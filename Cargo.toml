@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "poing-core",
+    "poing-plugin",
+    "poing-makepad-bridge",
+    "poing-gui",
+]
+resolver = "2"
