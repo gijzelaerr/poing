@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+makepad-widgets = { path = "../../../makepad/makepad/widgets" }
+poing-core = { path = "../poing-core" }

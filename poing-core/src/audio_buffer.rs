@@ -88,6 +88,6 @@ mod tests {
         buf.write(&[1.0, 2.0]);
         buf.clear();
         assert!(buf.is_empty());
-        assert_eq!(buf.read(), vec![]);
+        assert_eq!(buf.read(), Vec::<f32>::new());
     }
 }

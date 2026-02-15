@@ -92,7 +92,7 @@ impl Plugin for Poing {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        None
+        poing_makepad_bridge::create_editor(self.shared_state.clone(), (800, 600))
     }
 }
 

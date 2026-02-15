@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 ort = "2.0.0-rc.11"
-ndarray = "0.16"
+ndarray = "0.17"
 hound = "3"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+rand = "0.8"

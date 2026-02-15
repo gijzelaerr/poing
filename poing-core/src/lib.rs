@@ -17,6 +17,7 @@ pub enum GenerationState {
 
 /// Shared state for cross-thread communication between the audio thread,
 /// GUI, and inference thread.
+#[derive(Clone)]
 pub struct SharedState {
     pub prompt: Arc<Mutex<String>>,
     pub model_path: Arc<Mutex<Option<PathBuf>>>,

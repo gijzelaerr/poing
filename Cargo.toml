@@ -1,8 +1,10 @@
+
 [workspace]
 members = [
     "poing-core",
     "poing-plugin",
     "poing-makepad-bridge",
     "poing-gui",
+    "xtask",
 ]
 resolver = "2"
