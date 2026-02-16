@@ -92,9 +92,10 @@ pub fn create_embedded_makepad(
         internal_drag_items: None,
     };
 
+    let opengl_windows_for_cb = opengl_windows.clone();
     INIT.call_once(|| {
         init_xlib_app_global(Box::new(move |xlib_app, event| {
-            let mut ow = opengl_windows.borrow_mut();
+            let mut ow = opengl_windows_for_cb.borrow_mut();
             x11_cx.xlib_event_callback(xlib_app, event, &mut *ow)
         }));
     });
