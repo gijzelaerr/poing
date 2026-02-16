@@ -19,8 +19,9 @@ jobs:
         include:
           - os: macos-latest
             name: macOS-arm64
-          - os: macos-13
+          - os: macos-latest
             name: macOS-x86_64
+            cross_target: x86_64-apple-darwin
           - os: windows-latest
             name: Windows-x86_64
           - os: ubuntu-latest
@@ -33,11 +34,20 @@ jobs:
 
       - name: Clone Makepad
         shell: bash
-        run: git clone --depth 1 https://github.com/makepad/makepad.git "$GITHUB_WORKSPACE/../../makepad"
+        run: |
+          # Cargo.toml references makepad-widgets via ../../../makepad/makepad/widgets
+          # From a subcrate dir, that resolves to 2 dirs above the workspace root.
+          MAKEPAD_PARENT="$(cd "$GITHUB_WORKSPACE/../.." && pwd)/makepad"
+          mkdir -p "$MAKEPAD_PARENT"
+          git clone --depth 1 https://github.com/makepad/makepad.git "$MAKEPAD_PARENT/makepad"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cross_target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -49,13 +59,21 @@ jobs:
             libasound2-dev libpulse-dev
 
       - name: Build plugin bundle
-        run: cargo xtask bundle poing-plugin --release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cross_target }}" ]; then
+            cargo xtask bundle poing-plugin --release --target ${{ matrix.cross_target }}
+          else
+            cargo xtask bundle poing-plugin --release
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: poing-${{ matrix.name }}
-          path: target/release/bundle/
+          path: |
+            target/release/bundle/
+            target/${{ matrix.cross_target }}/release/bundle/
 
   release:
     name: Create Release
