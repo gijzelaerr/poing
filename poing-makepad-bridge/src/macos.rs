@@ -22,6 +22,7 @@ use makepad_widgets::{
         },
     },
 };
+use poing_core::SharedState;
 use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -61,6 +62,7 @@ impl Drop for EmbeddedMakepadHandle {
 pub fn create_embedded_makepad(
     parent_nsview: *mut c_void,
     size: (u32, u32),
+    shared_state: SharedState,
 ) -> EmbeddedMakepadHandle {
     let parent: ObjcId = parent_nsview as ObjcId;
     let _ = size; // Size is determined by the parent view
@@ -76,7 +78,7 @@ pub fn create_embedded_makepad(
     });
 
     // Create Cx with poing-gui's event handler
-    let event_handler = poing_gui::create_event_handler();
+    let event_handler = poing_gui::create_event_handler(shared_state);
     let cx = Rc::new(RefCell::new(Cx::new(event_handler)));
 
     // Set up Cx (replicating Cx::event_loop setup)

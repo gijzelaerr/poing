@@ -20,20 +20,40 @@ impl Editor for MakepadEditor {
                 ParentWindowHandle::AppKitNsView(ptr) => ptr,
                 _ => panic!("Expected AppKitNsView on macOS"),
             };
-            let handle = crate::macos::create_embedded_makepad(parent_ptr, self.size);
+            let handle = crate::macos::create_embedded_makepad(
+                parent_ptr,
+                self.size,
+                self.shared_state.clone(),
+            );
             Box::new(handle)
         }
 
         #[cfg(target_os = "windows")]
         {
-            let _ = parent;
-            panic!("Makepad embedding not yet implemented on Windows");
+            let parent_hwnd = match parent {
+                ParentWindowHandle::Win32Hwnd(ptr) => ptr,
+                _ => panic!("Expected Win32Hwnd on Windows"),
+            };
+            let handle = crate::windows::create_embedded_makepad(
+                parent_hwnd,
+                self.size,
+                self.shared_state.clone(),
+            );
+            Box::new(handle)
         }
 
         #[cfg(target_os = "linux")]
         {
-            let _ = parent;
-            panic!("Makepad embedding not yet implemented on Linux");
+            let parent_xid = match parent {
+                ParentWindowHandle::X11Window(xid) => xid,
+                _ => panic!("Expected X11Window on Linux"),
+            };
+            let handle = crate::linux::create_embedded_makepad(
+                parent_xid,
+                self.size,
+                self.shared_state.clone(),
+            );
+            Box::new(handle)
         }
     }
 
