@@ -19,9 +19,6 @@ jobs:
         include:
           - os: macos-latest
             name: macOS-arm64
-          - os: macos-latest
-            name: macOS-x86_64
-            cross_target: x86_64-apple-darwin
           - os: windows-latest
             name: Windows-x86_64
           - os: ubuntu-latest
@@ -32,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone Makepad
+      - name: Clone and patch Makepad
         shell: bash
         run: |
           # Cargo.toml references makepad-widgets via ../../../makepad/makepad/widgets
@@ -42,10 +39,10 @@ jobs:
           git clone https://github.com/makepad/makepad.git "$MAKEPAD_PARENT/makepad"
           cd "$MAKEPAD_PARENT/makepad"
           git checkout 29b277811428c36d5fd5483710d7b2fd5b7ae2ca
+          # Apply visibility patch to expose pub(crate) internals needed for embedding
+          git apply "$GITHUB_WORKSPACE/makepad-visibility.patch"
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.cross_target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -62,20 +59,13 @@ jobs:
 
       - name: Build plugin bundle
         shell: bash
-        run: |
-          if [ -n "${{ matrix.cross_target }}" ]; then
-            cargo xtask bundle poing-plugin --release --target ${{ matrix.cross_target }}
-          else
-            cargo xtask bundle poing-plugin --release
-          fi
+        run: cargo xtask bundle poing-plugin --release
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: poing-${{ matrix.name }}
-          path: |
-            target/release/bundle/
-            target/${{ matrix.cross_target }}/release/bundle/
+          path: target/release/bundle/
 
   release:
     name: Create Release

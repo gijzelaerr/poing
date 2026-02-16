@@ -1,0 +1,231 @@
+diff --git c/platform/src/cx.rs w/platform/src/cx.rs
+index 7d751a2e3..b8a48fe24 100644
+--- c/platform/src/cx.rs
++++ w/platform/src/cx.rs
+@@ -45,10 +45,10 @@ pub struct Cx {
+ 
+     pub debug_trace_active: bool,
+ 
+-    pub(crate) os_type: OsType,
++    pub os_type: OsType,
+     pub in_makepad_studio: bool,
+     pub demo_time_repaint: bool,
+-    pub(crate) gpu_info: GpuInfo,
++    pub gpu_info: GpuInfo,
+     pub(crate) xr_capabilities: XrCapabilities,
+     pub(crate) cpu_cores: usize,
+     pub null_texture: Texture,
+@@ -100,7 +100,7 @@ pub struct Cx {
+ 
+     pub components: ComponentRegistries,
+ 
+-    pub(crate) self_ref: Option<Rc<RefCell<Cx>>>,
++    pub self_ref: Option<Rc<RefCell<Cx>>>,
+     pub(crate) in_draw_event: bool,
+ 
+     /// Display context for the main window, used by AdaptiveView
+@@ -109,7 +109,7 @@ pub struct Cx {
+     pub debug: Debug,
+ 
+     #[allow(dead_code)]
+-    pub(crate) executor: Option<Executor>,
++    pub executor: Option<Executor>,
+     pub(crate) spawner: Spawner,
+ 
+     pub(crate) studio_web_socket: Option<WebSocket>,
+diff --git c/platform/src/lib.rs w/platform/src/lib.rs
+index c1f7342a8..7e3cc08fe 100644
+--- c/platform/src/lib.rs
++++ w/platform/src/lib.rs
+@@ -80,7 +80,7 @@
+         audio::*,
+         component::{ComponentInfo, ComponentRegistries, ComponentRegistry},
+         cursor::MouseCursor,
+-        cx::{Cx, CxRef, OsType},
++        cx::{Cx, CxRef, LinuxWindowParams, OsType},
+         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
+         draw_list::{CxDrawCall, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId},
+         draw_matrix::DrawMatrix,
+diff --git c/platform/src/os/apple/macos/macos.rs w/platform/src/os/apple/macos/macos.rs
+index bc822857c..1ca190337 100644
+--- c/platform/src/os/apple/macos/macos.rs
++++ w/platform/src/os/apple/macos/macos.rs
+@@ -45,7 +45,7 @@ pub struct MetalWindow {
+ }
+ 
+ impl MetalWindow {
+-    pub(crate) fn new(
++    pub fn new(
+         window_id: WindowId,
+         metal_cx: &MetalCx,
+         inner_size: Vec2d,
+@@ -161,7 +161,7 @@ pub fn event_loop(cx: Rc<RefCell<Cx>>) {
+         MacosApp::event_loop();
+     }
+ 
+-    pub(crate) fn handle_repaint(
++    pub fn handle_repaint(
+         &mut self,
+         metal_windows: &mut Vec<MetalWindow>,
+         metal_cx: &mut MetalCx,
+@@ -247,7 +247,7 @@ pub(crate) fn handle_gamepad_events(&mut self) {
+         }
+     }
+ 
+-    fn ensure_timer0_started(&mut self) {
++    pub fn ensure_timer0_started(&mut self) {
+         if !self.os.timer0_armed {
+             with_macos_app(|app| app.stop_timer(0));
+             with_macos_app(|app| app.start_timer(0, 0.008, true));
+@@ -263,7 +263,7 @@ fn ensure_timer0_stopped(&mut self) {
+         }
+     }
+ 
+-    fn cocoa_event_callback(
++    pub fn cocoa_event_callback(
+         &mut self,
+         event: MacosEvent,
+         metal_cx: &mut MetalCx,
+@@ -879,9 +879,9 @@ fn web_socket_send(&mut self, _websocket: WebSocket, _data: Vec<u8>) {
+ #[derive(Default)]
+ pub struct CxOs {
+     /// For how long to keep the timer alive when the app is idle
+-    pub(crate) keep_alive_counter: usize,
++    pub keep_alive_counter: usize,
+     /// Indicates wether the main timer is armed
+-    pub(crate) timer0_armed: bool,
++    pub timer0_armed: bool,
+     pub(crate) media: CxAppleMedia,
+     pub(crate) bytes_written: usize,
+     pub(crate) draw_calls_done: usize,
+diff --git c/platform/src/os/apple/macos/macos_app.rs w/platform/src/os/apple/macos/macos_app.rs
+index 564267cc4..e15afd063 100644
+--- c/platform/src/os/apple/macos/macos_app.rs
++++ w/platform/src/os/apple/macos/macos_app.rs
+@@ -103,7 +103,7 @@ pub struct MacosApp {
+     #[allow(unused)]
+     pasteboard: ObjcId,
+     startup_focus_hack_ran: bool,
+-    event_callback: Option<Box<dyn FnMut(MacosEvent) -> EventFlow>>,
++    pub event_callback: Option<Box<dyn FnMut(MacosEvent) -> EventFlow>>,
+     event_flow: EventFlow,
+ 
+     pub cursors: HashMap<MouseCursor, ObjcId>,
+diff --git c/platform/src/os/apple/macos/macos_window.rs w/platform/src/os/apple/macos/macos_window.rs
+index 037fbc1b5..21e0d774f 100644
+--- c/platform/src/os/apple/macos/macos_window.rs
++++ w/platform/src/os/apple/macos/macos_window.rs
+@@ -24,7 +24,7 @@
+ #[derive(Clone)]
+ pub struct MacosWindow {
+     pub(crate) window_id: WindowId,
+-    pub(crate) view: ObjcId,
++    pub view: ObjcId,
+     pub(crate) window: ObjcId,
+     pub(crate) ime_spot: Vec2d,
+     pub(crate) is_fullscreen: bool,
+diff --git c/platform/src/os/apple/metal.rs w/platform/src/os/apple/metal.rs
+index e4d101539..537148ba5 100644
+--- c/platform/src/os/apple/metal.rs
++++ w/platform/src/os/apple/metal.rs
+@@ -835,7 +835,7 @@ fn commit_command_buffer(
+         let () = unsafe { msg_send![command_buffer, commit] };
+     }
+ 
+-    pub(crate) fn mtl_compile_shaders(&mut self, metal_cx: &MetalCx) {
++    pub fn mtl_compile_shaders(&mut self, metal_cx: &MetalCx) {
+         for draw_shader_id in self
+             .draw_shaders
+             .compile_set
+@@ -945,7 +945,7 @@ pub struct SlErr {
+ }*/
+ 
+ impl MetalCx {
+-    pub(crate) fn new() -> MetalCx {
++    pub fn new() -> MetalCx {
+         let device = get_default_metal_device().expect("Cannot get default metal device");
+         MetalCx {
+             command_queue: unsafe { msg_send![device, newCommandQueue] },
+diff --git c/platform/src/os/cx_shared.rs w/platform/src/os/cx_shared.rs
+index 2e855c97c..3182f54d0 100644
+--- c/platform/src/os/cx_shared.rs
++++ w/platform/src/os/cx_shared.rs
+@@ -94,7 +94,7 @@ pub(crate) fn compute_pass_repaint_order(&mut self, passes_todo: &mut Vec<DrawPa
+         self.demo_time_repaint = false;
+     }
+ 
+-    pub(crate) fn need_redrawing(&self) -> bool {
++    pub fn need_redrawing(&self) -> bool {
+         self.new_draw_event.will_redraw()
+     }
+ 
+@@ -174,7 +174,7 @@ pub fn handle_actions(&mut self) {
+         }
+     }
+ 
+-    pub(crate) fn call_event_handler(&mut self, event: &Event) {
++    pub fn call_event_handler(&mut self, event: &Event) {
+         self.inner_call_event_handler(event);
+         self.inner_key_focus_change();
+         self.handle_triggers();
+diff --git c/platform/src/os/linux/windowing_backend.rs w/platform/src/os/linux/windowing_backend.rs
+index f89173398..aaea89337 100644
+--- c/platform/src/os/linux/windowing_backend.rs
++++ w/platform/src/os/linux/windowing_backend.rs
+@@ -180,7 +180,7 @@ pub struct CxOs {
+     pub(crate) network_response: NetworkResponseChannel,
+     pub(crate) stdin_timers: PollTimers,
+     pub(crate) start_time: Option<Instant>,
+-    pub(super) opengl_cx: Option<OpenglCx>,
++    pub opengl_cx: Option<OpenglCx>,
+ }
+ 
+ impl CxOs {
+diff --git c/platform/src/os/linux/x11/linux_x11.rs w/platform/src/os/linux/x11/linux_x11.rs
+index a3788bdbb..7efc48a6b 100644
+--- c/platform/src/os/linux/x11/linux_x11.rs
++++ w/platform/src/os/linux/x11/linux_x11.rs
+@@ -77,7 +77,7 @@ pub fn event_loop_impl(cx: Rc<RefCell<Cx>>) {
+         get_xlib_app_global().event_loop();
+     }
+ 
+-    fn xlib_event_callback(
++    pub fn xlib_event_callback(
+         &mut self,
+         xlib_app: &mut XlibApp,
+         event: XlibEvent,
+diff --git c/platform/src/os/windows/win32_app.rs w/platform/src/os/windows/win32_app.rs
+index 5fc7b9338..43fcd7ecd 100644
+--- c/platform/src/os/windows/win32_app.rs
++++ w/platform/src/os/windows/win32_app.rs
+@@ -90,7 +90,7 @@ pub unsafe fn DoDragDrop<P0, P1>(pdataobj: P0, pdropsource: P1, dwokeffects: DRO
+ }*/
+ 
+ pub struct Win32App {
+-    event_callback: Option<Box<dyn FnMut(Win32Event) -> EventFlow>>,
++    pub event_callback: Option<Box<dyn FnMut(Win32Event) -> EventFlow>>,
+     pub window_class_name: Vec<u16>,
+     pub all_windows: Vec<HWND>,
+     pub time: Win32Time,
+diff --git c/platform/src/os/windows/windows.rs w/platform/src/os/windows/windows.rs
+index bb491b50e..311139db7 100644
+--- c/platform/src/os/windows/windows.rs
++++ w/platform/src/os/windows/windows.rs
+@@ -65,7 +65,7 @@ pub fn event_loop(cx: Rc<RefCell<Cx>>) {
+         Win32App::event_loop();
+     }
+ 
+-    fn win32_event_callback(
++    pub fn win32_event_callback(
+         &mut self,
+         event: Win32Event,
+         d3d11_cx: &mut D3d11Cx,
+@@ -566,7 +566,7 @@ fn open_url(&mut self, _url: &str, _in_place: OpenUrlInPlace) {
+ pub struct CxOs {
+     pub(crate) start_time: Option<Instant>,
+     pub(crate) media: CxWindowsMedia,
+-    pub(crate) d3d11_device: Option<ID3D11Device>,
++    pub d3d11_device: Option<ID3D11Device>,
+     pub(crate) network_response: NetworkResponseChannel,
+     pub(crate) game_input_events: GameInputEventChannel,
+     pub(crate) windows_game_input: Option<WindowsGameInput>,

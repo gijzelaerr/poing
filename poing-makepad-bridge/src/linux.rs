@@ -8,8 +8,8 @@ use makepad_widgets::{
     Cx, CxOsApi, Event, OsType,
     cx_native::EventFlow,
     makepad_platform::{
-        cx::LinuxWindowParams,
-        gpu_info::GpuPerformance,
+        LinuxWindowParams,
+        GpuPerformance,
         os::linux::{
             egl_sys,
             opengl_cx::OpenglCx,
