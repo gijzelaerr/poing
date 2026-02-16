@@ -39,7 +39,9 @@ jobs:
           # From a subcrate dir, that resolves to 2 dirs above the workspace root.
           MAKEPAD_PARENT="$(cd "$GITHUB_WORKSPACE/../.." && pwd)/makepad"
           mkdir -p "$MAKEPAD_PARENT"
-          git clone --depth 1 https://github.com/makepad/makepad.git "$MAKEPAD_PARENT/makepad"
+          git clone https://github.com/makepad/makepad.git "$MAKEPAD_PARENT/makepad"
+          cd "$MAKEPAD_PARENT/makepad"
+          git checkout 29b277811428c36d5fd5483710d7b2fd5b7ae2ca
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +57,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libwayland-dev \
             libasound2-dev libpulse-dev
 
       - name: Build plugin bundle
