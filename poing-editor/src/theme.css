@@ -1,0 +1,116 @@
+* {
+    color: #dddddd;
+    font-size: 12;
+}
+
+:root {
+    background-color: #14141e;
+    layout-type: column;
+    child-space: 24px;
+    row-between: 16px;
+}
+
+.header-title {
+    font-size: 28;
+    color: #ffffff;
+}
+
+.header-subtitle {
+    font-size: 12;
+    color: #666666;
+    top: 8px;
+}
+
+label.field-label {
+    color: #888888;
+    font-size: 11;
+}
+
+.status-label {
+    color: #888888;
+    font-size: 11;
+}
+
+.progress-track {
+    height: 6px;
+    background-color: #1a1a28;
+    border-radius: 3px;
+}
+
+.progress-fill {
+    height: 6px;
+    background-color: #3d7ad1;
+    border-radius: 3px;
+}
+
+button {
+    background-color: #2a2a3e;
+    border-radius: 4px;
+    child-space: 6px;
+    child-left: 12px;
+    child-right: 12px;
+    cursor: hand;
+    height: auto;
+}
+
+button:hover {
+    background-color: #3a3a52;
+}
+
+button:active {
+    background-color: #1a1a2e;
+}
+
+button.generate {
+    background-color: #3d7ad1;
+}
+
+button.generate:hover {
+    background-color: #4d8ae1;
+}
+
+button.generate:active {
+    background-color: #2d6ac1;
+}
+
+textbox {
+    background-color: #1a1a2e;
+    color: #dddddd;
+    border-radius: 4px;
+    child-space: 8px;
+    height: auto;
+}
+
+dropdown {
+    background-color: #1a1a2e;
+    border-radius: 4px;
+    height: auto;
+}
+
+dropdown .title {
+    child-space: 6px;
+    child-left: 8px;
+    child-right: 8px;
+}
+
+dropdown popup {
+    background-color: #22223a;
+    border-radius: 4px;
+    child-space: 2px;
+}
+
+.dropdown-item {
+    child-space: 6px;
+    child-left: 8px;
+    child-right: 8px;
+    cursor: hand;
+}
+
+.dropdown-item:hover {
+    background-color: #3d7ad1;
+}
+
+.waveform-container {
+    background-color: #0f0f17;
+    border-radius: 4px;
+}

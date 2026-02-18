@@ -4,9 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "poing-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["assert_process_allocs"]
+standalone = ["nih_plug/standalone"]
+assert_process_allocs = ["nih_plug/assert_process_allocs"]
 
 [dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 poing-core = { path = "../poing-core" }
-poing-makepad-bridge = { path = "../poing-makepad-bridge" }
+poing-editor = { path = "../poing-editor" }

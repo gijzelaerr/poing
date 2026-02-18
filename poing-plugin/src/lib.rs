@@ -1,33 +1,48 @@
 use nih_plug::prelude::*;
+use nih_plug_vizia::ViziaState;
 use poing_core::audio_buffer::RingBuffer;
 use poing_core::SharedState;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-struct Poing {
+pub struct Poing {
     params: Arc<PoingParams>,
     shared_state: SharedState,
     ring_buffer: RingBuffer,
 }
 
 #[derive(Params)]
-struct PoingParams {}
+struct PoingParams {
+    #[persist = "model-path"]
+    pub selected_model_path: Arc<Mutex<Option<String>>>,
+
+    #[persist = "editor-state"]
+    pub editor_state: Arc<ViziaState>,
+}
 
 impl Default for Poing {
     fn default() -> Self {
         // 30 seconds at 48kHz mono
         let max_recording_samples = 48_000 * 30;
+        let shared_state = SharedState::new();
+
+        // Initialize persist field from SharedState's loaded config
+        let initial_path = shared_state
+            .model_path
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+
         Self {
-            params: Arc::new(PoingParams::default()),
-            shared_state: SharedState::new(),
+            params: Arc::new(PoingParams {
+                selected_model_path: Arc::new(Mutex::new(initial_path)),
+                editor_state: poing_editor::default_state(),
+            }),
+            shared_state,
             ring_buffer: RingBuffer::new(max_recording_samples),
         }
-    }
-}
-
-impl Default for PoingParams {
-    fn default() -> Self {
-        Self {}
     }
 }
 
@@ -63,6 +78,15 @@ impl Plugin for Poing {
         if let Ok(mut sr) = self.shared_state.sample_rate.lock() {
             *sr = buffer_config.sample_rate;
         }
+
+        // Sync persisted model path -> SharedState (DAW project reload)
+        if let Ok(persisted) = self.params.selected_model_path.lock() {
+            if let Some(path_str) = persisted.as_ref() {
+                let path = PathBuf::from(path_str);
+                *self.shared_state.model_path.lock().unwrap() = Some(path);
+            }
+        }
+
         true
     }
 
@@ -87,12 +111,25 @@ impl Plugin for Poing {
             }
         }
 
+        // Sync SharedState model_path -> persist field for DAW project save
+        if let Ok(current) = self.shared_state.model_path.try_lock() {
+            if let Ok(mut persisted) = self.params.selected_model_path.try_lock() {
+                let current_str = current.as_ref().map(|p| p.to_string_lossy().into_owned());
+                if *persisted != current_str {
+                    *persisted = current_str;
+                }
+            }
+        }
+
         // Audio passes through unmodified
         ProcessStatus::Normal
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        poing_makepad_bridge::create_editor(self.shared_state.clone(), (800, 600))
+        poing_editor::create(
+            self.shared_state.clone(),
+            self.params.editor_state.clone(),
+        )
     }
 }
 

@@ -29,19 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone and patch Makepad
-        shell: bash
-        run: |
-          # Cargo.toml references makepad-widgets via ../../../makepad/makepad/widgets
-          # From a subcrate dir, that resolves to 2 dirs above the workspace root.
-          MAKEPAD_PARENT="$(cd "$GITHUB_WORKSPACE/../.." && pwd)/makepad"
-          mkdir -p "$MAKEPAD_PARENT"
-          git clone https://github.com/makepad/makepad.git "$MAKEPAD_PARENT/makepad"
-          cd "$MAKEPAD_PARENT/makepad"
-          git checkout 29b277811428c36d5fd5483710d7b2fd5b7ae2ca
-          # Apply visibility patch to expose pub(crate) internals needed for embedding
-          git apply "$GITHUB_WORKSPACE/makepad-visibility.patch"
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

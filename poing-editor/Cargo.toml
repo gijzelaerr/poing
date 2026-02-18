@@ -1,0 +1,25 @@
+[package]
+name = "poing-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+poing-core = { path = "../poing-core" }
+rfd = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa = "0.26"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_System_Memory",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2"
