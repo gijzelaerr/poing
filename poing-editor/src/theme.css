@@ -83,27 +83,43 @@ textbox {
 
 dropdown {
     background-color: #1a1a2e;
+    border-width: 1px;
+    border-color: #2a2a3e;
     border-radius: 4px;
     height: auto;
+    cursor: hand;
+}
+
+dropdown:hover {
+    border-color: #3d7ad1;
 }
 
 dropdown .title {
     child-space: 6px;
-    child-left: 8px;
-    child-right: 8px;
+    child-left: 10px;
+    child-right: 10px;
+}
+
+.dropdown-arrow {
+    color: #666666;
+    font-size: 11;
 }
 
 dropdown popup {
     background-color: #22223a;
+    border-width: 1px;
+    border-color: #2a2a3e;
     border-radius: 4px;
     child-space: 2px;
+    top: 1px;
 }
 
 .dropdown-item {
     child-space: 6px;
-    child-left: 8px;
-    child-right: 8px;
+    child-left: 10px;
+    child-right: 10px;
     cursor: hand;
+    border-radius: 2px;
 }
 
 .dropdown-item:hover {

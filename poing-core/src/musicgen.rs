@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ndarray::{s, Array1, Array2, Array3, ArrayD, Axis, IxDyn};
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use rand::distributions::WeightedIndex;
@@ -26,15 +27,25 @@ struct MusicGenPipeline {
 
 impl MusicGenPipeline {
     fn load(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let session = || {
+            Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level1)
+        };
+
+        eprintln!("[poing] Loading text_encoder.onnx...");
         let text_encoder =
-            Session::builder()?.commit_from_file(model_dir.join("text_encoder.onnx"))?;
+            session()?.commit_from_file(model_dir.join("text_encoder.onnx"))?;
+        eprintln!("[poing] Loading decoder_model_merged.onnx...");
         let decoder =
-            Session::builder()?.commit_from_file(model_dir.join("decoder_model_merged.onnx"))?;
+            session()?.commit_from_file(model_dir.join("decoder_model_merged.onnx"))?;
+        eprintln!("[poing] Loading encodec_decode.onnx...");
         let encodec_decode =
-            Session::builder()?.commit_from_file(model_dir.join("encodec_decode.onnx"))?;
+            session()?.commit_from_file(model_dir.join("encodec_decode.onnx"))?;
+        eprintln!("[poing] Loading tokenizer...");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| e.to_string())?;
 
+        eprintln!("[poing] All models loaded");
         Ok(Self {
             text_encoder,
             decoder,

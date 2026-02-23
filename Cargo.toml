@@ -8,3 +8,9 @@ members = [
 ]
 resolver = "2"
 
+# Override baseview to include macOS standalone fixes:
+# - 3e129732: avoid crash when window is null in become_first_responder (#204)
+# - 9a0b42c0: defer certain events on macOS to avoid re-entrant calls (#189)
+[patch."https://github.com/RustAudio/baseview.git"]
+baseview = { path = "lib/baseview" }
+

@@ -44,19 +44,17 @@ Uses `nih_plug_vizia` with `create_vizia_editor()`. The editor has:
 
 - `nih_plug` / `nih_plug_vizia` - from `https://github.com/robbert-vdh/nih-plug.git` (commit 28b149e)
 - vizia - from `https://github.com/robbert-vdh/vizia.git` tag `patched-2024-05-06` (robbert-vdh's fork with baseview patches)
-- baseview - Two revisions coexist: `2c1b1a7` (via vizia) and `579130e` (via nih_plug standalone feature). This causes issues in standalone mode.
+- baseview - Patched local copy at `lib/baseview` (git submodule from `RustAudio/baseview` at `237d323c`), overriding both nih_plug revisions via `[patch]` in workspace `Cargo.toml`. Includes fixes for macOS null pointer crash and re-entrancy, plus additional deferrable event fixes for modal dialog compatibility.
 - `poing-core` depends on `ort` (ONNX Runtime), `ndarray`, `hound`, `tokenizers`
 
 ## Known Issues
 
-### Standalone mode crashes on macOS
-The standalone wrapper (`nih_export_standalone`) crashes on macOS due to two baseview issues:
-1. **Buffer size mismatch**: Core Audio delivers more samples than the requested period size (e.g., 558 vs 512). The cpal backend in nih_plug panics with an assertion. Workaround: use `-p 4096` or larger.
-2. **baseview RefCell re-entrancy**: macOS sends events (becomeFirstResponder, etc.) during frame rendering, causing `RefCell already borrowed` panic in baseview's `trigger_event`. The two different baseview revisions (standalone vs vizia) make this worse.
-
-These are upstream nih_plug/baseview issues, not specific to poing. The standalone mode was never used with the old Makepad bridge either (the standalone binary didn't exist before the VIZIA migration).
-
-**Testing the GUI requires loading the CLAP/VST3 bundle in a DAW** (e.g., REAPER).
+### Standalone mode on macOS
+Standalone mode works with `-p 4096` or larger period size. Core Audio may deliver more samples than the default period size (e.g., 558 vs 512), causing the cpal backend to panic. Use:
+```sh
+./target/debug/poing-standalone -p 4096
+```
+The GUI can also be tested by loading the CLAP/VST3 bundle in a DAW (e.g., REAPER).
 
 ### Drag-and-drop
 - macOS: Implemented via objc/cocoa NSPasteboardItem + beginDraggingSession

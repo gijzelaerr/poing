@@ -5,11 +5,9 @@ mod waveform;
 use model::{PoingEvent, PoingModel};
 use nih_plug::prelude::Editor;
 use nih_plug_vizia::vizia::prelude::*;
-use nih_plug_vizia::widgets::ResizeHandle;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use poing_core::SharedState;
 use std::sync::Arc;
-use std::time::Duration;
 use waveform::WaveformView;
 
 pub use nih_plug_vizia::ViziaState as EditorState;
@@ -33,20 +31,9 @@ pub fn create(
         cx.add_stylesheet(THEME_CSS)
             .expect("Failed to add theme stylesheet");
 
-        let poing_model = PoingModel::new(shared_state.clone());
+        let proxy = cx.get_proxy();
+        let poing_model = PoingModel::new(shared_state.clone(), proxy);
         poing_model.build(cx);
-
-        // Start a 30 Hz polling timer
-        let timer = cx.add_timer(
-            Duration::from_millis(33),
-            None,
-            |cx, action| {
-                if let TimerAction::Tick(_) = action {
-                    cx.emit(PoingEvent::TimerTick);
-                }
-            },
-        );
-        cx.start_timer(timer);
 
         VStack::new(cx, |cx| {
             // Header
@@ -72,7 +59,14 @@ pub fn create(
                 Dropdown::new(
                     cx,
                     |cx| {
-                        Label::new(cx, PoingModel::selected_model_name)
+                        HStack::new(cx, |cx| {
+                            Label::new(cx, PoingModel::selected_model_name)
+                                .width(Stretch(1.0));
+                            Label::new(cx, "\u{25BE}").class("dropdown-arrow");
+                        })
+                        .col_between(Pixels(4.0))
+                        .child_top(Stretch(1.0))
+                        .child_bottom(Stretch(1.0))
                     },
                     |cx| {
                         Binding::new(cx, PoingModel::model_names, |cx, names_lens| {
@@ -110,12 +104,19 @@ pub fn create(
             .child_bottom(Stretch(1.0));
 
             // Prompt input
-            Textbox::new(cx, PoingModel::prompt)
-                .on_edit(|cx, text| {
-                    cx.emit(PoingEvent::SetPrompt(text));
-                })
-                .width(Stretch(1.0))
-                .height(Auto);
+            HStack::new(cx, |cx| {
+                Label::new(cx, "Prompt:").class("field-label");
+                Textbox::new(cx, PoingModel::prompt)
+                    .on_edit(|cx, text| {
+                        cx.emit(PoingEvent::SetPrompt(text));
+                    })
+                    .placeholder("Describe the music to generate...")
+                    .width(Stretch(1.0));
+            })
+            .height(Auto)
+            .col_between(Pixels(8.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
 
             // Controls row
             HStack::new(cx, |cx| {
@@ -158,6 +159,5 @@ pub fn create(
         .width(Stretch(1.0))
         .height(Stretch(1.0));
 
-        ResizeHandle::new(cx);
     })
 }

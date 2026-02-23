@@ -3,8 +3,7 @@ use poing_core::config;
 use poing_core::{GenerationState, SharedState};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PoingEvent {
@@ -24,7 +23,7 @@ pub struct PoingModel {
     #[lens(ignore)]
     pub shared_state: SharedState,
     #[lens(ignore)]
-    recording_start: Option<Instant>,
+    proxy: ContextProxy,
     #[lens(ignore)]
     was_generating: bool,
 
@@ -40,14 +39,14 @@ pub struct PoingModel {
 }
 
 impl PoingModel {
-    pub fn new(shared_state: SharedState) -> Self {
+    pub fn new(shared_state: SharedState, proxy: ContextProxy) -> Self {
         let model_paths = shared_state.model_paths.lock().unwrap().clone();
         let model_names = Self::paths_to_names(&model_paths);
         let selected_model_name = model_names.first().cloned().unwrap_or_else(|| "No models loaded".into());
 
         Self {
             shared_state,
-            recording_start: None,
+            proxy,
             was_generating: false,
             status_text: "Ready".into(),
             progress: 0.0,
@@ -96,11 +95,7 @@ impl PoingModel {
 
         // Update status label -- recording takes priority
         self.status_text = if is_recording {
-            if let Some(start) = self.recording_start {
-                format!("Recording... {:.1}s", start.elapsed().as_secs_f32())
-            } else {
-                "Recording...".into()
-            }
+            "Recording...".into()
         } else {
             match &gen_state {
                 GenerationState::Idle => "Ready".into(),
@@ -131,11 +126,28 @@ impl PoingModel {
         cx.needs_redraw();
     }
 
-    fn start_generation(&mut self, _cx: &mut EventContext) {
+    fn start_generation(&mut self, cx: &mut EventContext) {
+        // Prevent multiple simultaneous generations (set immediately, don't wait for timer)
+        if self.is_generating {
+            return;
+        }
+        self.is_generating = true;
+        self.status_text = "Loading models...".into();
+        self.progress = 0.0;
+        cx.needs_redraw();
+
         let prompt = self.prompt.clone();
         if prompt.trim().is_empty() {
+            self.is_generating = false;
             *self.shared_state.generation_state.lock().unwrap() =
                 GenerationState::Error("Please enter a prompt".into());
+            return;
+        }
+
+        if self.shared_state.model_path.lock().unwrap().is_none() {
+            self.is_generating = false;
+            *self.shared_state.generation_state.lock().unwrap() =
+                GenerationState::Error("No model path configured".into());
             return;
         }
 
@@ -145,30 +157,50 @@ impl PoingModel {
         *self.shared_state.generated_audio.lock().unwrap() = None;
 
         let state = self.shared_state.clone();
+        let mut proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let model_dir = state.model_path.lock().unwrap().clone();
-            if let Some(model_dir) = model_dir {
-                let progress_state = state.progress.clone();
-                match poing_core::musicgen::generate_from_text(
-                    &prompt,
-                    &model_dir,
-                    move |p| {
-                        *progress_state.lock().unwrap() = p;
-                    },
-                ) {
-                    Ok(audio) => {
-                        *state.generated_audio.lock().unwrap() = Some(audio);
-                        *state.generation_state.lock().unwrap() = GenerationState::Complete;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let model_dir = state.model_path.lock().unwrap().clone();
+                if let Some(model_dir) = model_dir {
+                    let progress_state = state.progress.clone();
+                    let progress_proxy = Mutex::new(proxy.clone());
+                    match poing_core::musicgen::generate_from_text(
+                        &prompt,
+                        &model_dir,
+                        move |p| {
+                            *progress_state.lock().unwrap() = p;
+                            let _ = progress_proxy.lock().unwrap().emit(PoingEvent::TimerTick);
+                        },
+                    ) {
+                        Ok(audio) => {
+                            *state.generated_audio.lock().unwrap() = Some(audio);
+                            *state.generation_state.lock().unwrap() = GenerationState::Complete;
+                        }
+                        Err(e) => {
+                            *state.generation_state.lock().unwrap() =
+                                GenerationState::Error(e.to_string());
+                        }
                     }
-                    Err(e) => {
-                        *state.generation_state.lock().unwrap() =
-                            GenerationState::Error(e.to_string());
-                    }
+                } else {
+                    *state.generation_state.lock().unwrap() =
+                        GenerationState::Error("No model path configured".into());
                 }
-            } else {
-                *state.generation_state.lock().unwrap() =
-                    GenerationState::Error("No model path configured".into());
+            }));
+            if let Err(panic) = result {
+                let msg = if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "Unknown panic".to_string()
+                };
+                eprintln!("[poing] Generation thread panicked: {}", msg);
+                if let Ok(mut gen_state) = state.generation_state.try_lock() {
+                    *gen_state = GenerationState::Error(format!("Internal error: {}", msg));
+                }
             }
+            // Final UI update after generation completes (or errors)
+            let _ = proxy.emit(PoingEvent::TimerTick);
         });
     }
 
@@ -180,7 +212,6 @@ impl PoingModel {
 
         if was_recording {
             // Just stopped recording
-            self.recording_start = None;
             let recorded = self.shared_state.recorded_audio.lock().unwrap().clone();
             if !recorded.is_empty() {
                 self.waveform_data = Arc::new(compute_waveform_columns(&recorded, 1024));
@@ -188,8 +219,8 @@ impl PoingModel {
             }
         } else {
             // Just started recording
-            self.recording_start = Some(Instant::now());
             self.shared_state.recorded_audio.lock().unwrap().clear();
+            self.status_text = "Recording...".into();
         }
     }
 
