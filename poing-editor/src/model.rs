@@ -1,5 +1,6 @@
 use nih_plug_vizia::vizia::prelude::*;
 use poing_core::config;
+use poing_core::musicgen::GenerationParams;
 use poing_core::{GenerationState, SharedState};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -16,6 +17,12 @@ pub enum PoingEvent {
     RemoveModel,
     SelectModel(usize),
     SetPrompt(String),
+    SetBpm(String),
+    SetNumBars(String),
+    SetGuidanceScale(String),
+    SetTopK(String),
+    SyncBpm,
+    SyncDurationToRecording,
     StartDrag,
     TimerTick,
 }
@@ -38,6 +45,13 @@ pub struct PoingModel {
     pub record_button_text: String,
     pub selected_model_name: String,
     pub waveform_data: Arc<Vec<(f32, f32)>>,
+
+    // Generation parameters
+    pub bpm: String,
+    pub num_bars: String,
+    pub guidance_scale: String,
+    pub top_k: String,
+    pub host_bpm_label: String,
 }
 
 impl PoingModel {
@@ -59,6 +73,11 @@ impl PoingModel {
             record_button_text: "Record".into(),
             selected_model_name,
             waveform_data: Arc::new(Vec::new()),
+            bpm: "120".into(),
+            num_bars: "4".into(),
+            guidance_scale: "3.0".into(),
+            top_k: "50".into(),
+            host_bpm_label: "Sync BPM".into(),
         }
     }
 
@@ -118,6 +137,13 @@ impl PoingModel {
             }
         };
 
+        // Update host BPM label
+        if let Ok(host_tempo) = self.shared_state.host_tempo.try_lock() {
+            if let Some(tempo) = *host_tempo {
+                self.host_bpm_label = format!("Sync BPM ({:.0})", tempo);
+            }
+        }
+
         // Update record button text
         self.record_button_text = if is_recording {
             "Stop Recording".into()
@@ -126,6 +152,53 @@ impl PoingModel {
         };
 
         cx.needs_redraw();
+    }
+
+    /// Compute the target generation duration in seconds from BPM and bars.
+    fn compute_duration_seconds(&self) -> f32 {
+        let bpm: f32 = self.bpm.parse().unwrap_or(120.0);
+        let bars: f32 = self.num_bars.parse().unwrap_or(4.0);
+        let beats_per_bar = self
+            .shared_state
+            .host_time_sig
+            .try_lock()
+            .ok()
+            .and_then(|ts| ts.map(|(num, _)| num as f32))
+            .unwrap_or(4.0);
+
+        (bars * beats_per_bar * 60.0 / bpm).min(30.0)
+    }
+
+    fn sync_bpm(&mut self) {
+        if let Ok(host_tempo) = self.shared_state.host_tempo.try_lock() {
+            if let Some(tempo) = *host_tempo {
+                self.bpm = format!("{:.0}", tempo);
+            }
+        }
+    }
+
+    fn sync_duration_to_recording(&mut self) {
+        let sample_count = self
+            .shared_state
+            .recorded_audio
+            .lock()
+            .unwrap()
+            .len();
+        if sample_count == 0 {
+            return;
+        }
+        let sample_rate = *self.shared_state.sample_rate.lock().unwrap();
+        let duration_secs = sample_count as f32 / sample_rate;
+        let bpm: f32 = self.bpm.parse().unwrap_or(120.0);
+        let beats_per_bar = self
+            .shared_state
+            .host_time_sig
+            .try_lock()
+            .ok()
+            .and_then(|ts| ts.map(|(num, _)| num as f32))
+            .unwrap_or(4.0);
+        let bars = (duration_secs * bpm / (60.0 * beats_per_bar)).round().max(1.0);
+        self.num_bars = format!("{}", bars as u32);
     }
 
     fn start_generation(&mut self, cx: &mut EventContext) {
@@ -141,19 +214,34 @@ impl PoingModel {
         let prompt = self.prompt.clone();
         if prompt.trim().is_empty() {
             self.is_generating = false;
+            self.status_text = "Error: Please enter a prompt".into();
             *self.shared_state.generation_state.lock().unwrap() =
                 GenerationState::Error("Please enter a prompt".into());
+            cx.needs_redraw();
             return;
         }
 
         if self.shared_state.model_path.lock().unwrap().is_none() {
             self.is_generating = false;
+            self.status_text = "Error: No model path configured".into();
             *self.shared_state.generation_state.lock().unwrap() =
                 GenerationState::Error("No model path configured".into());
+            cx.needs_redraw();
             return;
         }
 
-        *self.shared_state.prompt.lock().unwrap() = prompt.clone();
+        // Build the full prompt with BPM hint
+        let bpm: f32 = self.bpm.parse().unwrap_or(120.0);
+        let full_prompt = format!("{:.0} bpm. {}", bpm, prompt);
+
+        // Build generation params
+        let gen_params = GenerationParams {
+            duration_seconds: self.compute_duration_seconds(),
+            guidance_scale: self.guidance_scale.parse().unwrap_or(3.0),
+            top_k: self.top_k.parse().unwrap_or(50),
+        };
+
+        *self.shared_state.prompt.lock().unwrap() = full_prompt.clone();
         *self.shared_state.generation_state.lock().unwrap() = GenerationState::Generating;
         *self.shared_state.progress.lock().unwrap() = 0.0;
         *self.shared_state.generated_audio.lock().unwrap() = None;
@@ -167,8 +255,9 @@ impl PoingModel {
                     let progress_state = state.progress.clone();
                     let progress_proxy = Mutex::new(proxy.clone());
                     match poing_core::musicgen::generate_from_text(
-                        &prompt,
+                        &full_prompt,
                         &model_dir,
+                        &gen_params,
                         move |p| {
                             *progress_state.lock().unwrap() = p;
                             let _ = progress_proxy.lock().unwrap().emit(PoingEvent::TimerTick);
@@ -366,6 +455,18 @@ impl Model for PoingModel {
             PoingEvent::RemoveModel => self.remove_selected_model(cx),
             PoingEvent::SelectModel(index) => self.select_model(*index),
             PoingEvent::SetPrompt(text) => self.prompt = text.clone(),
+            PoingEvent::SetBpm(text) => self.bpm = text.clone(),
+            PoingEvent::SetNumBars(text) => self.num_bars = text.clone(),
+            PoingEvent::SetGuidanceScale(text) => self.guidance_scale = text.clone(),
+            PoingEvent::SetTopK(text) => self.top_k = text.clone(),
+            PoingEvent::SyncBpm => {
+                self.sync_bpm();
+                cx.needs_redraw();
+            }
+            PoingEvent::SyncDurationToRecording => {
+                self.sync_duration_to_recording();
+                cx.needs_redraw();
+            }
             PoingEvent::StartDrag => self.start_drag(),
             PoingEvent::TimerTick => self.poll_shared_state(cx),
         });
