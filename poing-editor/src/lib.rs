@@ -118,6 +118,52 @@ pub fn create(
             .child_top(Stretch(1.0))
             .child_bottom(Stretch(1.0));
 
+            // Generation settings row
+            HStack::new(cx, |cx| {
+                Label::new(cx, "BPM:").class("field-label");
+                Textbox::new(cx, PoingModel::bpm)
+                    .on_edit(|cx, text| cx.emit(PoingEvent::SetBpm(text)))
+                    .width(Pixels(50.0));
+
+                Button::new(
+                    cx,
+                    |cx| cx.emit(PoingEvent::SyncBpm),
+                    |cx| Label::new(cx, PoingModel::host_bpm_label),
+                );
+
+                Label::new(cx, "Bars:").class("field-label");
+                Textbox::new(cx, PoingModel::num_bars)
+                    .on_edit(|cx, text| cx.emit(PoingEvent::SetNumBars(text)))
+                    .width(Pixels(40.0));
+
+                Button::new(
+                    cx,
+                    |cx| cx.emit(PoingEvent::SyncDurationToRecording),
+                    |cx| Label::new(cx, "Match Recording"),
+                );
+            })
+            .height(Auto)
+            .col_between(Pixels(8.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+            // Advanced settings row
+            HStack::new(cx, |cx| {
+                Label::new(cx, "Guidance:").class("field-label");
+                Textbox::new(cx, PoingModel::guidance_scale)
+                    .on_edit(|cx, text| cx.emit(PoingEvent::SetGuidanceScale(text)))
+                    .width(Pixels(45.0));
+
+                Label::new(cx, "Top-K:").class("field-label");
+                Textbox::new(cx, PoingModel::top_k)
+                    .on_edit(|cx, text| cx.emit(PoingEvent::SetTopK(text)))
+                    .width(Pixels(45.0));
+            })
+            .height(Auto)
+            .col_between(Pixels(8.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
             // Controls row
             HStack::new(cx, |cx| {
                 Button::new(

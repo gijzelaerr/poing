@@ -94,8 +94,23 @@ impl Plugin for Poing {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Sync host transport info to shared state for the GUI
+        let transport = context.transport();
+        if let Some(tempo) = transport.tempo {
+            if let Ok(mut t) = self.shared_state.host_tempo.try_lock() {
+                *t = Some(tempo);
+            }
+        }
+        if let (Some(num), Some(den)) =
+            (transport.time_sig_numerator, transport.time_sig_denominator)
+        {
+            if let Ok(mut ts) = self.shared_state.host_time_sig.try_lock() {
+                *ts = Some((num, den));
+            }
+        }
+
         // Copy input to ring buffer when recording is armed
         if self.shared_state.is_recording.load(Ordering::Relaxed) {
             for sample_frame in buffer.iter_samples() {

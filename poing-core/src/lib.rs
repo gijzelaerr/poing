@@ -31,6 +31,10 @@ pub struct SharedState {
     pub model_paths: Arc<Mutex<Vec<PathBuf>>>,
     pub pending_browse: Arc<AtomicBool>,
     pub browse_result: Arc<Mutex<Option<PathBuf>>>,
+    /// Host tempo in BPM, updated from the audio process thread.
+    pub host_tempo: Arc<Mutex<Option<f64>>>,
+    /// Host time signature (numerator, denominator), updated from the audio process thread.
+    pub host_time_sig: Arc<Mutex<Option<(i32, i32)>>>,
 }
 
 impl SharedState {
@@ -49,6 +53,8 @@ impl SharedState {
             model_paths: Arc::new(Mutex::new(cfg.model_paths)),
             pending_browse: Arc::new(AtomicBool::new(false)),
             browse_result: Arc::new(Mutex::new(None)),
+            host_tempo: Arc::new(Mutex::new(None)),
+            host_time_sig: Arc::new(Mutex::new(None)),
         }
     }
 }

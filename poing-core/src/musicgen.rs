@@ -14,9 +14,31 @@ const HEAD_DIM: usize = 64;
 const NUM_LAYERS: usize = 24;
 const BOS_TOKEN: i64 = 2048;
 const PAD_TOKEN: i64 = 2048;
-const GUIDANCE_SCALE: f32 = 3.0;
-const MAX_LENGTH: usize = 1500;
-const TOP_K: usize = 50;
+const DEFAULT_GUIDANCE_SCALE: f32 = 3.0;
+const DEFAULT_MAX_LENGTH: usize = 1500;
+const DEFAULT_TOP_K: usize = 50;
+const CODEC_FRAME_RATE: f32 = 50.0;
+
+/// Parameters controlling audio generation.
+#[derive(Debug, Clone)]
+pub struct GenerationParams {
+    /// Target duration in seconds. Capped to model's max (default 30s).
+    pub duration_seconds: f32,
+    /// Classifier-free guidance scale. Higher = closer to prompt. Default 3.0.
+    pub guidance_scale: f32,
+    /// Top-K sampling. Higher = more diverse. Default 50.
+    pub top_k: usize,
+}
+
+impl Default for GenerationParams {
+    fn default() -> Self {
+        Self {
+            duration_seconds: 30.0,
+            guidance_scale: DEFAULT_GUIDANCE_SCALE,
+            top_k: DEFAULT_TOP_K,
+        }
+    }
+}
 
 struct MusicGenPipeline {
     text_encoder: Session,
@@ -57,6 +79,7 @@ impl MusicGenPipeline {
     fn generate(
         &mut self,
         prompt: &str,
+        params: &GenerationParams,
         progress_callback: impl Fn(f32),
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let mut rng = rand::thread_rng();
@@ -116,7 +139,12 @@ impl MusicGenPipeline {
         //   CB k is active (generates) at positions (1+k), (2+k), (3+k), ...
         //   Positions 0..k are PAD for CB k, position k is where BOS sits
         // Total sequence length for the delayed representation:
-        let total_seq_len = MAX_LENGTH; // 1500 positions (0..1499)
+        // Compute from duration: aligned_len = duration * CODEC_FRAME_RATE,
+        // total_seq_len = aligned_len + 1 + (NUM_CODEBOOKS - 1)
+        let aligned_target =
+            (params.duration_seconds * CODEC_FRAME_RATE).ceil() as usize;
+        let total_seq_len =
+            (aligned_target + NUM_CODEBOOKS).min(DEFAULT_MAX_LENGTH);
         let total_codebook_rows = 2 * NUM_CODEBOOKS; // 8 (CFG batch)
 
         // Collected tokens: [total_codebook_rows, total_seq_len]
@@ -254,13 +282,13 @@ impl MusicGenPipeline {
 
             // CFG: guided = uncond + scale * (cond - uncond)
             let cfg_logits =
-                &uncond_logits + GUIDANCE_SCALE * (&cond_logits - &uncond_logits);
+                &uncond_logits + params.guidance_scale * (&cond_logits - &uncond_logits);
 
             let mut sampled = vec![PAD_TOKEN; total_codebook_rows];
             for cb in 0..NUM_CODEBOOKS {
                 let logit_slice = cfg_logits.slice(s![cb, 0, ..]);
                 let token =
-                    top_k_sample(logit_slice.as_slice().unwrap(), TOP_K, &mut rng);
+                    top_k_sample(logit_slice.as_slice().unwrap(), params.top_k, &mut rng);
                 sampled[cb] = token;
                 sampled[cb + NUM_CODEBOOKS] = token;
             }
@@ -350,10 +378,11 @@ fn top_k_sample(logits: &[f32], k: usize, rng: &mut impl Rng) -> i64 {
 pub fn generate_from_text(
     prompt: &str,
     model_dir: &Path,
+    params: &GenerationParams,
     progress_callback: impl Fn(f32),
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let mut pipeline = MusicGenPipeline::load(model_dir)?;
-    pipeline.generate(prompt, progress_callback)
+    pipeline.generate(prompt, params, progress_callback)
 }
 
 /// Generate audio from a text prompt combined with input audio using a MusicGen ONNX model.

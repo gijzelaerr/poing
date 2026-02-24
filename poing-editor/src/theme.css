@@ -81,6 +81,12 @@ textbox {
     height: auto;
 }
 
+textbox.small {
+    child-space: 4px;
+    child-left: 6px;
+    child-right: 6px;
+}
+
 dropdown {
     background-color: #1a1a2e;
     border-width: 1px;
