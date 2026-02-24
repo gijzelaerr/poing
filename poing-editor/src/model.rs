@@ -10,7 +10,9 @@ pub enum PoingEvent {
     Generate,
     ToggleRecording,
     Export,
+    ExportStatus(String),
     BrowseModel,
+    BrowseModelResult(PathBuf),
     RemoveModel,
     SelectModel(usize),
     SetPrompt(String),
@@ -231,59 +233,70 @@ impl PoingModel {
             return;
         };
 
-        let result = rfd::FileDialog::new()
-            .set_file_name("poing_generated.wav")
-            .add_filter("WAV", &["wav"])
-            .save_file();
+        // Spawn dialog on background thread to avoid RefCell re-entrancy from
+        // macOS modal event loop. rfd dispatches to the main thread internally.
+        let mut proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = rfd::FileDialog::new()
+                .set_file_name("poing_generated.wav")
+                .add_filter("WAV", &["wav"])
+                .save_file();
 
-        if let Some(path) = result {
-            match poing_core::wav::write_wav(&samples, 32000, &path) {
-                Ok(()) => {
-                    self.status_text = format!("Exported to {}", path.display());
-                }
-                Err(e) => {
-                    self.status_text = format!("Export failed: {}", e);
-                }
+            if let Some(path) = result {
+                let status = match poing_core::wav::write_wav(&samples, 32000, &path) {
+                    Ok(()) => format!("Exported to {}", path.display()),
+                    Err(e) => format!("Export failed: {}", e),
+                };
+                let _ = proxy.emit(PoingEvent::ExportStatus(status));
             }
-        }
+        });
     }
 
     fn browse_model(&mut self, _cx: &mut EventContext) {
-        let result = rfd::FileDialog::new()
-            .set_title("Select Model Directory")
-            .pick_folder();
+        // Spawn dialog on background thread to avoid RefCell re-entrancy from
+        // macOS modal event loop. rfd dispatches to the main thread internally.
+        let mut proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = rfd::FileDialog::new()
+                .set_title("Select Model Directory")
+                .pick_folder();
 
-        if let Some(path) = result {
-            if !config::validate_model_dir(&path) {
-                *self.shared_state.generation_state.lock().unwrap() = GenerationState::Error(
-                    "Invalid model directory: missing required files (text_encoder.onnx, decoder_model_merged.onnx, encodec_decode.onnx, tokenizer.json)".into(),
-                );
-                return;
+            if let Some(path) = result {
+                let _ = proxy.emit(PoingEvent::BrowseModelResult(path));
             }
+        });
+    }
 
-            let index = {
-                let mut model_paths = self.shared_state.model_paths.lock().unwrap();
-                if !model_paths.contains(&path) {
-                    model_paths.push(path.clone());
-                    let cfg = config::PoingConfig {
-                        model_paths: model_paths.clone(),
-                    };
-                    config::save_config(&cfg);
-                }
-                model_paths
-                    .iter()
-                    .position(|p| p == &path)
-                    .unwrap_or(0)
-            };
-
-            *self.shared_state.model_path.lock().unwrap() = Some(path);
-            let model_paths = self.shared_state.model_paths.lock().unwrap().clone();
-            self.model_names = Self::paths_to_names(&model_paths);
-            self.selected_model_index = index;
-            self.selected_model_name = self.model_names.get(index).cloned().unwrap_or_default();
-
-            *self.shared_state.generation_state.lock().unwrap() = GenerationState::Idle;
+    fn handle_browse_result(&mut self, path: &PathBuf) {
+        if !config::validate_model_dir(path) {
+            *self.shared_state.generation_state.lock().unwrap() = GenerationState::Error(
+                "Invalid model directory: missing required files (text_encoder.onnx, decoder_model_merged.onnx, encodec_decode.onnx, tokenizer.json)".into(),
+            );
+            return;
         }
+
+        let index = {
+            let mut model_paths = self.shared_state.model_paths.lock().unwrap();
+            if !model_paths.contains(path) {
+                model_paths.push(path.clone());
+                let cfg = config::PoingConfig {
+                    model_paths: model_paths.clone(),
+                };
+                config::save_config(&cfg);
+            }
+            model_paths
+                .iter()
+                .position(|p| p == path)
+                .unwrap_or(0)
+        };
+
+        *self.shared_state.model_path.lock().unwrap() = Some(path.clone());
+        let model_paths = self.shared_state.model_paths.lock().unwrap().clone();
+        self.model_names = Self::paths_to_names(&model_paths);
+        self.selected_model_index = index;
+        self.selected_model_name = self.model_names.get(index).cloned().unwrap_or_default();
+
+        *self.shared_state.generation_state.lock().unwrap() = GenerationState::Idle;
     }
 
     fn remove_selected_model(&mut self, _cx: &mut EventContext) {
@@ -341,7 +354,15 @@ impl Model for PoingModel {
             PoingEvent::Generate => self.start_generation(cx),
             PoingEvent::ToggleRecording => self.toggle_recording(cx),
             PoingEvent::Export => self.export_audio(cx),
+            PoingEvent::ExportStatus(status) => {
+                self.status_text = status.clone();
+                cx.needs_redraw();
+            }
             PoingEvent::BrowseModel => self.browse_model(cx),
+            PoingEvent::BrowseModelResult(path) => {
+                self.handle_browse_result(path);
+                cx.needs_redraw();
+            }
             PoingEvent::RemoveModel => self.remove_selected_model(cx),
             PoingEvent::SelectModel(index) => self.select_model(*index),
             PoingEvent::SetPrompt(text) => self.prompt = text.clone(),
