@@ -79,4 +79,4 @@ Key VIZIA patterns used:
 
 ## CI
 
-GitHub Actions builds on macOS, Windows, and Linux. No Makepad clone step needed (removed during VIZIA migration). Linux needs: libx11-dev, libxcursor-dev, libxrandr-dev, libxi-dev, libgl1-mesa-dev, libegl1-mesa-dev, libwayland-dev, libxkbcommon-dev, libasound2-dev, libpulse-dev.
+GitHub Actions builds on macOS, Windows, and Linux. No Makepad clone step needed (removed during VIZIA migration). Linux needs: libx11-dev, libx11-xcb-dev, libxcursor-dev, libxrandr-dev, libxi-dev, libgl1-mesa-dev, libegl1-mesa-dev, libwayland-dev, libxkbcommon-dev, libasound2-dev, libpulse-dev.
