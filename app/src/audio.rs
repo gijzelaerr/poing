@@ -1,5 +1,6 @@
 //! Stem loading (makepad-audio-decode: wav/flac/mp3/ogg), waveform peaks, the
 //! mixer (shared by live playback and the offline render) and the job worker.
+use makepad_micro_serde::*;
 
 use crate::model::Project;
 use makepad_widgets::*;
@@ -13,6 +14,10 @@ use std::sync::{Arc, Mutex};
 pub const PEAK_BLOCK: usize = 256;
 /// Region edges fade over this many seconds, in playback and render alike.
 const REGION_RAMP_S: f64 = 0.010;
+
+/// A song's lanes, in track order. Each stem is shared, so adding lanes copies
+/// pointers, not audio.
+pub type Stems = Arc<Vec<Arc<Stem>>>;
 
 pub struct Stem {
     pub l: Vec<f32>,
@@ -122,7 +127,7 @@ impl MixParams {
 
 /// Mix frames [start, start + out_l.len()) of all stems into out_l / out_r
 /// (overwrites). Resampling to the device rate is the caller's business.
-pub fn mix_into(stems: &[Stem], mix: &MixParams, sr: u32, start: usize, out_l: &mut [f32], out_r: &mut [f32]) {
+pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out_l: &mut [f32], out_r: &mut [f32]) {
     out_l.iter_mut().for_each(|x| *x = 0.0);
     out_r.iter_mut().for_each(|x| *x = 0.0);
     let inv_sr = 1.0 / sr as f64;
@@ -150,11 +155,24 @@ pub struct Shared {
     pub playing: AtomicBool,
     pub pos: AtomicU64,
     pub mix: Mutex<MixParams>,
+    /// Swapped by generation: the UI publishes a new set and keeps the old one
+    /// until `stems_seen` shows the callback switched, so a stem set's final
+    /// drop never happens on the audio thread.
+    pub stems: Mutex<Stems>,
+    pub stems_gen: AtomicU64,
+    pub stems_seen: AtomicU64,
 }
 
 impl Shared {
-    pub fn new(mix: MixParams) -> Self {
-        Self { playing: AtomicBool::new(false), pos: AtomicU64::new(0), mix: Mutex::new(mix) }
+    pub fn new(mix: MixParams, stems: Stems) -> Self {
+        Self {
+            playing: AtomicBool::new(false),
+            pos: AtomicU64::new(0),
+            mix: Mutex::new(mix),
+            stems: Mutex::new(stems),
+            stems_gen: AtomicU64::new(0),
+            stems_seen: AtomicU64::new(0),
+        }
     }
     pub fn pos(&self) -> usize {
         self.pos.load(Ordering::Relaxed) as usize
@@ -173,10 +191,11 @@ impl Shared {
 /// Install the stem player on audio output 0. Owns its scratch buffers; the hot
 /// path neither allocates (after the first callbacks size them) nor blocks.
 /// `POING_MUTE` keeps agent/test instances silent.
-pub fn start_output(cx: &mut Cx, stems: Arc<Vec<Stem>>, shared: Arc<Shared>, sr: u32) {
-    let total = stems.iter().map(|s| s.l.len()).max().unwrap_or(0);
+pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let muted = std::env::var_os("POING_MUTE").is_some();
     let mut cache = MixParams::default();
+    let mut stems: Stems = shared.stems.lock().map(|s| s.clone()).unwrap_or_default();
+    let mut stems_gen = shared.stems_gen.load(Ordering::Acquire);
     let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
     cx.audio_output(0, move |info, out| {
         out.zero();
@@ -185,6 +204,16 @@ pub fn start_output(cx: &mut Cx, stems: Arc<Vec<Stem>>, shared: Arc<Shared>, sr:
                 cache.clone_from(&m);
             }
         }
+        let gen = shared.stems_gen.load(Ordering::Acquire);
+        if gen != stems_gen {
+            if let Ok(s) = shared.stems.try_lock() {
+                // The UI still holds the previous set: never its last reference here.
+                stems = s.clone();
+                stems_gen = gen;
+                shared.stems_seen.store(gen, Ordering::Release);
+            }
+        }
+        let total = stems.iter().map(|s| s.l.len()).max().unwrap_or(0);
         if !shared.playing() {
             return;
         }
@@ -224,7 +253,10 @@ pub fn start_output(cx: &mut Cx, stems: Arc<Vec<Stem>>, shared: Arc<Shared>, sr:
 // ---------------------------------------------------------------- jobs worker
 
 pub enum Job {
-    Render { stems: Arc<Vec<Stem>>, mix: MixParams, sr: u32, out_dir: PathBuf, name: String },
+    Render { stems: Stems, mix: MixParams, sr: u32, out_dir: PathBuf, name: String },
+    /// Understand a song: run the analysis sidecar on `audio`, writing into the
+    /// `bundle`, then decode the new stems at `sr`.
+    Analyze { audio: PathBuf, bundle: PathBuf, sr: u32 },
 }
 
 /// Progress and results the worker sends to the UI (after each send it raises
@@ -232,6 +264,10 @@ pub enum Job {
 pub enum JobUpdate {
     Status(String),
     Done(String),
+    /// Analysis progress, 0..1 over the whole job.
+    Progress { message: String, progress: f32 },
+    /// analysis.json is written and its stems decoded: (track id, file, stem).
+    Analyzed { bundle: PathBuf, stems: Vec<(String, String, Stem)> },
 }
 
 pub struct Jobs {
@@ -250,6 +286,7 @@ impl Jobs {
                 while let Ok(job) = job_rx.recv() {
                     match job {
                         Job::Render { stems, mix, sr, out_dir, name } => render(&stems, &mix, sr, &out_dir, &name, &up_tx),
+                        Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
                     }
                 }
             })
@@ -306,7 +343,7 @@ fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::io::
 
 /// Full mix -> 24-bit WAV, then (when ffmpeg exists) two-pass loudnorm to
 /// -14 LUFS / -1 dBTP as a 320k MP3.
-pub fn render(stems: &[Stem], mix: &MixParams, sr: u32, out_dir: &Path, name: &str, tx: &Sender<JobUpdate>) {
+pub fn render(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, out_dir: &Path, name: &str, tx: &Sender<JobUpdate>) {
     send(tx, JobUpdate::Status("Rendering mix...".into()));
     let frames = stems.iter().map(|s| s.l.len()).max().unwrap_or(0);
     let (mut l, mut r) = (vec![0f32; frames], vec![0f32; frames]);
@@ -371,4 +408,90 @@ pub fn render(stems: &[Stem], mix: &MixParams, sr: u32, out_dir: &Path, name: &s
             format!("Rendered {} (MP3 encode failed)", wav.display())
         }),
     );
+}
+
+// ------------------------------------------------------------ analysis sidecar
+
+/// Where the analysis sidecar (a uv project) lives: `POING_SIDECAR`, else the
+/// repository's `sidecar/` next to this crate (development builds).
+pub fn sidecar_dir() -> PathBuf {
+    std::env::var_os("POING_SIDECAR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("sidecar"))
+}
+
+/// One progress line the sidecar prints on stdout.
+#[derive(makepad_micro_serde::DeJson)]
+struct SidecarLine {
+    stage: String,
+    progress: Option<f64>,
+    message: Option<String>,
+}
+
+/// Run the sidecar on `audio` into `bundle`, relaying its progress, then decode
+/// the stems it wrote. Its stderr goes to `bundle/analysis.log`.
+fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
+    use makepad_micro_serde::DeJson;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let progress = |message: &str, progress: f32| send(tx, JobUpdate::Progress { message: message.into(), progress });
+    progress("Starting analysis", 0.0);
+    let dir = sidecar_dir();
+    let log = match std::fs::File::create(bundle.join("analysis.log")) {
+        Ok(f) => f,
+        Err(e) => return send(tx, JobUpdate::Done(format!("Analysis failed: {e}"))),
+    };
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&dir).arg("python").arg(dir.join("poing_analyze.py")).arg(audio).arg(bundle)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
+    // SheetSage2 decodes audio with the ffmpeg CLI; put the one we found on PATH.
+    if let Some(ff) = ffmpeg().and_then(|f| f.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![ff];
+        paths.extend(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return send(tx, JobUpdate::Done(format!("Analysis needs `uv` on PATH ({e})"))),
+    };
+    let mut error = None;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
+            let message = l.message.unwrap_or_default();
+            if l.stage == "error" {
+                error = Some(message);
+            } else {
+                progress(&message, l.progress.unwrap_or(0.0) as f32);
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if !ok || error.is_some() {
+        let why = error.unwrap_or_else(|| "the sidecar exited with an error".into());
+        return send(tx, JobUpdate::Done(format!("Analysis failed: {why} (see {})", bundle.join("analysis.log").display())));
+    }
+    progress("Loading stems", 1.0);
+    let mut stems = Vec::new();
+    for (id, _) in poing_model::STEMS {
+        let file = format!("stems/{id}.wav");
+        match load_stem(&bundle.join(&file), sr) {
+            Ok(stem) => stems.push((id.to_string(), file, stem)),
+            Err(e) => return send(tx, JobUpdate::Done(format!("Analysis failed: {e}"))),
+        }
+    }
+    send(tx, JobUpdate::Analyzed { bundle: bundle.to_path_buf(), stems });
 }

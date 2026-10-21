@@ -1,9 +1,10 @@
 //! Editor state shared between the App (inspector, transport) and the Timeline
 //! widget through Scope data.
 
-use crate::audio::{MixParams, Shared, Stem};
-use crate::model::{default_gain_for, Project, Region};
+use crate::audio::{MixParams, Shared, Stem, Stems};
+use crate::model::{default_gain_for, Analysis, Project, Region};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17,8 +18,12 @@ pub enum Selection {
 pub struct EditorState {
     pub project: Project,
     pub path: PathBuf,
-    pub stems: Arc<Vec<Stem>>,
+    pub stems: Stems,
     pub shared: Arc<Shared>,
+    /// Stem sets the audio thread may still hold; dropped here once it moved on.
+    retired: Vec<Stems>,
+    /// Analysis in progress: (message, 0..1). None when idle.
+    pub analysing: Option<(String, f32)>,
     pub sel: Selection,
     /// pixels per second; 0 asks the timeline to fit the song on its next draw
     pub pps: f64,
@@ -41,11 +46,14 @@ impl EditorState {
             .max()
             .unwrap_or(0)
             + 1;
+        let stems: Stems = Arc::new(stems.into_iter().map(Arc::new).collect());
         Self {
             project,
             path,
-            stems: Arc::new(stems),
-            shared: Arc::new(Shared::new(mix)),
+            shared: Arc::new(Shared::new(mix, stems.clone())),
+            stems,
+            retired: Vec::new(),
+            analysing: None,
             sel: Selection::None,
             pps: 0.0,
             scroll_t: 0.0,
@@ -58,6 +66,46 @@ impl EditorState {
 
     pub fn sr(&self) -> u32 {
         self.project.sr()
+    }
+
+    /// Merge a finished analysis: new stem lanes join the song while it keeps
+    /// playing, sections and chords appear, and the project is saved.
+    pub fn apply_analysis(&mut self, analysis: Analysis, stems: Vec<(String, String, Stem)>) -> Result<(), String> {
+        let files: Vec<(String, String)> = stems.iter().map(|(id, file, _)| (id.clone(), file.clone())).collect();
+        let added = self.project.apply_analysis(analysis, &files);
+        let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+        for (id, _, stem) in stems {
+            if self.project.track_index(&id).is_some_and(|i| added.contains(&i)) {
+                lanes.push(Arc::new(stem));
+            }
+        }
+        if lanes.len() != self.project.tracks.len() {
+            return Err(format!("analysis lanes {} != tracks {}", lanes.len(), self.project.tracks.len()));
+        }
+        self.publish_stems(Arc::new(lanes));
+        self.push_mix();
+        self.analysing = None;
+        self.sel_changed = true;
+        self.save()
+    }
+
+    /// Hand the audio thread a new stem set; keep the old one until it switched.
+    fn publish_stems(&mut self, stems: Stems) {
+        let old = std::mem::replace(&mut self.stems, stems.clone());
+        if let Ok(mut s) = self.shared.stems.lock() {
+            *s = stems;
+        }
+        self.shared.stems_gen.fetch_add(1, Ordering::AcqRel);
+        self.retired.push(old);
+    }
+
+    /// Drop retired stem sets once the audio thread runs on the current one.
+    pub fn collect_retired(&mut self) {
+        if !self.retired.is_empty()
+            && self.shared.stems_seen.load(Ordering::Acquire) == self.shared.stems_gen.load(Ordering::Acquire)
+        {
+            self.retired.clear();
+        }
     }
     pub fn duration(&self) -> f64 {
         self.project.duration

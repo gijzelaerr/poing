@@ -9,3 +9,4 @@ license.workspace = true
 poing-model.workspace = true
 makepad-widgets.workspace = true
 makepad-audio-decode.workspace = true
+makepad-micro-serde.workspace = true

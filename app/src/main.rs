@@ -14,9 +14,10 @@ mod timeline;
 
 use audio::{Job, JobUpdate, Jobs, Stem};
 use makepad_widgets::*;
-use model::{default_gain_for, Project, REGION_KINDS};
+use makepad_micro_serde::DeJson;
+use model::{default_gain_for, Analysis, Project, REGION_KINDS};
 use state::{EditorState, Selection};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use timeline::kind_index;
 
 app_main!(App);
@@ -96,13 +97,67 @@ pub struct App {
     jobs: Option<Jobs>,
 }
 
-fn project_path() -> PathBuf {
-    std::env::args()
-        .skip(1)
-        .find(|a| a.ends_with(".json"))
+/// Audio Poing can import (what makepad-audio-decode reads).
+const AUDIO_EXT: [&str; 4] = ["mp3", "wav", "flac", "ogg"];
+
+/// What the command line asks to open: a project, or a song to import.
+enum Open {
+    Project(PathBuf),
+    Audio(PathBuf),
+}
+
+fn open_target() -> Open {
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    let is_audio = |a: &String| {
+        Path::new(a).extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_EXT.contains(&e.to_ascii_lowercase().as_str()))
+    };
+    if let Some(a) = args.iter().find(|a| is_audio(a)) {
+        return Open::Audio(PathBuf::from(a));
+    }
+    let project = args
+        .iter()
+        .find(|a| a.ends_with(".json") || a.ends_with(".poing"))
+        .cloned()
         .or_else(|| std::env::var("POING_PROJECT").ok())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("project.json"))
+        .unwrap_or_else(|| PathBuf::from("project.json"));
+    // A bundle folder opens its project.json.
+    Open::Project(if project.extension().is_some_and(|e| e == "poing") { project.join("project.json") } else { project })
+}
+
+/// Import a song: `<song>.poing/` beside it holds a copy of the original and the
+/// project; an existing bundle is reopened. Returns the project file and
+/// whether the song still needs analysing.
+fn import(audio: &Path, sr: u32) -> Result<(PathBuf, bool), String> {
+    let name = audio.file_stem().and_then(|s| s.to_str()).ok_or("bad file name")?.to_string();
+    let bundle = audio.with_file_name(format!("{name}.poing"));
+    let project_file = bundle.join("project.json");
+    if project_file.exists() {
+        let p = Project::load(&project_file)?;
+        return Ok((project_file, !p.is_analysed()));
+    }
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("create {}: {e}", bundle.display()))?;
+    let ext = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav").to_ascii_lowercase();
+    let source = format!("original.{ext}");
+    std::fs::copy(audio, bundle.join(&source)).map_err(|e| format!("copy {}: {e}", audio.display()))?;
+    let original = audio::load_stem(&bundle.join(&source), sr)?;
+    let duration = original.l.len() as f64 / sr as f64;
+    Project::import(&name, &source, duration, sr).save(&project_file)?;
+    Ok((project_file, true))
+}
+
+/// "Song name · E minor · 125 bpm"
+fn song_title(p: &Project) -> String {
+    let mut t = p.name.clone();
+    if let Some(a) = &p.analysis {
+        if let Some(k) = &a.key {
+            t.push_str(&format!("  ·  {k}"));
+        }
+        if let Some(bpm) = a.tempo {
+            t.push_str(&format!("  ·  {bpm:.0} bpm"));
+        }
+    }
+    t
 }
 
 const HELP: &str =
@@ -110,25 +165,40 @@ const HELP: &str =
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
-        let path = project_path();
-        let result = (|| -> Result<EditorState, String> {
+        let result = (|| -> Result<(EditorState, bool), String> {
+            let (path, analyse) = match open_target() {
+                Open::Project(path) => (path, false),
+                Open::Audio(audio) => import(&audio, 48000)?,
+            };
             let project = Project::load(&path)?;
             let mut stems: Vec<Stem> = Vec::new();
             for i in 0..project.tracks.len() {
                 stems.push(audio::load_stem(&project.track_path(&path, i), project.sr())?);
             }
-            Ok(EditorState::new(project, path.clone(), stems))
+            Ok((EditorState::new(project, path, stems), analyse))
         })();
         match result {
-            Ok(st) => {
-                self.ui.label(cx, ids!(project_label)).set_text(cx, &format!("{}   ({})", st.project.name, st.path.display()));
-                audio::start_output(cx, st.stems.clone(), st.shared.clone(), st.sr());
+            Ok((mut st, analyse)) => {
+                self.ui.label(cx, ids!(project_label)).set_text(cx, &song_title(&st.project));
+                audio::start_output(cx, st.shared.clone(), st.sr());
+                if analyse {
+                    self.start_analysis(&mut st);
+                }
                 self.state = Some(st);
             }
             Err(e) => {
-                self.ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Could not open project: {e}"));
-                log!("daw: load failed: {e}");
+                self.ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Could not open: {e}"));
+                log!("poing: load failed: {e}");
             }
+        }
+    }
+
+    /// Understand the song in the background; lanes fill in when it lands.
+    fn start_analysis(&self, st: &mut EditorState) {
+        let (Some(jobs), Some(source)) = (&self.jobs, st.project.source.clone()) else { return };
+        let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        if jobs.submit(Job::Analyze { audio: bundle.join(source), bundle, sr: st.sr() }) {
+            st.analysing = Some(("Starting analysis".into(), 0.0));
         }
     }
 
@@ -183,17 +253,56 @@ impl App {
     }
 
     fn drain_jobs(&mut self, cx: &mut Cx) {
-        let mut last = None;
+        let mut updates = Vec::new();
         if let Some(jobs) = &self.jobs {
             while let Ok(u) = jobs.rx.try_recv() {
-                last = Some(match u {
-                    JobUpdate::Status(s) | JobUpdate::Done(s) => s,
-                });
+                updates.push(u);
             }
         }
-        if let Some(s) = last {
-            self.set_status(cx, &s);
+        for u in updates {
+            let status = match u {
+                JobUpdate::Status(s) => s,
+                JobUpdate::Done(s) => {
+                    if let Some(st) = &mut self.state {
+                        st.analysing = None;
+                    }
+                    s
+                }
+                JobUpdate::Progress { message, progress } => {
+                    let line = format!("Analysing  ·  {message}  {:.0}%", progress * 100.0);
+                    if let Some(st) = &mut self.state {
+                        st.analysing = Some((message, progress));
+                    }
+                    line
+                }
+                JobUpdate::Analyzed { bundle, stems } => {
+                    let Some(st) = &mut self.state else { continue };
+                    let file = bundle.join("analysis.json");
+                    let result = std::fs::read_to_string(&file)
+                        .map_err(|e| format!("read {}: {e}", file.display()))
+                        .and_then(|t| Analysis::deserialize_json_lenient(&t).map_err(|e| format!("parse {}: {e:?}", file.display())))
+                        .and_then(|a| st.apply_analysis(a, stems));
+                    match result {
+                        Ok(()) => {
+                            self.ui.label(cx, ids!(project_label)).set_text(cx, &song_title(&st.project));
+                            let a = st.project.analysis.as_ref();
+                            format!(
+                                "Understood: {} sections, {} chords, {} lyric lines",
+                                st.project.sections().len(),
+                                a.and_then(|a| a.chords.as_ref()).map_or(0, |c| c.len()),
+                                a.and_then(|a| a.lyrics.as_ref()).map_or(0, |l| l.len()),
+                            )
+                        }
+                        Err(e) => {
+                            st.analysing = None;
+                            format!("Analysis could not be applied: {e}")
+                        }
+                    }
+                }
+            };
+            self.set_status(cx, &status);
         }
+        self.ui.widget(cx, ids!(timeline)).redraw(cx);
     }
 }
 

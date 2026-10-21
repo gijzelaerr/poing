@@ -13,7 +13,34 @@ pub struct Project {
     pub sample_rate: Option<u32>,
     pub sections: Option<Vec<Section>>,
     pub regions: Option<Vec<Region>>,
+    /// The imported audio file, relative to the project (bundles made by import).
+    pub source: Option<String>,
+    /// What the analysis found; absent until it has run.
+    pub analysis: Option<Analysis>,
 }
+
+/// Song understanding, as written by the analysis sidecar (`analysis.json`).
+#[derive(SerJson, DeJson, Clone, Debug, Default)]
+pub struct Analysis {
+    pub tempo: Option<f64>,
+    pub key: Option<String>,
+    pub beats: Option<Vec<f64>>,
+    pub downbeats: Option<Vec<f64>>,
+    /// Chord spans, e.g. label "F#", "Em", "B7".
+    pub chords: Option<Vec<Section>>,
+    pub sections: Option<Vec<Section>>,
+    pub lyrics: Option<Vec<LyricLine>>,
+}
+
+#[derive(SerJson, DeJson, Clone, Debug)]
+pub struct LyricLine {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// The stems the analysis separates, in lane order: (track id, display name).
+pub const STEMS: [(&str, &str); 4] = [("vocals", "Vocals"), ("drums", "Drums"), ("bass", "Bass"), ("other", "Other")];
 
 #[derive(SerJson, DeJson, Clone, Debug)]
 pub struct Track {
@@ -86,9 +113,63 @@ impl Region {
 }
 
 impl Project {
+    /// A fresh project for an imported song: one "Original" lane playing the
+    /// source file, everything else filled in when the analysis lands.
+    pub fn import(name: &str, source_file: &str, duration: f64, sample_rate: u32) -> Self {
+        Project {
+            name: name.to_string(),
+            duration,
+            tracks: vec![Track {
+                id: "original".into(),
+                name: "Original".into(),
+                file: source_file.to_string(),
+                gain_db: None,
+                mute: None,
+                solo: None,
+            }],
+            sample_rate: Some(sample_rate),
+            sections: Some(Vec::new()),
+            regions: Some(Vec::new()),
+            source: Some(source_file.to_string()),
+            analysis: None,
+        }
+    }
+
+    pub fn is_analysed(&self) -> bool {
+        self.analysis.is_some()
+    }
+
+    /// Merge an analysis: add the stem lanes (before any existing ones), mute the
+    /// original so the stems are what plays, and take its sections when the
+    /// project has none yet. Returns the indices of the tracks it added.
+    pub fn apply_analysis(&mut self, analysis: Analysis, stem_files: &[(String, String)]) -> Vec<usize> {
+        let mut added = Vec::new();
+        for (id, file) in stem_files {
+            if self.track_index(id).is_some() {
+                continue;
+            }
+            let name = STEMS.iter().find(|(s, _)| s == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.clone());
+            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None });
+            added.push(self.tracks.len() - 1);
+        }
+        if !added.is_empty() {
+            if let Some(i) = self.track_index("original") {
+                self.tracks[i].mute = Some(true);
+            }
+        }
+        if self.sections().is_empty() {
+            if let Some(secs) = &analysis.sections {
+                *self.sections_mut() = secs.clone();
+            }
+        }
+        self.analysis = Some(analysis);
+        added
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let mut p = Project::deserialize_json(&text).map_err(|e| format!("parse {}: {e:?}", path.display()))?;
+        // Lenient: fields from newer versions are skipped, not an error.
+        let mut p = Project::deserialize_json_lenient(&text).map_err(|e| format!("parse {}: {e:?}", path.display()))?;
         p.sections.get_or_insert_with(Vec::new);
         p.regions.get_or_insert_with(Vec::new);
         Ok(p)
@@ -150,7 +231,44 @@ mod tests {
             sample_rate: Some(48000),
             sections: Some(vec![Section { start: 0.0, end: 2.0, label: "verse".into() }]),
             regions: Some(regions),
+            source: None,
+            analysis: None,
         }
+    }
+
+    #[test]
+    fn import_then_analysis_adds_stems_and_sections() {
+        let mut p = Project::import("song", "original.mp3", 10.0, 48000);
+        assert_eq!(p.tracks.len(), 1);
+        let a = Analysis {
+            tempo: Some(123.0),
+            key: Some("F major".into()),
+            sections: Some(vec![Section { start: 0.0, end: 5.0, label: "intro".into() }, Section { start: 5.0, end: 10.0, label: "verse".into() }]),
+            ..Default::default()
+        };
+        let stems: Vec<(String, String)> = STEMS.iter().map(|(id, _)| (id.to_string(), format!("stems/{id}.wav"))).collect();
+        let added = p.apply_analysis(a, &stems);
+        assert_eq!(added.len(), 4);
+        assert_eq!(p.tracks[1].name, "Vocals");
+        assert!(p.tracks[0].muted(), "original is muted once stems exist");
+        assert_eq!(p.sections().len(), 2);
+        assert!(p.is_analysed());
+        // applying again does not duplicate lanes
+        let again = p.apply_analysis(Analysis::default(), &stems);
+        assert!(again.is_empty() && p.tracks.len() == 5);
+    }
+
+    #[test]
+    fn analysis_json_from_the_sidecar_parses() {
+        let json = r#"{"tempo":123.0,"key":"E minor","beats":[0.5,1.0],"downbeats":[0.5],
+            "chords":[{"start":0.0,"end":1.9,"label":"Em"}],
+            "sections":[{"start":0.0,"end":5.9,"label":"intro"}],
+            "lyrics":[{"start":15.4,"end":19.8,"text":"hear the wind"}],
+            "stems":{"vocals":"stems/vocals.wav"}}"#;
+        let a = Analysis::deserialize_json_lenient(json).unwrap();
+        assert_eq!(a.key.as_deref(), Some("E minor"));
+        assert_eq!(a.chords.unwrap()[0].label, "Em");
+        assert_eq!(a.lyrics.unwrap()[0].text, "hear the wind");
     }
 
     fn region(kind: &str, gain_db: f64) -> Region {
