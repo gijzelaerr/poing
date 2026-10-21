@@ -1,5 +1,10 @@
 /target
-models/
-*.onnx
-.idea/
+**/target/
+# model weights, reference audio and renders are downloaded/produced locally
+/models/
+/assets/audio/
 *.wav
+*.flac
+*.mp3
+.DS_Store
+

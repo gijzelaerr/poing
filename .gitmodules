@@ -1,3 +1,0 @@
-[submodule "lib/baseview"]
-	path = lib/baseview
-	url = https://github.com/RustAudio/baseview.git
