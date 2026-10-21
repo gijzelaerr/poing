@@ -128,12 +128,24 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 
 ## 7. CI and quality
 
-- **GitHub Actions** matrix: `macos-latest` (arm64), `windows-latest`, `ubuntu-latest`. Build, `cargo test`, and a headless smoke test of the app (Makepad `--remote` + `MAKEPAD_HIDE_WINDOWS=1`; Linux under a virtual display). CPU-only: GPU kernels build without CUDA in CI.
-- **GPU job** on a self-hosted runner (RTX 4070 Ti, Windows): model smoke tests (`yue2_render --check`, stem split, SNR gates as in Makepad PR #1322).
+- **GitHub Actions** matrix (hosted runners only): `macos-latest` (arm64), `windows-latest`, `ubuntu-latest`. Build, `cargo test`, and a headless smoke test of the app (Makepad `--remote` + `MAKEPAD_HIDE_WINDOWS=1`; Linux under a virtual display). CPU-only: GPU kernels build without CUDA in CI.
+- **GPU and model tests run by hand**, not in CI. `cargo xtask gpu-check` runs on the RTX 4070 Ti dev PC (Windows, CUDA): `yue2_render --check`, stem split, SNR gates as in Makepad PR #1322. Results are recorded per milestone.
+- **Metal/AU tests by hand on the Mac** at each milestone (no Mac runner).
 - **Golden tests:** the two reference songs' stems, scores and expected renders (hashes, SNR thresholds), with audio stored outside git and fetched by `xtask`.
-- **Releases:** tagged builds → signed and notarised macOS `.dmg`, signed Windows installer, Linux AppImage. Needs signing identities.
+- **Releases:** unsigned CI builds until M8. Then signed and notarised macOS `.dmg`, signed Windows installer, Linux AppImage (needs an Apple Developer ID and a Windows signing certificate).
 
-## 8. Risks
+## 8. Decisions (2026-10-21)
+
+| Topic | Decision |
+| --- | --- |
+| First use | **Remixing existing songs**: M0–M4 come first (import → understand → replace sections/stems as takes) |
+| CI | Hosted GitHub runners only. GPU tests by hand on the Windows/CUDA dev PC; Metal/AU by hand on the Mac |
+| Signing | Later (M8); unsigned dev builds until then |
+| Agent autonomy | May push to `main` once a milestone's checks pass, open Makepad PRs, install dev tooling, use CI freely |
+| Makepad | `work` branch via a pinned git dependency; no commercial (VJ/Stage) code needed (Rik, 2026-10-21) |
+| Licence | Code MIT; model weights downloaded separately under their own licences |
+
+## 9. Risks
 
 | Risk | Mitigation |
 | --- | --- |
