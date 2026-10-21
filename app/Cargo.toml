@@ -1,0 +1,11 @@
+[package]
+name = "poing"
+description = "Poing: AI-native music workstation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+poing-model.workspace = true
+makepad-widgets.workspace = true
+makepad-audio-decode.workspace = true

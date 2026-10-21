@@ -1,0 +1,9 @@
+[package]
+name = "poing-model"
+description = "Poing project model: song, sections, stems, regions; project.json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+makepad-micro-serde.workspace = true

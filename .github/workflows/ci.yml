@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Agent/test instances never make sound.
+  POING_MUTE: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, name: macOS-arm64, exe: poing }
+          - { os: windows-latest, name: Windows-x86_64, exe: poing.exe }
+          - { os: ubuntu-latest, name: Linux-x86_64, exe: poing }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # The build-time package list from Makepad's tools/makepad_builder.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config libssl-dev \
+            libx11-dev libxcursor-dev libxkbcommon-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libasound2-dev libpulse-dev libwayland-dev wayland-protocols \
+            libegl-dev libgl-dev libglx-dev libdrm-dev libgbm-dev
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Test
+        run: cargo test --release --workspace --locked
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: poing-${{ matrix.name }}
+          path: target/release/${{ matrix.exe }}
+          if-no-files-found: error

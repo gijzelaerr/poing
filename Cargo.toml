@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["app", "model"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/gijzelaerr/poing"
+
+[workspace.dependencies]
+poing-model = { path = "model" }
+# Makepad 2.0 is not on crates.io. Pinned to a tag in gijzelaerr/makepad so the
+# commit stays fetchable when upstream rewrites `work` (see CLAUDE.md).
+makepad-widgets = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-audio-decode = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-micro-serde = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+
+# Makepad's own profiles: line tables for printf debugging, incremental release.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+incremental = true
+lto = "off"
