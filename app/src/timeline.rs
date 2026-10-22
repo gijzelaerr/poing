@@ -110,6 +110,8 @@ enum Drag {
     MoveRegion { region: usize, grab: f64 },
     ResizeRegion { region: usize, left: bool },
     SectionEdge { index: usize },
+    /// Dragging a lane's dB value sideways sets its level.
+    Gain { lane: usize, x0: f64, g0: f64 },
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -257,6 +259,10 @@ impl DawTimeline {
     fn mute_box(&self, lane: usize) -> Rect {
         Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 58.0, self.lane_y(lane) + 9.0), size: dvec2(22.0, 18.0) }
     }
+    /// The lane's dB value in its header: drag it to set the level.
+    fn gain_box(&self, lane: usize) -> Rect {
+        Rect { pos: dvec2(self.geo.rect.pos.x + 26.0, self.lane_y(lane) + 24.0), size: dvec2(80.0, 16.0) }
+    }
     fn solo_box(&self, lane: usize) -> Rect {
         Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 32.0, self.lane_y(lane) + 9.0), size: dvec2(22.0, 18.0) }
     }
@@ -340,19 +346,30 @@ impl DawTimeline {
     /// A lane's waveform: the peaks under each pixel column, drawn twice
     /// (the full swing faint, its inner half solid) for depth.
     fn wave(&mut self, cx: &mut Cx2d, st: &EditorState, stem: usize, ly: f64, lane_h: f64, color: Vec4f) {
+        let peak = st.stems.get(stem).map_or(1.0, |s| s.peak_abs);
+        self.wave_span(cx, st, stem, ly, lane_h, color, 0.0, (0.0, st.duration()), peak);
+    }
+
+    /// A stem's waveform over song time [from, to], the stem starting at song
+    /// time `at`, scaled so `peak` fills the lane (a take uses its lane's).
+    #[allow(clippy::too_many_arguments)]
+    fn wave_span(&mut self, cx: &mut Cx2d, st: &EditorState, stem: usize, ly: f64, lane_h: f64, color: Vec4f, at: f64, span: (f64, f64), peak: f32) {
         let Some(s) = st.stems.get(stem).cloned() else { return };
-        let scale = (lane_h * 0.42) / s.peak_abs as f64;
+        let scale = (lane_h * 0.42) / peak.max(1e-6) as f64;
         let mid = ly + lane_h * 0.5;
         let sr = st.sr() as f64;
         let (x0, w) = (self.geo.x0, self.geo.w);
         let faint = vec4(color.x, color.y, color.z, color.w * 0.45);
         for px in 0..(w as usize) {
             let t0 = st.scroll_t + px as f64 / st.pps;
-            if t0 >= st.duration() {
+            if t0 >= st.duration() || t0 >= span.1 {
                 break;
             }
-            let b0 = (t0 * sr) as usize / PEAK_BLOCK;
-            let b1 = (((t0 + 1.0 / st.pps) * sr) as usize / PEAK_BLOCK).max(b0 + 1).min(s.peaks.len());
+            if t0 < span.0 || t0 < at {
+                continue;
+            }
+            let b0 = ((t0 - at) * sr) as usize / PEAK_BLOCK;
+            let b1 = ((((t0 - at) + 1.0 / st.pps) * sr) as usize / PEAK_BLOCK).max(b0 + 1).min(s.peaks.len());
             if b0 >= b1 {
                 break;
             }
@@ -620,6 +637,22 @@ impl DawTimeline {
                 self.fx_chips_row(cx, st, Some(i), left + 16.0, ly + lh - 20.0, left + HEADER_W - 10.0);
             }
             self.wave(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.25) });
+            // A lane take that is on: its own audio over its range, on the lane's scale.
+            let lane_peak = st.stems.get(i).map_or(1.0, |s| s.peak_abs);
+            let takes_here: Vec<(usize, f64, f64)> = st
+                .active
+                .iter()
+                .filter_map(|id| st.project.take_index(id))
+                .filter(|&k| st.project.takes()[k].scope == "lane" && st.project.takes()[k].track.as_deref() == Some(tr.id.as_str()))
+                .map(|k| (st.project.tracks.len() + k, st.project.takes()[k].start, st.project.takes()[k].end))
+                .collect();
+            for (stem, start, end) in takes_here {
+                if let Some((x, tw)) = self.span(st, start, end) {
+                    self.rect(cx, x, ly + 1.0, tw, lh - 2.0, rgba(CARD, 1.0));
+                    let bright = vec4(col.x.min(1.0), col.y.min(1.0), col.z.min(1.0), if audible { 1.0 } else { 0.3 });
+                    self.wave_span(cx, st, stem, ly, lh, bright, start, (start, end), lane_peak);
+                }
+            }
         }
 
         // layers: one lane each, at their blend
@@ -809,7 +842,16 @@ impl Widget for DawTimeline {
                     }
                 } else if let Some(lane) = self.lane_at(y) {
                     if !in_wave {
-                        if self.mute_box(lane).contains(fe.abs) {
+                        if self.gain_box(lane).contains(fe.abs) {
+                            st.checkpoint();
+                            if fe.tap_count >= 2 {
+                                // double-click: back to 0 dB
+                                st.project.tracks[lane].gain_db = Some(0.0);
+                                st.push_mix();
+                            } else {
+                                self.drag = Drag::Gain { lane, x0: fe.abs.x, g0: st.project.tracks[lane].gain() };
+                            }
+                        } else if self.mute_box(lane).contains(fe.abs) {
                             st.checkpoint();
                             let t = &mut st.project.tracks[lane];
                             t.mute = Some(!t.muted());
@@ -873,6 +915,13 @@ impl Widget for DawTimeline {
                                 r.end = t.max(r.start + 0.05);
                             }
                         }
+                        st.push_mix();
+                        st.sel_changed = true;
+                    }
+                    Drag::Gain { lane, x0, g0 } => {
+                        // a tenth of a dB per pixel, in half-dB steps
+                        let g = ((g0 + (x - x0) * 0.1) * 2.0).round() / 2.0;
+                        st.project.tracks[lane].gain_db = Some(g.clamp(-36.0, 12.0));
                         st.push_mix();
                         st.sel_changed = true;
                     }
