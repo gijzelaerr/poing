@@ -156,8 +156,45 @@ script_mod! {
                     }
                     View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
 
-                    timeline := mod.widgets.DawTimeline{}
+                    // The start screen: shown until a song is open.
+                    home := View{
+                        visible: false
+                        width: Fill height: Fill flow: Down spacing: 10
+                        align: Align{x: 0.5 y: 0.38}
+                        Label{
+                            text: "Drop a song here"
+                            draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 22}}
+                        }
+                        Caption{
+                            text: "MP3, WAV, FLAC or OGG. Poing splits it into parts and finds its sections, chords and words; everything stays next to the song in a .poing folder."
+                        }
+                        home_error := Label{
+                            text: ""
+                            draw_text +: {color: #xff6961 text_style: theme.font_regular{font_size: 9.5}}
+                        }
+                        recent_box := View{
+                            width: Fit height: Fit flow: Down spacing: 6
+                            margin: Inset{top: 18 bottom: 0 left: 0 right: 0}
+                            align: Align{x: 0.5 y: 0.0}
+                            Caption{text: "Recent"}
+                            rec0 := PillButton{text: ""}
+                            rec1 := PillButton{text: ""}
+                            rec2 := PillButton{text: ""}
+                            rec3 := PillButton{text: ""}
+                            rec4 := PillButton{text: ""}
+                            rec5 := PillButton{text: ""}
+                            rec6 := PillButton{text: ""}
+                            rec7 := PillButton{text: ""}
+                        }
+                    }
 
+                    timeline_box := View{
+                        width: Fill height: Fill flow: Down
+                        timeline := mod.widgets.DawTimeline{}
+                    }
+
+                    inspector_box := View{
+                    width: Fill height: Fit flow: Down
                     View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
                     inspector := View{
                         width: Fill height: Fit flow: Down spacing: 10
@@ -210,6 +247,7 @@ script_mod! {
                         }
                         status_label := Caption{text: ""}
                     }
+                    }
                 }
             }
         }
@@ -229,6 +267,9 @@ pub struct App {
     /// Autosave: fires a moment after the last change (no Save button).
     #[rust]
     autosave: Timer,
+    /// The songs the start screen lists, in button order.
+    #[rust]
+    recent: Vec<PathBuf>,
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -240,23 +281,86 @@ enum Open {
     Audio(PathBuf),
 }
 
-fn open_target() -> Open {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
-    let is_audio = |a: &String| {
-        Path::new(a).extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_EXT.contains(&e.to_ascii_lowercase().as_str()))
-    };
-    if let Some(a) = args.iter().find(|a| is_audio(a)) {
-        return Open::Audio(PathBuf::from(a));
+/// What a path handed to Poing (an argument or a drop) opens: a song to
+/// import, a `.poing` bundle or a project file.
+fn target_for(path: &Path) -> Option<Open> {
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    if AUDIO_EXT.contains(&ext.as_str()) {
+        Some(Open::Audio(path.to_path_buf()))
+    } else if ext == "poing" || path.join("project.json").exists() {
+        Some(Open::Project(path.join("project.json")))
+    } else if ext == "json" {
+        Some(Open::Project(path.to_path_buf()))
+    } else {
+        None
     }
-    let project = args
-        .iter()
-        .find(|a| a.ends_with(".json") || a.ends_with(".poing"))
-        .cloned()
-        .or_else(|| std::env::var("POING_PROJECT").ok())
+}
+
+/// What the command line (or POING_PROJECT) asks to open; None shows the start screen.
+fn open_target() -> Option<Open> {
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    args.iter()
+        .find_map(|a| target_for(Path::new(a)))
+        .or_else(|| std::env::var("POING_PROJECT").ok().and_then(|p| target_for(Path::new(&p))))
+}
+
+/// Poing's own settings folder (the recent songs list lives there).
+fn config_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    }?;
+    Some(base.join(if cfg!(target_os = "linux") { "poing" } else { "Poing" }))
+}
+
+/// Songs opened before, newest first (project files that still exist).
+fn recent_songs() -> Vec<PathBuf> {
+    let Some(file) = config_dir().map(|d| d.join("recent.txt")) else { return Vec::new() };
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("project.json"));
-    // A bundle folder opens its project.json.
-    Open::Project(if project.extension().is_some_and(|e| e == "poing") { project.join("project.json") } else { project })
+        .filter(|p| p.exists())
+        .take(8)
+        .collect()
+}
+
+fn remember_song(project: &Path) {
+    let Some(dir) = config_dir() else { return };
+    let plain = |p: PathBuf| match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        // Windows canonical paths carry a verbatim prefix; keep the plain form
+        Some(s) => PathBuf::from(s),
+        None => p,
+    };
+    let project = plain(std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf()));
+    let mut list = vec![project.clone()];
+    list.extend(recent_songs().into_iter().map(plain).filter(|p| plain(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())) != project));
+    let text: Vec<String> = list.iter().take(8).map(|p| p.to_string_lossy().into_owned()).collect();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("recent.txt"), text.join("\n"));
+}
+
+/// A song's name for the start screen: its project's name, else its folder's.
+fn song_name(project: &Path) -> String {
+    Project::load(project).map(|p| p.name).unwrap_or_else(|_| {
+        project.parent().and_then(|d| d.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    })
+}
+
+/// An analysis that finished on disk but never reached the project (the
+/// app moved to another song meanwhile): its result and decoded stems.
+fn finished_analysis(bundle: &Path, sr: u32) -> Option<(Analysis, Vec<(String, String, Stem)>)> {
+    let text = std::fs::read_to_string(bundle.join("analysis.json")).ok()?;
+    let analysis = Analysis::deserialize_json_lenient(&text).ok()?;
+    let mut stems = Vec::new();
+    for (id, _) in model::STEMS {
+        let file = format!("stems/{id}.wav");
+        stems.push((id.to_string(), file.clone(), audio::load_stem(&bundle.join(&file), sr).ok()?));
+    }
+    Some((analysis, stems))
 }
 
 /// Import a song: `<song>.poing/` beside it holds a copy of the original and the
@@ -591,7 +695,41 @@ const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mar
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
-        self.open(cx, open_target());
+        match open_target() {
+            Some(target) => self.open(cx, target),
+            None => self.show_home(cx, None),
+        }
+    }
+
+    /// The start screen: drop a song, or pick one opened before.
+    fn show_home(&mut self, cx: &mut Cx, error: Option<&str>) {
+        let ui = self.ui.clone();
+        let songs = recent_songs();
+        let buttons = [ids!(rec0), ids!(rec1), ids!(rec2), ids!(rec3), ids!(rec4), ids!(rec5), ids!(rec6), ids!(rec7)];
+        for (i, b) in buttons.iter().enumerate() {
+            let btn = ui.button(cx, *b);
+            match songs.get(i) {
+                Some(p) => {
+                    btn.set_text(cx, &song_name(p));
+                    btn.set_visible(cx, true);
+                }
+                None => btn.set_visible(cx, false),
+            }
+        }
+        self.recent = songs;
+        ui.view(cx, ids!(recent_box)).set_visible(cx, !self.recent.is_empty());
+        ui.label(cx, ids!(home_error)).set_text(cx, error.unwrap_or(""));
+        self.show_song_view(cx, false);
+    }
+
+    /// Switch between the start screen and the song.
+    fn show_song_view(&mut self, cx: &mut Cx, song: bool) {
+        let ui = self.ui.clone();
+        ui.view(cx, ids!(home)).set_visible(cx, !song);
+        for id in [ids!(timeline_box), ids!(inspector_box)] {
+            ui.view(cx, id).set_visible(cx, song);
+        }
+        ui.redraw(cx);
     }
 
     /// Open a project or import a song. The audio output is installed once;
@@ -615,11 +753,23 @@ impl App {
             for t in project.takes() {
                 stems.push(audio::load_stem(&dir.join(&t.file), project.sr())?);
             }
-            Ok((EditorState::new(project, path, stems, shared.clone()), analyse))
+            let sr = project.sr();
+            let mut st = EditorState::new(project, path, stems, shared.clone());
+            // Analysed while another song was open: apply it from disk, no second run.
+            let mut analyse = analyse;
+            if analyse {
+                if let Some((analysis, stems)) = finished_analysis(&dir, sr) {
+                    st.apply_analysis(analysis, stems)?;
+                    analyse = false;
+                }
+            }
+            Ok((st, analyse))
         })();
         match result {
             Ok((mut st, analyse)) => {
                 show_title(&self.ui, cx, &st.project);
+                remember_song(&st.path);
+                self.show_song_view(cx, true);
                 if shared.is_none() {
                     audio::start_output(cx, st.shared.clone(), st.sr());
                 }
@@ -636,8 +786,12 @@ impl App {
                 }
             }
             Err(e) => {
-                self.ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Could not open: {e}"));
                 log!("poing: load failed: {e}");
+                if self.state.is_some() {
+                    self.set_status(cx, &format!("Could not open that: {e}"));
+                } else {
+                    self.show_home(cx, Some(&format!("Could not open that: {e}")));
+                }
             }
         }
     }
@@ -863,6 +1017,14 @@ impl MatchEvent for App {
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let ui = self.ui.clone();
+        let buttons = [ids!(rec0), ids!(rec1), ids!(rec2), ids!(rec3), ids!(rec4), ids!(rec5), ids!(rec6), ids!(rec7)];
+        if let Some(i) = buttons.iter().position(|b| ui.button(cx, *b).clicked(actions)) {
+            if let Some(p) = self.recent.get(i).cloned() {
+                self.open(cx, Open::Project(p));
+                self.refresh_inspector(cx);
+                return;
+            }
+        }
         let Some(st) = &mut self.state else { return };
         let mut status: Option<String> = None;
 
@@ -1029,6 +1191,28 @@ impl AppMain for App {
         if self.state.as_ref().is_some_and(|st| st.dirty) && !matches!(event, Event::Timer(_) | Event::NextFrame(_)) {
             cx.stop_timer(self.autosave);
             self.autosave = cx.start_timeout(1.5);
+        }
+        // Drop a song (or a .poing folder) anywhere on the window to open it.
+        match event {
+            Event::Drag(e) => {
+                if e.items.iter().any(|i| matches!(i, DragItem::FilePath { path, .. } if target_for(Path::new(path)).is_some())) {
+                    *e.response.lock().unwrap() = DragResponse::Copy;
+                }
+            }
+            Event::Drop(e) => {
+                let target = e.items.iter().find_map(|i| match i {
+                    DragItem::FilePath { path, .. } => target_for(Path::new(path)),
+                    _ => None,
+                });
+                if let Some(target) = target {
+                    if let Some(st) = self.state.as_mut() {
+                        let _ = st.save();
+                    }
+                    self.open(cx, target);
+                    self.refresh_inspector(cx);
+                }
+            }
+            _ => {}
         }
         // Shortcuts work anywhere but in a text field (which keeps its own keys).
         if let Event::KeyDown(ke) = event {
