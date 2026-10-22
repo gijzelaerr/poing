@@ -158,9 +158,15 @@ fn shade(c: Vec4f, f: f32) -> Vec4f {
     vec4(c.x * f, c.y * f, c.z * f, c.w)
 }
 
-/// A lane's colour, by what it is.
-fn track_color(id: &str, i: usize) -> u32 {
+/// A lane's colour, by what it is (a kept layer by the instrument it names).
+fn track_color(id: &str, name: &str, i: usize) -> u32 {
     const OTHERS: [u32; 6] = [0xff375f, 0x5e5ce6, 0xffd60a, 0x64d2ff, 0xbf5af2, 0x30d158];
+    let kind = name.to_lowercase();
+    let id = if id.starts_with("layer-") {
+        ["drums", "bass", "vocals", "other"].into_iter().find(|k| kind.starts_with(k)).unwrap_or(id)
+    } else {
+        id
+    };
     match id {
         "original" => 0x8e8e93,
         "vocals" => 0xbf5af2,
@@ -550,7 +556,7 @@ impl DawTimeline {
         for i in 0..n {
             let ly = self.lane_y(i);
             let tr = st.project.tracks[i].clone();
-            let col = rgba(track_color(&tr.id, i), 1.0);
+            let col = rgba(track_color(&tr.id, &tr.name, i), 1.0);
             let audible = gains[i] > 0.0;
             let lh = lane_h - LANE_GAP;
             let selected = st.sel == Selection::Track(i);

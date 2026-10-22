@@ -19,6 +19,7 @@ cargo run --release -p poing -- path/to/song.mp3
   - "less echo on the voice" splits the voice from its reverb (UVR de-reverb, about 40 s); *Blend* sets how much echo stays.
   - "add tight 80s disco drums ..." plays a new part with ACE-Step lego, keeps just that instrument and fits it into the lane's gaps (about 75 s).
   - anything else ("funky slap bass", "warm rhodes keys") plays the lane's part again as that instrument, level-matched, starting on a downbeat (about 2 minutes).
+- **Effects:** select a lane and describe an effect ("tape saturation", "a slapback delay"; with nothing selected, "... on the whole mix" for the master). Claude Code (`claude` on PATH, your own login) writes it as a Makepad Splash audio shader; Poing compiles and auditions it and sends problems back, up to three rounds. Its knobs appear when you click its chip; edit `fx/*.splash` and it recompiles live.
 - **Takes:** chips above the lanes switch takes on and off (A/B); one per lane or range, layers stack. *Keep* opens a song take as a new song, bakes a lane take into its lane, or turns a layer into a lane.
 
 YuE2 needs Makepad's `yue2_render` (built with CUDA; set `POING_YUE2_RENDER`) and the `m-a-p/YuE2-3B` and `m-a-p/YuE2-Vae` weights in the Hugging Face cache (or `POING_YUE2_MODEL` / `POING_YUE2_VAE`). `POING_MUTE=1` keeps test instances silent.

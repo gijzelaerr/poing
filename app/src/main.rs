@@ -107,7 +107,8 @@ script_mod! {
                             draw_icon.svg: crate_resource("self:resources/icons/pause.svg")
                         }
                         title_col := View{
-                            width: 260 height: Fill flow: Down spacing: 2
+                            width: Fit height: Fill flow: Right spacing: 10
+                            padding: Inset{left: 0 right: 6 top: 8 bottom: 0}
                             project_label := Label{
                                 text: "Poing"
                                 draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 11}}
@@ -198,12 +199,12 @@ script_mod! {
                         fx_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 12
                             align: Align{y: 0.5}
-                            fx_k0 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
-                            fx_k1 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
-                            fx_k2 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
-                            fx_k3 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
-                            fx_k4 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
-                            fx_k5 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_b0 := View{width: Fit height: Fit fx_k0 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_b1 := View{width: Fit height: Fit fx_k1 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_b2 := View{width: Fit height: Fit fx_k2 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_b3 := View{width: Fit height: Fit fx_k3 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_b4 := View{width: Fit height: Fit fx_k4 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_b5 := View{width: Fit height: Fit fx_k5 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_bypass := CheckBox{text: "Bypass"}
                             fx_remove := PillButton{text: "Remove"}
                         }
@@ -225,6 +226,9 @@ pub struct App {
     status_at: Option<std::time::Instant>,
     #[rust]
     jobs: Option<Jobs>,
+    /// Autosave: fires a moment after the last change (no Save button).
+    #[rust]
+    autosave: Timer,
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -418,7 +422,13 @@ fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option
     let (context, place) = match lane {
         Some(l) => {
             let t = &st.project.tracks[l];
-            (format!("the {} lane (its {} stem) of {song}", t.name, t.id), t.name.clone())
+            // Its level, so the defaults engage on this material.
+            let level = st.stems.get(l).map(|s| {
+                let rms = (s.l.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / s.l.len().max(1) as f64).sqrt();
+                let db = |x: f64| 20.0 * x.max(1e-9).log10();
+                format!("; its level is about {:.0} dBFS RMS with peaks near {:.0} dBFS", db(rms), db(s.peak_abs as f64))
+            });
+            (format!("the {} lane (its {} stem) of {song}{}", t.name, t.id, level.unwrap_or_default()), t.name.clone())
         }
         None => (format!("the master bus (the whole mix) of {song}"), "the master".into()),
     };
@@ -686,16 +696,17 @@ impl App {
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
                 let knobs = st.fx_knobs(&fx.id);
                 let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+                let boxes = [ids!(fx_b0), ids!(fx_b1), ids!(fx_b2), ids!(fx_b3), ids!(fx_b4), ids!(fx_b5)];
                 for (k, id) in sliders.iter().enumerate() {
+                    ui.view(cx, boxes[k]).set_visible(cx, k < knobs.len());
                     let mut w = ui.widget(cx, *id);
                     match knobs.get(k) {
                         Some((name, value, min, max)) => {
                             let (name, min, max) = (name.replace('_', " "), *min, *max);
                             script_apply_eval!(cx, w, {text: #(name) min: #(min) max: #(max)});
-                            w.set_visible(cx, true);
                             ui.slider(cx, *id).set_value(cx, *value);
                         }
-                        None => w.set_visible(cx, false),
+                        None => {}
                     }
                 }
                 ui.check_box(cx, ids!(fx_bypass)).set_active(cx, fx.bypassed(), Animate::No);
@@ -774,7 +785,7 @@ impl App {
                 }
                 JobUpdate::Progress { bundle, message, progress } => {
                     let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
-                    let what = if message.starts_with("Take") { "" } else { "Analysing  ·  " };
+                    let what = if message.starts_with("Take") || message.starts_with("Effect") { "" } else { "Analysing  ·  " };
                     let line = format!("{what}{message}  {:.0}%", progress * 100.0);
                     st.analysing = Some((message, progress));
                     line
@@ -998,6 +1009,19 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if let Event::Signal = event {
             self.drain_jobs(cx);
+        }
+        if self.autosave.is_event(event).is_some() {
+            self.autosave = Timer::empty();
+            if let Some(st) = self.state.as_mut().filter(|st| st.dirty) {
+                if let Err(e) = st.save() {
+                    self.set_status(cx, &format!("Could not save: {e}"));
+                }
+            }
+        }
+        // A change starts (or restarts) the countdown: one save per pause, not per drag step.
+        if self.state.as_ref().is_some_and(|st| st.dirty) && !matches!(event, Event::Timer(_) | Event::NextFrame(_)) {
+            cx.stop_timer(self.autosave);
+            self.autosave = cx.start_timeout(1.5);
         }
         self.match_event(cx, event);
         match &mut self.state {
