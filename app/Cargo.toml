@@ -11,3 +11,8 @@ makepad-widgets.workspace = true
 makepad-audio-decode.workspace = true
 makepad-micro-serde.workspace = true
 makepad-script-audio-aot.workspace = true
+
+# VST3 plugin hosting (M6): Windows first. No audio backend of its own (Poing's
+# engine drives it); process isolation runs a plugin in a helper process.
+[target.'cfg(windows)'.dependencies]
+vst3-host = { version = "0.10", default-features = false, features = ["process-isolation"] }
