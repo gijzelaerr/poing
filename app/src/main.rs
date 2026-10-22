@@ -433,7 +433,10 @@ impl AppMain for App {
         }
         self.match_event(cx, event);
         match &mut self.state {
-            Some(st) => self.ui.handle_event(cx, event, &mut Scope::with_data(st)),
+            Some(st) => {
+                st.collect_retired();
+                self.ui.handle_event(cx, event, &mut Scope::with_data(st))
+            }
             None => self.ui.handle_event(cx, event, &mut Scope::empty()),
         }
         self.refresh_inspector(cx);

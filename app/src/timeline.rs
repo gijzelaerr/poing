@@ -24,6 +24,7 @@ script_mod! {
 const HEADER_W: f64 = 200.0;
 const RULER_H: f64 = 22.0;
 const SECT_H: f64 = 26.0;
+const CHORD_H: f64 = 18.0;
 const GAP: f64 = 6.0;
 const EDGE_PX: f64 = 6.0;
 
@@ -33,6 +34,7 @@ struct Geo {
     x0: f64,
     w: f64,
     sect_y: f64,
+    chord_y: f64,
     lanes_y: f64,
     lane_h: f64,
     n: usize,
@@ -143,6 +145,9 @@ impl DawTimeline {
     fn in_ruler(&self, y: f64) -> bool {
         y >= self.geo.rect.pos.y && y < self.geo.sect_y
     }
+    fn in_chords(&self, y: f64) -> bool {
+        y >= self.geo.chord_y && y < self.geo.lanes_y
+    }
     fn in_sections(&self, y: f64) -> bool {
         y >= self.geo.sect_y && y < self.geo.sect_y + SECT_H
     }
@@ -200,13 +205,17 @@ impl DawTimeline {
 
     fn draw_all(&mut self, cx: &mut Cx2d, st: &mut EditorState, rect: Rect) {
         let n = st.project.tracks.len();
-        let lanes_y = rect.pos.y + RULER_H + SECT_H + GAP;
+        let chords = st.project.analysis.as_ref().and_then(|a| a.chords.clone()).unwrap_or_default();
+        let lyrics = st.project.analysis.as_ref().and_then(|a| a.lyrics.clone()).unwrap_or_default();
+        let chord_y = rect.pos.y + RULER_H + SECT_H;
+        let lanes_y = chord_y + if chords.is_empty() { 0.0 } else { CHORD_H } + GAP;
         let lane_h = ((rect.size.y - (lanes_y - rect.pos.y)) / n.max(1) as f64).clamp(40.0, 140.0);
         self.geo = Geo {
             rect,
             x0: rect.pos.x + HEADER_W,
             w: (rect.size.x - HEADER_W).max(10.0),
             sect_y: rect.pos.y + RULER_H,
+            chord_y,
             lanes_y,
             lane_h,
             n,
@@ -261,6 +270,31 @@ impl DawTimeline {
             }
         }
 
+        // analysis progress: a thin bar under the sections lane
+        if let Some((_, p)) = st.analysing.clone() {
+            self.rect(cx, x0, sy + SECT_H - 3.0, w, 3.0, rgba(0x343a46, 1.0));
+            self.rect(cx, x0, sy + SECT_H - 3.0, w * p.clamp(0.0, 1.0) as f64, 3.0, rgba(0x4fc3f7, 1.0));
+            self.next_frame = cx.new_next_frame();
+        }
+
+        // chords
+        if !chords.is_empty() {
+            self.text(cx, rect.pos.x + 8.0, chord_y + 3.0, dim, "Chords");
+            let cur = chords.iter().position(|c| ph >= c.start && ph < c.end);
+            for (i, c) in chords.iter().enumerate() {
+                if c.label == "N" {
+                    continue;
+                }
+                if let Some((x, cw)) = self.span(st, c.start, c.end) {
+                    let on = cur == Some(i);
+                    self.rect(cx, x, chord_y + 1.0, cw - 1.0, CHORD_H - 2.0, rgba(if on { 0x3d4658 } else { 0x23272f }, 1.0));
+                    if cw > c.label.chars().count() as f64 * 6.0 + 6.0 {
+                        self.text(cx, x + 3.0, chord_y + 3.0, if on { white } else { dim }, &c.label);
+                    }
+                }
+            }
+        }
+
         // lanes
         let gains = st.project.track_gains();
         for i in 0..n {
@@ -306,6 +340,21 @@ impl DawTimeline {
             }
             for (x, y, h) in cols {
                 self.rect(cx, x, y, 1.0, h, wave_col);
+            }
+        }
+
+        // lyrics along the bottom of the vocals lane
+        if let Some(v) = st.project.track_index("vocals") {
+            let y = self.lane_y(v) + lane_h - 16.0;
+            let mut right = f64::MIN;
+            for l in &lyrics {
+                let x = self.x_of(st, l.start).max(x0);
+                if x >= x0 + w || self.x_of(st, l.end) < x0 || x < right {
+                    continue;
+                }
+                let on = ph >= l.start && ph < l.end;
+                self.text(cx, x + 2.0, y, if on { white } else { dim }, l.text.trim());
+                right = x + l.text.trim().chars().count() as f64 * 5.5;
             }
         }
 
@@ -363,6 +412,11 @@ impl Widget for DawTimeline {
                             st.select(Selection::Section(i));
                             st.seek(start);
                         }
+                    }
+                } else if self.in_chords(y) {
+                    if in_wave {
+                        st.seek(self.t_of(st, x));
+                        self.drag = Drag::Seek;
                     }
                 } else if let Some(lane) = self.lane_at(y) {
                     if !in_wave {
