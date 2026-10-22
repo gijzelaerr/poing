@@ -86,6 +86,13 @@ pub struct EditorState {
     /// on the UI thread, once the audio thread has let go of it.
     #[cfg(windows)]
     retired_controls: Vec<(vst3_host::realtime::RtControl, Instant)>,
+    /// MIDI lanes played by a plugin: track id -> the plugin path loaded for it.
+    pub inst_plugins: HashMap<String, String>,
+    /// Plugin instruments loaded but not yet in a rack.
+    #[cfg(windows)]
+    pending_insts: Vec<(String, Box<crate::plugins::Hosted>)>,
+    /// A plugin to play the MIDI part Claude is writing (named in the Describe).
+    pub next_instrument: Option<(String, PathBuf)>,
 }
 
 impl EditorState {
@@ -158,6 +165,10 @@ impl EditorState {
             pending_runners: Vec::new(),
             #[cfg(windows)]
             retired_controls: Vec::new(),
+            inst_plugins: HashMap::new(),
+            #[cfg(windows)]
+            pending_insts: Vec::new(),
+            next_instrument: None,
         }
         .with_fx()
     }
@@ -220,9 +231,17 @@ impl EditorState {
         let grid = poing_model::BeatGrid::of(&self.project);
         let sr = self.sr();
         for (i, t) in self.project.tracks.iter().enumerate() {
-            let (Some(notes), Some(shader), Some(c)) = (&t.notes, self.inst_shaders.get(&t.id), self.inst_controls.get(&t.id)) else { continue };
+            let Some(notes) = &t.notes else { continue };
+            let events = crate::synth::events(notes, &grid, sr);
+            if t.instrument.as_ref().is_some_and(|f| f.plugin.is_some()) {
+                // its instance arrives by install or adopt
+                #[cfg(windows)]
+                rack.midi.push(crate::synth::MidiLane::new(i, events, crate::synth::Sound::Plugin(crate::synth::PluginSound::new(&t.id, sr))));
+                continue;
+            }
+            let (Some(shader), Some(c)) = (self.inst_shaders.get(&t.id), self.inst_controls.get(&t.id)) else { continue };
             let synth = crate::synth::Synth::new(shader.clone(), c.clone(), sr);
-            rack.midi.push(crate::synth::MidiLane::new(i, crate::synth::events(notes, &grid, sr), synth));
+            rack.midi.push(crate::synth::MidiLane::new(i, events, crate::synth::Sound::Splash(synth)));
         }
         rack
     }
@@ -231,8 +250,15 @@ impl EditorState {
     fn compile_instruments(&mut self) {
         let dir = self.dir();
         let tracks: Vec<Track> = self.project.tracks.iter().filter(|t| t.is_midi()).cloned().collect();
+        // plugin instruments no longer wanted (an undo) go with the next rack swap
+        let wanted: Vec<(String, String)> = tracks.iter().filter_map(|t| Some((t.id.clone(), t.instrument.as_ref()?.plugin.clone()?))).collect();
+        self.inst_plugins.retain(|id, path| wanted.iter().any(|(i, p)| i == id && p == path));
         for t in tracks {
             let Some(inst) = &t.instrument else { continue };
+            if let Some(path) = &inst.plugin {
+                self.load_plugin_instrument(&t.id, path, inst);
+                continue;
+            }
             let code = std::fs::read_to_string(dir.join(&inst.file)).map_err(|e| e.to_string());
             match code.and_then(|c| fx::compile_instrument(&c)) {
                 Ok(shader) => {
@@ -304,6 +330,7 @@ impl EditorState {
             // A rack the audio thread never picked up gives its plugins back.
             if let Some(mut stale) = self.shared.fx_in.lock().ok().and_then(|mut s| s.take()) {
                 self.pending_runners.extend(stale.take_runners());
+                self.pending_insts.extend(stale.take_instruments());
             }
         }
         #[allow(unused_mut)]
@@ -312,6 +339,10 @@ impl EditorState {
         for (id, runner) in std::mem::take(&mut self.pending_runners) {
             // a plugin no longer in the song is dropped here (its control destroys it)
             let _ = rack.install(&id, runner);
+        }
+        #[cfg(windows)]
+        for (id, hosted) in std::mem::take(&mut self.pending_insts) {
+            let _ = rack.install_instrument(&id, hosted);
         }
         if let Ok(mut slot) = self.shared.fx_in.lock() {
             *slot = Some(Box::new(rack));
@@ -413,7 +444,69 @@ impl EditorState {
                 Err(_) => missing.push(fx.name.clone()),
             }
         }
+        #[cfg(windows)]
+        for t in self.project.tracks.iter().filter(|t| t.is_midi()) {
+            let Some(inst) = t.instrument.as_ref().filter(|f| f.plugin.is_some()) else { continue };
+            match crate::plugins::load_instrument(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst)) {
+                Ok((hosted, _)) => {
+                    let _ = rack.install_instrument(&t.id, hosted);
+                }
+                Err(_) => missing.push(inst.name.clone()),
+            }
+        }
         (rack, missing)
+    }
+
+    /// Load the plugin at `path` to play MIDI lane `id` (UI thread), ready for the next rack.
+    fn load_plugin_instrument(&mut self, id: &str, path: &str, inst: &Fx) -> bool {
+        if self.inst_plugins.get(id).is_some_and(|p| p == path) {
+            return true; // already playing: the rack keeps its instance
+        }
+        #[cfg(windows)]
+        {
+            match crate::plugins::load_instrument(std::path::Path::new(path), self.sr(), Some(inst)) {
+                Ok((hosted, params)) => {
+                    self.plugin_params.insert(id.to_string(), params);
+                    self.inst_plugins.insert(id.to_string(), path.to_string());
+                    self.pending_insts.retain(|(i, _)| i != id);
+                    self.pending_insts.push((id.to_string(), hosted));
+                    self.fx_errors.remove(id);
+                    true
+                }
+                Err(e) => {
+                    self.fx_errors.insert(id.to_string(), e);
+                    false
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = inst;
+            self.fx_errors.insert(id.to_string(), "VST3 plugins play on Windows for now".into());
+            false
+        }
+    }
+
+    /// Play MIDI lane `lane` with the installed plugin `name` at `path`.
+    pub fn set_instrument_plugin(&mut self, lane: usize, name: &str, path: &std::path::Path, prompt: Option<String>) -> Result<(), String> {
+        let Some(t) = self.project.tracks.get(lane).filter(|t| t.is_midi()).cloned() else { return Err("that lane has no notes".into()) };
+        let inst = Fx {
+            id: t.id.clone(),
+            name: name.to_string(),
+            file: String::new(),
+            params: None,
+            bypass: None,
+            prompt,
+            plugin: Some(path.to_string_lossy().into_owned()),
+        };
+        if !self.load_plugin_instrument(&t.id, &inst.plugin.clone().unwrap_or_default(), &inst) {
+            return Err(self.fx_errors.remove(&t.id).unwrap_or_default());
+        }
+        self.checkpoint();
+        self.project.tracks[lane].instrument = Some(inst);
+        self.publish_fx();
+        self.sel_changed = true;
+        self.save()
     }
 
     /// The plugin handles a song switch must keep alive until the audio
@@ -617,6 +710,7 @@ impl EditorState {
             for c in self.plugin_controls.values_mut() {
                 c.service_teardown();
             }
+            crate::plugins::bury();
             self.retired_controls.retain_mut(|(c, since)| {
                 let destroyed = c.service_teardown();
                 !destroyed && since.elapsed().as_secs_f64() < 30.0

@@ -109,6 +109,12 @@ pub fn plugin_named<'a>(text: &str, plugins: &'a [String]) -> Option<&'a String>
             _ => words.clone(),
         };
         out.push(unversioned.join(" "));
+        // a version glued on ("Serum2") is said with a space ("serum 2")
+        let joined = words.join(" ");
+        let head = joined.trim_end_matches(|c: char| c.is_ascii_digit());
+        if head.len() < joined.len() && head.ends_with(|c: char| c.is_alphabetic()) {
+            out.push(format!("{head} {}", &joined[head.len()..]));
+        }
         for w in [&words, &unversioned] {
             if w.len() > 1 {
                 out.push(w[1..].join(" "));
@@ -727,7 +733,7 @@ mod tests {
 
     #[test]
     fn installed_plugins_are_found_by_name() {
-        let plugins: Vec<String> = ["FabFilter Pro-Q 3", "FabFilter Pro-C 2", "Raum", "Replika XT", "Supercharger GT", "Supercharger", "Love"]
+        let plugins: Vec<String> = ["FabFilter Pro-Q 3", "FabFilter Pro-C 2", "Raum", "Replika XT", "Supercharger GT", "Supercharger", "Love", "Serum", "Serum2"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -739,6 +745,8 @@ mod tests {
         assert_eq!(found("add some reverb"), None, "a plain effect is a shader");
         assert_eq!(found("add tight disco drums"), None);
         assert_eq!(found("lovely warm tape"), None, "whole words only");
+        assert_eq!(found("play it with Serum 2"), Some("Serum2".into()), "a glued version said apart");
+        assert_eq!(found("play it with serum"), Some("Serum".into()));
     }
 
     #[test]

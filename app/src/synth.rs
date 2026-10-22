@@ -146,19 +146,122 @@ impl Synth {
     }
 }
 
+/// A VST3 instrument in a MIDI lane (Windows for now). A rebuilt rack starts
+/// without its instance and takes it over from the rack it replaces.
+#[cfg(windows)]
+pub struct PluginSound {
+    pub id: String,
+    pub hosted: Option<Box<crate::plugins::Hosted>>,
+    buffers: vst3_host::audio::AudioBuffers,
+    /// Notes the plugin holds, to release on a jump.
+    held: [bool; 128],
+}
+
+#[cfg(windows)]
+impl PluginSound {
+    pub fn new(id: &str, sample_rate: u32) -> Self {
+        let buffers = vst3_host::audio::AudioBuffers::new(0, 2, crate::fx::PLUGIN_BLOCK, sample_rate as f64);
+        PluginSound { id: id.to_string(), hosted: None, buffers, held: [false; 128] }
+    }
+
+    /// Take over the instance (and the notes it holds) of the lane this one replaces.
+    pub fn take_over(&mut self, old: &mut PluginSound) {
+        self.hosted = old.hosted.take();
+        self.held = old.held;
+    }
+
+    fn send(&mut self, pitch: u8, vel: f32, on: bool) {
+        use vst3_host::midi::{MidiChannel, MidiEvent};
+        let Some(plugin) = self.hosted.as_mut().and_then(|h| h.plugin.as_mut()) else { return };
+        let note = pitch.min(127);
+        let event = if on {
+            MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity: (vel * 127.0).round().clamp(1.0, 127.0) as u8 }
+        } else {
+            MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
+        };
+        if plugin.send_midi_event_at(event, 0).is_ok() {
+            self.held[note as usize] = on;
+        }
+    }
+
+    /// Add `l.len()` frames of the plugin's output into l/r.
+    fn render(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let Some(plugin) = self.hosted.as_mut().and_then(|h| h.plugin.as_mut()) else { return };
+        let n = l.len().min(r.len());
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(crate::fx::PLUGIN_BLOCK);
+            self.buffers.block_size = k;
+            if plugin.process_audio(&mut self.buffers).is_ok() {
+                let outs = &self.buffers.outputs;
+                let (out_l, out_r) = (&outs[0], &outs[outs.len().min(2) - 1]);
+                for j in 0..k {
+                    l[done + j] += if out_l[j].is_finite() { out_l[j].clamp(-4.0, 4.0) } else { 0.0 };
+                    r[done + j] += if out_r[j].is_finite() { out_r[j].clamp(-4.0, 4.0) } else { 0.0 };
+                }
+            }
+            done += k;
+        }
+    }
+}
+
+/// What plays a MIDI lane: a Splash instrument or a plugin.
+pub enum Sound {
+    Splash(Synth),
+    #[cfg(windows)]
+    Plugin(PluginSound),
+}
+
+impl Sound {
+    fn note_on(&mut self, pitch: u8, vel: f32) {
+        match self {
+            Sound::Splash(s) => s.note_on(pitch, vel),
+            #[cfg(windows)]
+            Sound::Plugin(p) => p.send(pitch, vel, true),
+        }
+    }
+    fn note_off(&mut self, pitch: u8) {
+        match self {
+            Sound::Splash(s) => s.note_off(pitch),
+            #[cfg(windows)]
+            Sound::Plugin(p) => p.send(pitch, 0.0, false),
+        }
+    }
+    fn all_off(&mut self) {
+        match self {
+            Sound::Splash(s) => s.all_off(),
+            #[cfg(windows)]
+            Sound::Plugin(p) => {
+                for pitch in 0..128u8 {
+                    if p.held[pitch as usize] {
+                        p.send(pitch, 0.0, false);
+                    }
+                }
+            }
+        }
+    }
+    fn render(&mut self, l: &mut [f32], r: &mut [f32]) {
+        match self {
+            Sound::Splash(s) => s.render(l, r),
+            #[cfg(windows)]
+            Sound::Plugin(p) => p.render(l, r),
+        }
+    }
+}
+
 /// One MIDI lane in the rack: its events, its instrument, where playback is.
 pub struct MidiLane {
     pub track: usize,
     pub events: Vec<NoteEvent>,
-    pub synth: Synth,
+    pub sound: Sound,
     /// The frame the last block ended at (u64::MAX: nothing played yet).
     last_end: u64,
     cursor: usize,
 }
 
 impl MidiLane {
-    pub fn new(track: usize, events: Vec<NoteEvent>, synth: Synth) -> Self {
-        MidiLane { track, events, synth, last_end: u64::MAX, cursor: 0 }
+    pub fn new(track: usize, events: Vec<NoteEvent>, sound: Sound) -> Self {
+        MidiLane { track, events, sound, last_end: u64::MAX, cursor: 0 }
     }
 
     /// Something other than the next block follows (a seek, a loop, a pause).
@@ -173,7 +276,7 @@ impl MidiLane {
         r[..n].fill(0.0);
         if start != self.last_end {
             // a jump: release what sounds, carry on from the new place
-            self.synth.all_off();
+            self.sound.all_off();
             self.cursor = self.events.partition_point(|e| e.frame < start);
         }
         let end = start + n as u64;
@@ -184,18 +287,18 @@ impl MidiLane {
             }
             let off = (e.frame.saturating_sub(start) as usize).min(n);
             if off > at {
-                self.synth.render(&mut l[at..off], &mut r[at..off]);
+                self.sound.render(&mut l[at..off], &mut r[at..off]);
                 at = off;
             }
             if e.on {
-                self.synth.note_on(e.pitch, e.vel);
+                self.sound.note_on(e.pitch, e.vel);
             } else {
-                self.synth.note_off(e.pitch);
+                self.sound.note_off(e.pitch);
             }
             self.cursor += 1;
         }
         if at < n {
-            self.synth.render(&mut l[at..n], &mut r[at..n]);
+            self.sound.render(&mut l[at..n], &mut r[at..n]);
         }
         self.last_end = end;
     }
@@ -235,7 +338,7 @@ mod tests {
         let notes = [Note { start: 0.25, len: 0.5, pitch: 48, vel: 0.9 }];
         let ev = events(&notes, &grid, 48000);
         assert_eq!(ev[0].frame, 6000);
-        let mut lane = MidiLane::new(0, ev, synth(BUILTIN[0].2));
+        let mut lane = MidiLane::new(0, ev, Sound::Splash(synth(BUILTIN[0].2)));
         let (mut l, mut r) = (vec![0.0f32; 8000], vec![0.0f32; 8000]);
         lane.render(0, &mut l, &mut r);
         assert!(l[..6000].iter().all(|x| *x == 0.0), "silent before the note");

@@ -435,15 +435,16 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         return "A job is still running; describe the next take when it is done.".into();
     }
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    // A MIDI part ("add a funky bassline", "... played by Serum"), over the selected section or the song
+    if let (Some(role), Selection::None | Selection::Section(_)) = (model::midi_part(text), st.sel) {
+        st.next_instrument = named_plugin(st, text);
+        return write_midi(st, jobs, bundle, role, text);
+    }
     // An installed plugin named with nothing selected: on the master.
     if matches!(st.sel, Selection::None | Selection::Section(_)) {
         if let Some(result) = add_named_plugin(st, None, text) {
             return result;
         }
-    }
-    // A MIDI part ("add a funky bassline"), over the selected section or the song
-    if let (Some(role), Selection::None | Selection::Section(_)) = (model::midi_part(text), st.sel) {
-        return write_midi(st, jobs, bundle, role, text);
     }
     // An effect on the whole mix ("... on the master")
     if is_master_effect_text(text) && !matches!(st.sel, Selection::Track(_) | Selection::Region(_)) {
@@ -547,10 +548,24 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
 
 /// Describe that names an installed plugin ("Raum on the vocals"): put it on
 /// the lane, or the master. None when no plugin is named.
-fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Option<String> {
+/// An installed plugin the text names: (name, bundle path).
+fn named_plugin(st: &EditorState, text: &str) -> Option<(String, PathBuf)> {
     let names: Vec<String> = st.plugin_library.iter().map(|(n, _)| n.clone()).collect();
     let name = model::plugin_named(text, &names)?.clone();
     let path = st.plugin_library.iter().find(|(n, _)| *n == name)?.1.clone();
+    Some((name, path))
+}
+
+fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Option<String> {
+    let (name, path) = named_plugin(st, text)?;
+    // on a MIDI lane an instrument plays its notes; an effect goes on as usual
+    if let Some(l) = lane.filter(|&l| st.project.tracks[l].is_midi()) {
+        match st.set_instrument_plugin(l, &name, &path, Some(text.to_string())) {
+            Ok(()) => return Some(format!("{name} now plays {}.", st.project.tracks[l].name)),
+            Err(e) if !e.contains("not an instrument") => return Some(format!("{name} could not play it: {e}")),
+            Err(_) => {}
+        }
+    }
     let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
     Some(match st.add_plugin(lane, &name, &path, Some(text.to_string())) {
         Ok(_) => {
@@ -914,7 +929,10 @@ impl App {
             Selection::Track(i) if i < st.project.tracks.len() => {
                 let t = st.project.tracks[i].clone();
                 let what = match &t.notes {
-                    Some(n) => format!("MIDI, {} notes", n.len()),
+                    Some(n) => match t.instrument.as_ref().filter(|i| i.plugin.is_some()) {
+                        Some(i) => format!("MIDI, {} notes, played by {}", n.len(), i.name),
+                        None => format!("MIDI, {} notes", n.len()),
+                    },
                     None => t.file.clone(),
                 };
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Track: {}   ({what})", t.name));
@@ -1036,7 +1054,14 @@ impl App {
                     match st.add_midi_track(&name, code, notes, Some(request)) {
                         Ok(lane) => {
                             st.select(Selection::Track(lane));
-                            format!("{name} is a new MIDI lane ({note}), played by Poing's {role}. Click a note to move it, drag its end to lengthen, Delete removes it.")
+                            let by = match st.next_instrument.take() {
+                                Some((plugin, path)) => match st.set_instrument_plugin(lane, &plugin, &path, None) {
+                                    Ok(()) => plugin,
+                                    Err(e) => format!("Poing's {role} ({plugin} could not play it: {e})"),
+                                },
+                                None => format!("Poing's {role}"),
+                            };
+                            format!("{name} is a new MIDI lane ({note}), played by {by}. Click a note to move it, drag its end to lengthen, Delete removes it.")
                         }
                         Err(e) => format!("{name} could not be added: {e}"),
                     }

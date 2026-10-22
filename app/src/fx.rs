@@ -235,6 +235,50 @@ impl FxRack {
                 unit.carry_from(o);
             }
         }
+        // plugin instruments move over with the notes they hold (the new lane releases them)
+        #[cfg(windows)]
+        for m in &mut self.midi {
+            let crate::synth::Sound::Plugin(p) = &mut m.sound else { continue };
+            if p.hosted.is_some() {
+                continue;
+            }
+            for o in &mut old.midi {
+                if let crate::synth::Sound::Plugin(op) = &mut o.sound {
+                    if op.id == p.id && op.hosted.is_some() {
+                        p.take_over(op);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Give MIDI lane instrument `id` its plugin instance.
+    #[cfg(windows)]
+    pub fn install_instrument(&mut self, id: &str, new: Box<crate::plugins::Hosted>) -> Result<(), Box<crate::plugins::Hosted>> {
+        for m in &mut self.midi {
+            if let crate::synth::Sound::Plugin(p) = &mut m.sound {
+                if p.id == id {
+                    p.hosted = Some(new);
+                    return Ok(());
+                }
+            }
+        }
+        Err(new)
+    }
+
+    /// Take every plugin instrument out (see `take_runners`).
+    #[cfg(windows)]
+    pub fn take_instruments(&mut self) -> Vec<(String, Box<crate::plugins::Hosted>)> {
+        let mut out = Vec::new();
+        for m in &mut self.midi {
+            if let crate::synth::Sound::Plugin(p) = &mut m.sound {
+                if let Some(h) = p.hosted.take() {
+                    out.push((p.id.clone(), h));
+                }
+            }
+        }
+        out
     }
 
     /// Give plugin unit `id` its instance (a newly loaded plugin).
