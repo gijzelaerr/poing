@@ -15,7 +15,7 @@ mod timeline;
 use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
-use model::{default_gain_for, demucs_stem_for, lane_intent, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
+use model::{default_gain_for, demucs_stem_for, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
 use timeline::kind_index;
@@ -283,17 +283,28 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
 fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize, range: Option<(f64, f64)>, text: &str) -> String {
     let track = st.project.tracks[lane].clone();
     let lane_file = st.project.track_path(&st.path, lane);
-    let (start, end) = range.unwrap_or((0.0, st.project.duration));
-    let place = range.map(|(a, b)| format!(" from {a:.0}s to {b:.0}s")).unwrap_or_default();
     let intent = lane_intent(text, &track.id);
-    if let LaneIntent::AddWhat = intent {
-        return format!("Which instrument should Poing add? Say it, e.g. \"add warm strings\" (it can play: {}).", LEGO_TRACKS.join(", "));
-    }
-    if let LaneIntent::Replace = intent {
-        return format!(
-            "Poing can take echo out of {} (\"less echo\") or add a part (\"add ...\"); playing the lane itself again comes next.",
-            track.name
-        );
+    // A replaced part comes in on the one: its range snaps to downbeats.
+    let range = match (&intent, range) {
+        (LaneIntent::Replace(_), Some((a, b))) => {
+            let downbeats = st.project.analysis.as_ref().and_then(|a| a.downbeats.clone()).unwrap_or_default();
+            Some(snap_to_downbeats(a, b, &downbeats))
+        }
+        _ => range,
+    };
+    let (start, end) = range.unwrap_or((0.0, st.project.duration));
+    let place = range.map(|(a, b)| format!(" from {a:.1}s to {b:.1}s")).unwrap_or_default();
+    match &intent {
+        LaneIntent::AddWhat => {
+            return format!("Which instrument should Poing add? Say it, e.g. \"add warm strings\" (it can play: {}).", LEGO_TRACKS.join(", "))
+        }
+        LaneIntent::Replace(None) => {
+            return format!("Which instrument should {} become? Say it, e.g. \"warm rhodes keys\" (it can play: {}).", track.name, LEGO_TRACKS.join(", "))
+        }
+        LaneIntent::Replace(Some(i)) if i == "vocals" || i == "backing_vocals" => {
+            return "Singing a part again needs its words: select the section and Describe it to repaint it.".into()
+        }
+        _ => {}
     }
     let (id, seed) = st.project.next_take();
     let n = id.trim_start_matches('t').to_string();
@@ -311,6 +322,31 @@ fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize
         blend: Some(0.65),
     };
     let (job, status) = match intent {
+        LaneIntent::Replace(Some(instrument)) => {
+            let Some(source) = st.project.source.clone() else { return "This song has no source audio to play along to".into() };
+            take.engine = "lego".into();
+            take.blend = Some(1.0);
+            let a = st.project.analysis.clone().unwrap_or_default();
+            let lego = LegoJob {
+                src: bundle.join(source).to_string_lossy().into_owned(),
+                track: instrument.clone(),
+                caption: text.to_string(),
+                seed,
+                bpm: a.tempo.map(f64::round),
+                key: a.key,
+                ..Default::default()
+            };
+            let (a, b) = range.unwrap_or((0.0, 0.0));
+            let clean = LayerJob {
+                stem: demucs_stem_for(&instrument).to_string(),
+                match_lane: Some(lane_file.to_string_lossy().into_owned()),
+                start: a,
+                end: b,
+                ..Default::default()
+            };
+            let status = format!("Playing {} again as {instrument}{place}, take {n} (about a minute and a half)...", track.name);
+            (Job::Layer { bundle, take, lego, clean, sr: st.sr() }, status)
+        }
         LaneIntent::AddLayer(instrument) => {
             let Some(source) = st.project.source.clone() else { return "This song has no source audio to play along to".into() };
             take.scope = "layer".into();

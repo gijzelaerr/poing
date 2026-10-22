@@ -971,6 +971,8 @@ pub struct LayerJob {
     pub stem: String,
     /// The lane whose gaps the layer fills (full level where it is thin).
     pub reference: Option<String>,
+    /// The lane a replacement takes over: matched to its loudness.
+    pub match_lane: Option<String>,
     pub start: f64,
     pub end: f64,
 }

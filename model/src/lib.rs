@@ -76,8 +76,25 @@ pub enum LaneIntent {
     AddLayer(String),
     /// "add ..." without an instrument Poing can tell.
     AddWhat,
-    /// Anything else: play this lane's part again differently.
-    Replace,
+    /// Anything else: play this lane's part again, as the named instrument or
+    /// the lane's own kind (None: Poing cannot tell which instrument).
+    Replace(Option<String>),
+}
+
+/// The lego instrument a Describe names, if any.
+fn instrument_in(t: &str) -> Option<String> {
+    let has = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|x| x.starts_with(w));
+    let synonyms: [(&str, &str); 16] = [
+        ("drum", "drums"), ("percussion", "percussion"), ("shaker", "percussion"), ("conga", "percussion"),
+        ("piano", "keyboard"), ("keys", "keyboard"), ("rhodes", "keyboard"), ("organ", "keyboard"),
+        ("synth", "synth"), ("string", "strings"), ("guitar", "guitar"), ("bass", "bass"), ("horn", "brass"),
+        ("choir", "backing_vocals"), ("harmon", "backing_vocals"), ("strijk", "strings"),
+    ];
+    LEGO_TRACKS
+        .iter()
+        .find(|track| has(track))
+        .map(|t| t.to_string())
+        .or_else(|| synonyms.iter().find(|(w, _)| has(w)).map(|(_, t)| t.to_string()))
 }
 
 /// Read a Describe on lane `track` (English and Dutch keywords).
@@ -87,27 +104,34 @@ pub fn lane_intent(text: &str, track: &str) -> LaneIntent {
     if has(&["echo", "reverb", "galm", "nagalm", "dry", "droog", "drier", "droger"]) {
         return LaneIntent::Dereverb;
     }
+    // The lane's own kind, when it is one lego plays.
+    let own = matches!(track, "drums" | "bass" | "vocals").then(|| track.to_string());
     if has(&["add", "extra", "layer", "toevoegen", "voeg", "laag", "more", "meer"]) {
-        let synonyms: [(&str, &str); 14] = [
-            ("drum", "drums"), ("percussion", "percussion"), ("shaker", "percussion"), ("conga", "percussion"),
-            ("piano", "keyboard"), ("keys", "keyboard"), ("organ", "keyboard"), ("synth", "synth"),
-            ("string", "strings"), ("guitar", "guitar"), ("bass", "bass"), ("horn", "brass"),
-            ("choir", "backing_vocals"), ("harmon", "backing_vocals"),
-        ];
-        for track in LEGO_TRACKS {
-            if has(&[track]) {
-                return LaneIntent::AddLayer(track.into());
-            }
-        }
-        if let Some((_, track)) = synonyms.iter().find(|(w, _)| has(&[w])) {
-            return LaneIntent::AddLayer(track.to_string());
-        }
-        return match track {
-            "drums" | "bass" | "vocals" => LaneIntent::AddLayer(track.into()),
-            _ => LaneIntent::AddWhat,
+        return match instrument_in(&t).or(own) {
+            Some(i) => LaneIntent::AddLayer(i),
+            None => LaneIntent::AddWhat,
         };
     }
-    LaneIntent::Replace
+    LaneIntent::Replace(instrument_in(&t).or(own))
+}
+
+/// Where a range edit starts and ends: on the nearest downbeat within half a
+/// second, so a replaced part comes in on the one.
+pub fn snap_to_downbeats(start: f64, end: f64, downbeats: &[f64]) -> (f64, f64) {
+    let snap = |t: f64| {
+        downbeats
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
+            .filter(|d| (d - t).abs() <= 0.5)
+            .unwrap_or(t)
+    };
+    let (a, b) = (snap(start), snap(end));
+    if b > a + 0.5 {
+        (a, b)
+    } else {
+        (start, end)
+    }
 }
 
 /// The Demucs stem that holds a lego track (htdemucs: vocals, drums, bass, other).
@@ -401,7 +425,17 @@ mod tests {
         assert_eq!(lane_intent("add some piano chords", "other"), LaneIntent::AddLayer("keyboard".into()));
         assert_eq!(lane_intent("add more groove", "drums"), LaneIntent::AddLayer("drums".into()));
         assert_eq!(lane_intent("add more groove", "other"), LaneIntent::AddWhat);
-        assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace);
+        assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace(Some("bass".into())));
+        assert_eq!(lane_intent("warm rhodes instead", "other"), LaneIntent::Replace(Some("keyboard".into())));
+        assert_eq!(lane_intent("make it nicer", "other"), LaneIntent::Replace(None));
+    }
+
+    #[test]
+    fn range_edits_snap_to_downbeats() {
+        let downbeats = [0.0, 2.0, 4.0, 6.0];
+        assert_eq!(snap_to_downbeats(1.7, 5.8, &downbeats), (2.0, 6.0));
+        assert_eq!(snap_to_downbeats(2.9, 4.2, &downbeats), (2.9, 4.0), "too far from a downbeat: stays");
+        assert_eq!(snap_to_downbeats(1.8, 2.1, &downbeats), (1.8, 2.1), "would collapse: stays");
     }
 
     #[test]

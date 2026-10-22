@@ -3,7 +3,7 @@
 Usage: uv run --project sidecar python poing_layer.py <job.json>
 
 job.json: {"src": lego output, "out": wav, "stem": "drums"|"bass"|"vocals"|"other",
-           "reference": lane wav?, "start": s?, "end": s?,
+           "reference": lane wav?, "match_lane": lane wav?, "start": s?, "end": s?,
            "thin_db": -35, "gain_thin": 1.0, "gain_full": 0.35}
 
 1. Demucs (htdemucs_ft) keeps just the wanted stem: lego output carries some
@@ -11,7 +11,9 @@ job.json: {"src": lego output, "out": wav, "stem": "drums"|"bass"|"vocals"|"othe
 2. With a reference lane, the layer plays at gain_thin where that lane is
    quieter than thin_db (per 2 s window) and at gain_full elsewhere, smoothed
    over ~1 s: it fills the gaps and sits under the parts that are already full.
-3. Only [start, end] is written when a range is given (a region).
+3. With a lane to match (a replacement), it is scaled to that lane's loudness
+   over the range: ACE-Step normalises its output.
+4. Only [start, end] is written when a range is given (a region).
 """
 import json
 import sys
@@ -38,6 +40,14 @@ def gap_fill_gain(ref, sr, thin_db, gain_thin, gain_full):
     return (c[k:] - c[:-k]) / k  # moving average via a running sum (np.convolve is O(n*k))
 
 
+def read_at(path, sr):
+    """A lane as (frames, channels) at rate sr (lanes Poing baked are 48 kHz, Demucs writes 44.1)."""
+    import librosa
+    import soundfile as sf
+    x, x_sr = sf.read(path, always_2d=True)
+    return x if x_sr == sr else librosa.resample(x.T, orig_sr=x_sr, target_sr=sr).T
+
+
 def main():
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     began = time.time()
@@ -55,14 +65,19 @@ def main():
     reference = job.get("reference") or job.get("ref")
     if reference:
         emit("fill", 0.9, "Fitting it into the gaps")
-        ref, ref_sr = sf.read(reference, always_2d=True)
-        if ref_sr != sr:
-            raise RuntimeError(f"reference is {ref_sr} Hz, layer {sr} Hz")
+        ref = read_at(reference, sr)
         n = min(len(part), len(ref))
         gain = gap_fill_gain(ref[:n].mean(axis=1), sr, job.get("thin_db", -35), job.get("gain_thin", 1.0),
                              job.get("gain_full", 0.35))
         part = part[:n] * gain[:, None]
     start, end = float(job.get("start") or 0.0), float(job.get("end") or 0.0)
+    if job.get("match_lane"):
+        lane = read_at(job["match_lane"], sr)
+        a, b = (int(start * sr), int(end * sr)) if end > start else (0, min(len(lane), len(part)))
+        rms = lambda x: float(np.sqrt(np.mean(x ** 2))) if len(x) else 0.0
+        target, have = rms(lane[a:b]), rms(part[a:b])
+        if have > 1e-6 and target > 1e-6:
+            part = part * (target / have)
     if end > start:
         part = part[int(start * sr):int(end * sr)]
     sf.write(job["out"], part, sr, subtype="FLOAT")

@@ -15,7 +15,11 @@ cargo run --release -p poing -- path/to/song.mp3
 - **Understand:** opening a song creates `song.poing/` next to it and analyses it in the background (uv, `sidecar/`): Demucs stems, SheetSage2 sections/key/chords/score, Whisper lyrics. About 2.5 minutes on an RTX 4070 Ti.
 - **Describe:** type a style in the top bar and press Enter. Poing renders a whole-song cover take with native YuE2 from the song's own score and lyrics, so the chords, melody and words stay. About 45 s. A `lyrics.txt` in the bundle (hand-corrected, `[Verse]`-tagged) wins over the transcription.
 - **Repaint:** select a section first and Describe repaints just that range with ACE-Step 1.5 (about 30 s), blended in over a second of original on each side. Needs an [ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5) checkout next to this repository (or `POING_ACESTEP`).
-- **Takes:** chips above the lanes switch between the original and each take (A/B). *Keep as a new song* opens the take as its own song and analyses it.
+- **Lanes:** select a lane (or drag a region on it) and Describe works on that part:
+  - "less echo on the voice" splits the voice from its reverb (UVR de-reverb, about 40 s); *Blend* sets how much echo stays.
+  - "add tight 80s disco drums ..." plays a new part with ACE-Step lego, keeps just that instrument and fits it into the lane's gaps (about 75 s).
+  - anything else ("funky slap bass", "warm rhodes keys") plays the lane's part again as that instrument, level-matched, starting on a downbeat (about 2 minutes).
+- **Takes:** chips above the lanes switch takes on and off (A/B); one per lane or range, layers stack. *Keep* opens a song take as a new song, bakes a lane take into its lane, or turns a layer into a lane.
 
 YuE2 needs Makepad's `yue2_render` (built with CUDA; set `POING_YUE2_RENDER`) and the `m-a-p/YuE2-3B` and `m-a-p/YuE2-Vae` weights in the Hugging Face cache (or `POING_YUE2_MODEL` / `POING_YUE2_VAE`). `POING_MUTE=1` keeps test instances silent.
 
