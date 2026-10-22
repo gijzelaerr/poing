@@ -60,6 +60,8 @@ pub struct EditorState {
     pub notice: Option<String>,
     /// The timeline's area: key focus there (or nowhere) means shortcuts apply.
     pub timeline_area: makepad_widgets::Area,
+    /// Meter levels as shown (they fall back slowly): lanes, then master.
+    pub meter_show: Vec<f32>,
 }
 
 impl EditorState {
@@ -117,6 +119,7 @@ impl EditorState {
             redo: Vec::new(),
             notice: None,
             timeline_area: makepad_widgets::Area::Empty,
+            meter_show: vec![0.0; audio::METER_LANES + 1],
         }
         .with_fx()
     }

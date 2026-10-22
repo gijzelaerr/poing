@@ -3,7 +3,7 @@
 //! and the playhead. Immediate-mode shapes and text; all mouse and keyboard
 //! editing of the arrangement happens here.
 
-use crate::audio::PEAK_BLOCK;
+use crate::audio::{MASTER_METER, METER_LANES, PEAK_BLOCK};
 use crate::model::REGION_KINDS;
 use crate::state::{EditorState, Selection};
 use makepad_widgets::*;
@@ -325,6 +325,18 @@ impl DawTimeline {
         r
     }
 
+    /// A level meter: dBFS from -60 to 0 across w, green, then yellow from
+    /// -12 dB, red from -3 dB.
+    fn meter_bar(&mut self, cx: &mut Cx2d, x: f64, y: f64, w: f64, level: f32) {
+        self.shape(cx, Rect { pos: dvec2(x, y), size: dvec2(w, 4.0) }, 2.0, rgba(0x2a2e37, 1.0), rgba(0x2a2e37, 1.0));
+        let db = 20.0 * level.max(1e-6).log10();
+        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0) as f64;
+        if frac > 0.0 {
+            let c = if db > -3.0 { 0xff453a } else if db > -12.0 { 0xffd60a } else { 0x30d158 };
+            self.shape(cx, Rect { pos: dvec2(x, y), size: dvec2((w * frac).max(4.0), 4.0) }, 2.0, rgba(c, 1.0), rgba(c, 0.85));
+        }
+    }
+
     /// A lane's waveform: the peaks under each pixel column, drawn twice
     /// (the full swing faint, its inner half solid) for depth.
     fn wave(&mut self, cx: &mut Cx2d, st: &EditorState, stem: usize, ly: f64, lane_h: f64, color: Vec4f) {
@@ -438,6 +450,17 @@ impl DawTimeline {
         }
         let (x0, w) = (self.geo.x0, self.geo.w);
         let left = rect.pos.x;
+        // meters: take the peaks the audio thread left, let the shown level fall back
+        let mut moving = false;
+        for i in 0..=METER_LANES {
+            let v = f32::from_bits(st.shared.meters[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+            let shown = &mut st.meter_show[i];
+            *shown = v.max(*shown * 0.88);
+            moving |= *shown > 1e-4;
+        }
+        if moving {
+            self.next_frame = cx.new_next_frame();
+        }
         let white = rgba(TEXT, 1.0);
         let dim = rgba(TEXT_2, 1.0);
         let faint = rgba(TEXT_2, 0.7);
@@ -578,8 +601,12 @@ impl DawTimeline {
             let (sf, si) = if tr.soloed() { (rgba(0xffd60a, 1.0), rgba(0x111111, 1.0)) } else { (rgba(0x2a2e37, 1.0), rgba(TEXT, 0.8)) };
             self.shape(cx, sb, 5.0, sf, shade(sf, 0.9));
             self.text(cx, sb.pos.x + 7.5, sb.pos.y + 3.5, si, "S");
-            if lh >= 62.0 {
-                self.fx_chips_row(cx, st, Some(i), left + 16.0, ly + lh - 22.0, left + HEADER_W - 10.0);
+            if i < METER_LANES {
+                let level = st.meter_show[i];
+                self.meter_bar(cx, left + 30.0, ly + 42.0, HEADER_W - 66.0, level);
+            }
+            if lh >= 66.0 {
+                self.fx_chips_row(cx, st, Some(i), left + 16.0, ly + lh - 20.0, left + HEADER_W - 10.0);
             }
             self.wave(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.25) });
         }
@@ -662,6 +689,8 @@ impl DawTimeline {
         let my = master_y;
         self.shape(cx, Rect { pos: dvec2(left + 6.0, my), size: dvec2(rect.size.x - 12.0, MASTER_H - 6.0) }, 8.0, rgba(0x15171b, 1.0), rgba(0x15171b, 1.0));
         self.bold(cx, left + 16.0, my + 8.0, dim, "Master");
+        let level = st.meter_show[MASTER_METER];
+        self.meter_bar(cx, left + 74.0, my + 12.0, HEADER_W - 92.0, level);
         self.fx_chips_row(cx, st, None, x0, my + 6.0, x0 + w);
         if st.project.chain(None).is_empty() {
             self.text(cx, x0, my + 8.0, faint, "Select a lane and describe an effect (\"tape saturation\", \"a warm plate reverb\") to add one");

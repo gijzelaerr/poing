@@ -7,7 +7,7 @@ use crate::model::{Project, Take};
 use makepad_widgets::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -291,6 +291,23 @@ fn take_lane(k: &MixTake) -> Option<usize> {
 /// each lane with its lane takes and layers, through the lane's effects, then
 /// the master effects. Section takes join after the lane effects (they stand
 /// in for the whole mix). Resampling to the device rate is the caller's business.
+/// Meters: one per lane (by track index) and the master, last.
+pub const METER_LANES: usize = 32;
+pub const MASTER_METER: usize = METER_LANES;
+
+/// Raise meter `i` to `peak` (positive floats order like their bits).
+#[inline]
+fn meter(meters: Option<&[AtomicU32]>, i: usize, peak: f32) {
+    if let Some(m) = meters.and_then(|m| m.get(i)) {
+        m.fetch_max(peak.to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn peak_of(l: &[f32], r: &[f32]) -> f32 {
+    l.iter().chain(r.iter()).fold(0.0f32, |p, x| p.max(x.abs()))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn mix_into(
     stems: &[Arc<Stem>],
     mix: &MixParams,
@@ -298,7 +315,22 @@ pub fn mix_into(
     start: usize,
     out_l: &mut [f32],
     out_r: &mut [f32],
+    rack: Option<&mut FxRack>,
+) {
+    mix_metered(stems, mix, sr, start, out_l, out_r, rack, None)
+}
+
+/// [`mix_into`], raising `meters` (lanes then master) to this block's peaks.
+#[allow(clippy::too_many_arguments)]
+pub fn mix_metered(
+    stems: &[Arc<Stem>],
+    mix: &MixParams,
+    sr: u32,
+    start: usize,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
     mut rack: Option<&mut FxRack>,
+    meters: Option<&[AtomicU32]>,
 ) {
     let n = out_l.len().min(out_r.len());
     if n > LANE_FRAMES && rack.is_some() {
@@ -306,7 +338,7 @@ pub fn mix_into(
         let mut done = 0;
         while done < n {
             let k = (n - done).min(LANE_FRAMES);
-            mix_into(stems, mix, sr, start + done, &mut out_l[done..done + k], &mut out_r[done..done + k], rack.as_deref_mut());
+            mix_metered(stems, mix, sr, start + done, &mut out_l[done..done + k], &mut out_r[done..done + k], rack.as_deref_mut(), meters);
             done += k;
         }
         return;
@@ -316,26 +348,32 @@ pub fn mix_into(
     let inv_sr = 1.0 / sr as f64;
     let t0 = start as f64 * inv_sr;
     let t1 = (start + n) as f64 * inv_sr;
-    let add = |out_l: &mut [f32], out_r: &mut [f32], s: &Stem, offset: usize, gain: &dyn Fn(f64) -> f32| {
+    // Adds a stem at a gain; returns the peak it added (for the meters).
+    let add = |out_l: &mut [f32], out_r: &mut [f32], s: &Stem, offset: usize, gain: &dyn Fn(f64) -> f32| -> f32 {
+        let mut peak = 0.0f32;
         for i in 0..out_l.len() {
             let f = start + i;
             if f < offset || f - offset >= s.l.len() {
                 continue;
             }
             let g = gain(f as f64 * inv_sr);
-            out_l[i] += s.l[f - offset] * g;
-            out_r[i] += s.r[f - offset] * g;
+            let (a, b) = (s.l[f - offset] * g, s.r[f - offset] * g);
+            out_l[i] += a;
+            out_r[i] += b;
+            peak = peak.max(a.abs()).max(b.abs());
         }
+        peak
     };
     let offset_of = |k: &MixTake| (k.start.max(0.0) * sr as f64) as usize;
     // A song take is the whole song: only it plays (through the master).
     if let Some(k) = mix.song_take() {
         if let Some(s) = stems.get(k.stem) {
-            add(&mut out_l[..n], &mut out_r[..n], s, 0, &|_| 1.0);
+            let _ = add(&mut out_l[..n], &mut out_r[..n], s, 0, &|_| 1.0);
         }
         if let Some(rack) = rack {
             rack.process_master(&mut out_l[..n], &mut out_r[..n]);
         }
+        meter(meters, MASTER_METER, peak_of(&out_l[..n], &out_r[..n]));
         return;
     }
     let tracks = mix.gains.len().min(stems.len());
@@ -353,10 +391,10 @@ pub fn mix_into(
                 let (ll, lr) = (&mut rk.lane_l[..n], &mut rk.lane_r[..n]);
                 ll.fill(0.0);
                 lr.fill(0.0);
-                add(ll, lr, s, 0, &lane_gain);
+                let _ = add(ll, lr, s, 0, &lane_gain);
                 for k in mix.takes.iter().flatten().filter(|k| take_lane(k) == Some(ti) && k.touches(t0, t1)) {
                     if let Some(ts) = stems.get(k.stem) {
-                        add(ll, lr, ts, offset_of(k), &|t| take_gain(mix, k, t));
+                        let _ = add(ll, lr, ts, offset_of(k), &|t| take_gain(mix, k, t));
                     }
                 }
                 rk.process_lane(ti, n);
@@ -364,8 +402,12 @@ pub fn mix_into(
                     out_l[i] += rk.lane_l[i];
                     out_r[i] += rk.lane_r[i];
                 }
+                meter(meters, ti, peak_of(&rk.lane_l[..n], &rk.lane_r[..n]));
             }
-            None => add(&mut out_l[..n], &mut out_r[..n], s, 0, &lane_gain),
+            None => {
+                let peak = add(&mut out_l[..n], &mut out_r[..n], s, 0, &lane_gain);
+                meter(meters, ti, peak);
+            }
         }
     }
     let routed = |k: &MixTake| take_lane(k).is_some_and(|lane| rack.as_ref().is_some_and(|r| r.lane_has_fx(lane)));
@@ -374,12 +416,16 @@ pub fn mix_into(
             continue;
         }
         if let Some(s) = stems.get(k.stem) {
-            add(&mut out_l[..n], &mut out_r[..n], s, offset_of(k), &|t| take_gain(mix, k, t));
+            let peak = add(&mut out_l[..n], &mut out_r[..n], s, offset_of(k), &|t| take_gain(mix, k, t));
+            if let Some(lane) = take_lane(k) {
+                meter(meters, lane, peak);
+            }
         }
     }
     if let Some(rack) = rack {
         rack.process_master(&mut out_l[..n], &mut out_r[..n]);
     }
+    meter(meters, MASTER_METER, peak_of(&out_l[..n], &out_r[..n]));
 }
 /// State shared with the audio callback: transport flags and the published mix.
 /// The callback only `try_lock`s `mix` and keeps its own copy when the UI holds it.
@@ -397,6 +443,8 @@ pub struct Shared {
     pub fx_in: Mutex<Option<Box<FxRack>>>,
     /// The rack it replaced, for the UI to drop.
     pub fx_out: Mutex<Option<Box<FxRack>>>,
+    /// Peak levels since the UI last read them (f32 bits): lanes, then master.
+    pub meters: [AtomicU32; METER_LANES + 1],
 }
 
 impl Shared {
@@ -410,6 +458,7 @@ impl Shared {
             stems_seen: AtomicU64::new(0),
             fx_in: Mutex::new(None),
             fx_out: Mutex::new(None),
+            meters: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
     pub fn pos(&self) -> usize {
@@ -485,7 +534,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         let n_src = ((dev_frames as f64 * ratio).ceil() as usize).min(total - start);
         l.resize(n_src, 0.0);
         r.resize(n_src, 0.0);
-        mix_into(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack));
+        mix_metered(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack), Some(&shared.meters));
         if !muted {
             let chans = out.channel_count();
             for i in 0..dev_frames {
@@ -1327,6 +1376,22 @@ mod tests {
         // without a rack the same mix is the plain sum
         mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         assert!((l[200] - 2.25).abs() < 1e-6, "{}", l[200]);
+    }
+
+    #[test]
+    fn meters_hold_each_lane_s_and_the_master_s_peak() {
+        use super::{mix_metered, MASTER_METER, METER_LANES};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let stems = vec![constant(0.25, 100), constant(0.5, 100)];
+        let mut mix = with_takes(&[]);
+        mix.gains = vec![1.0, 0.5];
+        let meters: Vec<AtomicU32> = (0..=METER_LANES).map(|_| AtomicU32::new(0)).collect();
+        let (mut l, mut r) = (vec![0.0; 64], vec![0.0; 64]);
+        mix_metered(&stems, &mix, 1000, 0, &mut l, &mut r, None, Some(&meters));
+        let read = |i: usize| f32::from_bits(meters[i].load(Ordering::Relaxed));
+        assert_eq!(read(0), 0.25);
+        assert_eq!(read(1), 0.25, "after the lane's gain");
+        assert_eq!(read(MASTER_METER), 0.5);
     }
 
     #[test]
