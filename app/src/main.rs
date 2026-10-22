@@ -928,8 +928,7 @@ impl MatchEvent for App {
                     st.set_fx_bypass(&id, on);
                 }
                 if ui.button(cx, ids!(fx_remove)).clicked(actions) {
-                    st.delete_selected();
-                    status = Some("Effect removed".into());
+                    status = st.delete_selected();
                 }
             }
         }
@@ -963,7 +962,7 @@ impl MatchEvent for App {
                     st.dirty = true;
                 }
                 if ui.button(cx, ids!(delete_btn)).clicked(actions) {
-                    st.delete_selected();
+                    status = st.delete_selected();
                 }
             }
         }
@@ -989,7 +988,7 @@ impl MatchEvent for App {
                 }
             }
             if ui.button(cx, ids!(merge_btn)).clicked(actions) {
-                st.delete_selected();
+                status = st.delete_selected();
             }
         }
 
@@ -1033,6 +1032,10 @@ impl AppMain for App {
         match &mut self.state {
             Some(st) => {
                 st.collect_retired();
+                if let Some(note) = st.notice.take() {
+                    self.ui.label(cx, ids!(status_label)).set_text(cx, &note);
+                    self.status_at = Some(std::time::Instant::now());
+                }
                 if let Some(note) = st.reload_changed_fx() {
                     self.ui.label(cx, ids!(status_label)).set_text(cx, &note);
                 }

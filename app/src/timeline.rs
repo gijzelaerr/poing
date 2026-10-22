@@ -699,6 +699,7 @@ impl Widget for DawTimeline {
                     }
                 } else if self.in_sections(y) {
                     if let Some(edge) = self.section_edge_at(st, x) {
+                        st.checkpoint();
                         self.drag = Drag::SectionEdge { index: edge };
                     } else if in_wave {
                         let t = self.t_of(st, x);
@@ -724,16 +725,19 @@ impl Widget for DawTimeline {
                 } else if let Some(lane) = self.lane_at(y) {
                     if !in_wave {
                         if self.mute_box(lane).contains(fe.abs) {
+                            st.checkpoint();
                             let t = &mut st.project.tracks[lane];
                             t.mute = Some(!t.muted());
                             st.push_mix();
                         } else if self.solo_box(lane).contains(fe.abs) {
+                            st.checkpoint();
                             let t = &mut st.project.tracks[lane];
                             t.solo = Some(!t.soloed());
                             st.push_mix();
                         }
                         st.select(Selection::Track(lane));
                     } else if let Some((ri, part)) = self.region_at(st, lane, x) {
+                        st.checkpoint();
                         st.select(Selection::Region(ri));
                         self.drag = match part {
                             1 => Drag::ResizeRegion { region: ri, left: true },
@@ -754,6 +758,7 @@ impl Widget for DawTimeline {
                 match self.drag {
                     Drag::Seek => st.seek(t),
                     Drag::Pending { track, t0, x0 } if (x - x0).abs() > 4.0 => {
+                        st.checkpoint();
                         let ri = st.add_region(track, t0, t);
                         st.select(Selection::Region(ri));
                         self.drag = Drag::NewRegion { region: ri, anchor: t0 };
@@ -828,7 +833,9 @@ impl Widget for DawTimeline {
                 let cmd = ke.modifiers.control || ke.modifiers.logo;
                 match ke.key_code {
                     KeyCode::Space => st.toggle_play(),
-                    KeyCode::Delete | KeyCode::Backspace => st.delete_selected(),
+                    KeyCode::Delete | KeyCode::Backspace => st.notice = st.delete_selected(),
+                    KeyCode::KeyZ if cmd => st.notice = st.undo(ke.modifiers.shift),
+                    KeyCode::KeyY if cmd => st.notice = st.undo(true),
                     KeyCode::Home => st.seek(0.0),
                     // F: fit the song in view
                     KeyCode::KeyF => st.pps = 0.0,

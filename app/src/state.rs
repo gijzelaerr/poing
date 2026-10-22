@@ -53,6 +53,11 @@ pub struct EditorState {
     /// Effects that do not compile right now, with why.
     pub fx_errors: HashMap<String, String>,
     fx_polled: Instant,
+    /// Song states before each edit (Ctrl+Z) and after each undo (Ctrl+Shift+Z).
+    undo: Vec<(Project, Stems)>,
+    redo: Vec<(Project, Stems)>,
+    /// A message for the status line from an edit made in the timeline.
+    pub notice: Option<String>,
 }
 
 impl EditorState {
@@ -106,6 +111,9 @@ impl EditorState {
             fx_controls: HashMap::new(),
             fx_errors: HashMap::new(),
             fx_polled: Instant::now(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            notice: None,
         }
         .with_fx()
     }
@@ -174,6 +182,7 @@ impl EditorState {
     /// Add an effect written as `code` to a lane (or the master).
     pub fn add_fx(&mut self, lane: Option<usize>, name: &str, code: &str, prompt: Option<String>) -> Result<String, String> {
         fx::compile_source(code)?;
+        self.checkpoint();
         let id = self.project.next_fx();
         let file = format!("fx/{id}.splash");
         let dir = self.dir();
@@ -337,6 +346,7 @@ impl EditorState {
     }
     /// A new take joins the stem set and is switched on straight away.
     pub fn add_take(&mut self, take: Take, stem: Stem) -> Result<(), String> {
+        self.checkpoint();
         let id = take.id.clone();
         self.project.takes_mut().push(take);
         let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
@@ -363,9 +373,8 @@ impl EditorState {
             self.focus = None;
         }
         self.takes_changed(self.duration());
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::remove_file(dir.join(&take.file));
-        }
+        // the audio file stays: undo brings the take back
+        let _ = take;
         self.save()
     }
 
@@ -373,6 +382,7 @@ impl EditorState {
     /// (a lane of its own). The stem set stays tracks then takes. Song takes
     /// are kept as a new song instead (see `promote_take`).
     pub fn keep_take(&mut self, id: &str) -> Result<String, String> {
+        self.checkpoint();
         let i = self.project.take_index(id).ok_or("no such take")?;
         let take = self.project.takes()[i].clone();
         let k = MixParams::from_project(&self.project, 0, &[id.to_string()]).takes[0].ok_or("this take has no lane to go to")?;
@@ -428,7 +438,7 @@ impl EditorState {
         self.publish_stems(Arc::new(lanes));
         self.push_mix();
         self.sel_changed = true;
-        let _ = std::fs::remove_file(dir.join(&take.file));
+        // the take's file stays: undo brings it back
         self.save()?;
         Ok(message)
     }
@@ -558,39 +568,125 @@ impl EditorState {
         self.project.regions().len() - 1
     }
 
-    pub fn delete_selected(&mut self) {
-        match self.sel {
+    /// Delete what is selected (a region, section, effect, lane) or, with
+    /// nothing selected, the take shown in the inspector. Says what it did
+    /// (for the status line); everything can be undone.
+    pub fn delete_selected(&mut self) -> Option<String> {
+        let done = match self.sel {
             Selection::Fx(lane, i) => {
-                if let Some(id) = self.project.chain(lane).get(i).map(|f| f.id.clone()) {
-                    let _ = self.remove_fx(&id);
-                    self.select(Selection::None);
-                }
+                let fx = self.project.chain(lane).get(i).cloned()?;
+                self.checkpoint();
+                let _ = self.remove_fx(&fx.id);
+                format!("Removed {}", fx.name)
             }
             Selection::Region(i) if i < self.project.regions().len() => {
-                self.project.regions_mut().remove(i);
-                self.select(Selection::None);
+                self.checkpoint();
+                let r = self.project.regions_mut().remove(i);
                 self.push_mix();
+                format!("Removed the {} region", r.kind)
             }
             Selection::Section(i) if self.project.sections().len() > 1 && i < self.project.sections().len() => {
+                self.checkpoint();
                 // merge into the previous section (or the next one if it is the first)
                 let secs = self.project.sections_mut();
                 let removed = secs.remove(i);
-                if i > 0 {
+                let into = if i > 0 {
                     secs[i - 1].end = removed.end;
+                    secs[i - 1].label.clone()
                 } else {
                     secs[0].start = removed.start;
-                }
-                self.select(Selection::None);
+                    secs[0].label.clone()
+                };
                 self.dirty = true;
+                format!("Merged the {} into the {into} before it", removed.label)
             }
-            _ => {}
+            Selection::Track(i) if i < self.project.tracks.len() => {
+                if self.project.tracks.len() == 1 {
+                    return Some("The last lane stays: a song needs one".into());
+                }
+                self.checkpoint();
+                let name = self.remove_track(i);
+                format!("Removed the {name} lane")
+            }
+            Selection::None => {
+                let take = self.focused_take()?;
+                self.checkpoint();
+                let _ = self.delete_take(&take.id);
+                format!("Deleted take {}", take.id.trim_start_matches('t'))
+            }
+            _ => return None,
+        };
+        self.select(Selection::None);
+        Some(format!("{done}  ·  Ctrl+Z to undo"))
+    }
+
+    /// Remove lane `i` with what hangs off it: its regions, effects, and the
+    /// takes made for it. Its audio file stays in the bundle (undo needs it).
+    fn remove_track(&mut self, i: usize) -> String {
+        let track = self.project.tracks.remove(i);
+        self.project.regions_mut().retain(|r| r.track != track.id);
+        let tracks_before = self.project.tracks.len() + 1;
+        // the stem set is tracks then takes: drop this lane and its takes
+        let takes = self.project.takes().clone();
+        let keep: Vec<bool> = takes.iter().map(|t| t.track.as_deref() != Some(track.id.as_str())).collect();
+        let mut lanes: Vec<Arc<Stem>> = Vec::new();
+        for (j, s) in self.stems.iter().enumerate() {
+            let keep_it = if j < tracks_before { j != i } else { keep[j - tracks_before] };
+            if keep_it {
+                lanes.push(s.clone());
+            }
         }
+        let gone: Vec<String> = takes.iter().zip(&keep).filter(|(_, k)| !**k).map(|(t, _)| t.id.clone()).collect();
+        self.project.takes_mut().retain(|t| !gone.contains(&t.id));
+        self.active.retain(|a| !gone.contains(a));
+        self.publish_stems(Arc::new(lanes));
+        self.push_mix();
+        self.publish_fx();
+        self.dirty = true;
+        track.name
+    }
+
+    /// Remember the song as it is, before an edit (for Ctrl+Z).
+    pub fn checkpoint(&mut self) {
+        self.undo.push((self.project.clone(), self.stems.clone()));
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Step back one edit (or forward again with `redo`).
+    pub fn undo(&mut self, redo: bool) -> Option<String> {
+        let (project, stems) = if redo { self.redo.pop()? } else { self.undo.pop()? };
+        let now = (std::mem::replace(&mut self.project, project), self.stems.clone());
+        if redo {
+            self.undo.push(now);
+        } else {
+            self.redo.push(now);
+        }
+        self.publish_stems(stems);
+        let project = &self.project;
+        self.active.retain(|id| project.take_index(id).is_some());
+        if self.focus.as_deref().is_some_and(|id| self.project.take_index(id).is_none()) {
+            self.focus = None;
+        }
+        // effects come back from their files (kept on disk for this)
+        let ids: Vec<String> = self.all_fx().iter().map(|f| f.id.clone()).collect();
+        for id in ids {
+            self.compile_fx(&id);
+        }
+        self.publish_fx();
+        self.push_mix();
+        self.select(Selection::None);
+        let _ = self.save();
+        Some(if redo { "Redone".into() } else { "Undone  ·  Ctrl+Shift+Z to redo".into() })
     }
 
     /// Split the section under time t in two at t.
     pub fn split_section_at(&mut self, t: f64) {
-        let secs = self.project.sections_mut();
-        if let Some(i) = secs.iter().position(|s| t > s.start + 0.2 && t < s.end - 0.2) {
+        if let Some(i) = self.project.sections().iter().position(|s| t > s.start + 0.2 && t < s.end - 0.2) {
+            self.checkpoint();
+            let secs = self.project.sections_mut();
             let mut right = secs[i].clone();
             right.start = t;
             secs[i].end = t;
@@ -601,9 +697,16 @@ impl EditorState {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
+        // Regions are kept in time order; a selected region stays selected.
+        let selected = match self.sel {
+            Selection::Region(i) => self.project.regions().get(i).map(|r| r.id.clone()),
+            _ => None,
+        };
         self.project.regions_mut().sort_by(|a, b| a.start.total_cmp(&b.start));
-        if let Selection::Region(_) = self.sel {
-            self.select(Selection::None);
+        if let Some(id) = selected {
+            if let Some(i) = self.project.regions().iter().position(|r| r.id == id) {
+                self.sel = Selection::Region(i);
+            }
         }
         self.project.save(&self.path)?;
         self.dirty = false;
