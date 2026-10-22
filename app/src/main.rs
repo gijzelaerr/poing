@@ -850,6 +850,12 @@ impl App {
 }
 
 impl MatchEvent for App {
+    /// Play through the system's default output (the audio callback only
+    /// runs once an output device is opened).
+    fn handle_audio_devices(&mut self, cx: &mut Cx, devices: &AudioDevicesEvent) {
+        cx.use_audio_outputs(&devices.default_output());
+    }
+
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.jobs = Some(Jobs::start(cx));
         self.load(cx);
