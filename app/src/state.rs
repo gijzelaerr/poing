@@ -58,6 +58,8 @@ pub struct EditorState {
     redo: Vec<(Project, Stems)>,
     /// A message for the status line from an edit made in the timeline.
     pub notice: Option<String>,
+    /// The timeline's area: key focus there (or nowhere) means shortcuts apply.
+    pub timeline_area: makepad_widgets::Area,
 }
 
 impl EditorState {
@@ -114,6 +116,7 @@ impl EditorState {
             undo: Vec::new(),
             redo: Vec::new(),
             notice: None,
+            timeline_area: makepad_widgets::Area::Empty,
         }
         .with_fx()
     }

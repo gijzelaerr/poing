@@ -676,6 +676,49 @@ impl DawTimeline {
     }
 }
 
+/// A keyboard shortcut on the song; true when the key was one.
+pub fn shortcut(st: &mut EditorState, ke: &KeyEvent) -> bool {
+    let cmd = ke.modifiers.control || ke.modifiers.logo;
+    match ke.key_code {
+        KeyCode::Space => st.toggle_play(),
+        KeyCode::Delete | KeyCode::Backspace => st.notice = st.delete_selected(),
+        KeyCode::KeyZ if cmd => st.notice = st.undo(ke.modifiers.shift),
+        KeyCode::KeyY if cmd => st.notice = st.undo(true),
+        KeyCode::Home => st.seek(0.0),
+        KeyCode::End => st.seek(st.duration()),
+        // F: fit the song in view
+        KeyCode::KeyF if !cmd => st.pps = 0.0,
+        // B: split the section at the playhead (a blade)
+        KeyCode::KeyB if !cmd => {
+            let t = st.playhead();
+            st.split_section_at(t);
+        }
+        // M / S: mute or solo the selected lane
+        KeyCode::KeyM | KeyCode::KeyS if !cmd => {
+            let Selection::Track(i) = st.sel else { return false };
+            st.checkpoint();
+            let t = &mut st.project.tracks[i];
+            if ke.key_code == KeyCode::KeyM {
+                t.mute = Some(!t.muted());
+            } else {
+                t.solo = Some(!t.soloed());
+            }
+            st.push_mix();
+            st.sel_changed = true;
+        }
+        KeyCode::KeyS if cmd => {
+            st.notice = Some(match st.save() {
+                Ok(()) => "Saved".into(),
+                Err(e) => format!("Could not save: {e}"),
+            });
+        }
+        // Escape: select nothing
+        KeyCode::Escape => st.select(Selection::None),
+        _ => return false,
+    }
+    true
+}
+
 impl Widget for DawTimeline {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if self.next_frame.is_event(event).is_some() {
@@ -829,34 +872,16 @@ impl Widget for DawTimeline {
                 self.clamp_scroll(st);
                 self.area.redraw(cx);
             }
-            Hit::KeyDown(ke) => {
-                let cmd = ke.modifiers.control || ke.modifiers.logo;
-                match ke.key_code {
-                    KeyCode::Space => st.toggle_play(),
-                    KeyCode::Delete | KeyCode::Backspace => st.notice = st.delete_selected(),
-                    KeyCode::KeyZ if cmd => st.notice = st.undo(ke.modifiers.shift),
-                    KeyCode::KeyY if cmd => st.notice = st.undo(true),
-                    KeyCode::Home => st.seek(0.0),
-                    // F: fit the song in view
-                    KeyCode::KeyF => st.pps = 0.0,
-                    // B: split the section at the playhead (a blade)
-                    KeyCode::KeyB => {
-                        let t = st.playhead();
-                        st.split_section_at(t);
-                    }
-                    KeyCode::KeyS if cmd => {
-                        let _ = st.save();
-                    }
-                    _ => {}
-                }
-                self.area.redraw(cx);
-            }
+            // Keys are the App's: shortcuts work wherever the focus is, except in a text field.
             _ => {}
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let rect = cx.walk_turtle_with_area(&mut self.area, walk);
+        if let Some(st) = scope.data_mut().get_mut::<EditorState>() {
+            st.timeline_area = self.area;
+        }
         self.draw_bg.draw_abs(cx, rect);
         if let Some(st) = scope.data_mut().get_mut::<EditorState>() {
             self.draw_all(cx, st, rect);

@@ -886,6 +886,8 @@ impl MatchEvent for App {
         if let Some((text, _)) = ui.text_input(cx, ids!(describe_input)).returned(actions) {
             if !text.trim().is_empty() {
                 status = Some(describe(st, self.jobs.as_ref(), text.trim()));
+                // back to the song: shortcuts work again
+                cx.set_key_focus(Area::Empty);
             }
         }
         if ui.button(cx, ids!(delete_take_btn)).clicked(actions) {
@@ -1027,6 +1029,15 @@ impl AppMain for App {
         if self.state.as_ref().is_some_and(|st| st.dirty) && !matches!(event, Event::Timer(_) | Event::NextFrame(_)) {
             cx.stop_timer(self.autosave);
             self.autosave = cx.start_timeout(1.5);
+        }
+        // Shortcuts work anywhere but in a text field (which keeps its own keys).
+        if let Event::KeyDown(ke) = event {
+            if let Some(st) = self.state.as_mut() {
+                let focus = cx.key_focus();
+                if (focus.is_empty() || focus == st.timeline_area) && timeline::shortcut(st, ke) {
+                    self.ui.widget(cx, ids!(timeline)).redraw(cx);
+                }
+            }
         }
         self.match_event(cx, event);
         match &mut self.state {
