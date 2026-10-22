@@ -500,7 +500,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         if let Ok(mut back) = shared.fx_out.try_lock() {
             if back.is_none() {
                 if let Some(mut new) = shared.fx_in.try_lock().ok().and_then(|mut s| s.take()) {
-                    new.adopt(&rack);
+                    new.adopt(&mut rack);
                     *back = Some(std::mem::replace(&mut rack, new));
                 }
             }
@@ -1386,7 +1386,7 @@ mod tests {
         use crate::fx::{compile_source, FxControls, FxRack, FxUnit};
         let code = "let gain = param(0.5, 0, 1)\nfn effect(l, r) { vec2(l * gain, r * gain) }\n";
         let shader = compile_source(code).unwrap();
-        let fx = poing_model::Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None };
+        let fx = poing_model::Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None };
         let unit = FxUnit::new("fx1", shader.clone(), FxControls::new(&shader, &fx, None), 1000);
         let mut rack = FxRack::new(vec![vec![unit], Vec::new()], Vec::new());
         // lane 0 (1.0) has the effect and a layer (1.0); lane 1 (0.25) has none

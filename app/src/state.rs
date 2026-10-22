@@ -3,6 +3,7 @@
 
 use crate::audio::{self, MixParams, Shared, Stem, Stems, TakeKind};
 use crate::fx::{self, FxControls, FxRack};
+use crate::plugins::PluginParam;
 use crate::model::{default_gain_for, Analysis, Fx, Project, Region, Take, Track};
 use makepad_script_audio_aot::AudioShaderRef;
 use std::collections::HashMap;
@@ -64,6 +65,20 @@ pub struct EditorState {
     pub meter_show: Vec<f32>,
     /// The range playback loops over (seconds), if any.
     pub loop_range: Option<(f64, f64)>,
+    /// Installed VST3 plugins (name, bundle path), found on disk.
+    pub plugin_library: Vec<(String, PathBuf)>,
+    /// Each plugin effect's parameters (by effect id).
+    pub plugin_params: HashMap<String, Vec<PluginParam>>,
+    /// The UI's handle to each playing plugin (knob changes, teardown).
+    #[cfg(windows)]
+    plugin_controls: HashMap<String, vst3_host::realtime::RtControl>,
+    /// Plugin instances loaded but not yet in a rack.
+    #[cfg(windows)]
+    pending_runners: Vec<(String, Box<fx::Runner>)>,
+    /// Handles of plugins on their way out: they destroy their plugin here,
+    /// on the UI thread, once the audio thread has let go of it.
+    #[cfg(windows)]
+    retired_controls: Vec<(vst3_host::realtime::RtControl, Instant)>,
 }
 
 impl EditorState {
@@ -124,6 +139,14 @@ impl EditorState {
             timeline_area: makepad_widgets::Area::Empty,
             meter_show: vec![0.0; audio::METER_LANES + 1],
             loop_range: None,
+            plugin_library: crate::plugins::library(),
+            plugin_params: HashMap::new(),
+            #[cfg(windows)]
+            plugin_controls: HashMap::new(),
+            #[cfg(windows)]
+            pending_runners: Vec::new(),
+            #[cfg(windows)]
+            retired_controls: Vec::new(),
         }
         .with_fx()
     }
@@ -156,6 +179,9 @@ impl EditorState {
     /// values; it plays from the next rack.
     fn compile_fx(&mut self, id: &str) -> bool {
         let Some(fx) = self.fx(id).cloned() else { return false };
+        if fx.plugin.is_some() {
+            return self.load_plugin_fx(&fx);
+        }
         let file = self.dir().join(&fx.file);
         let mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
         self.fx_mtimes.insert(id.to_string(), mtime);
@@ -183,10 +209,135 @@ impl EditorState {
     /// Hand the audio thread a rack for the current effects (it carries
     /// over the state of every effect it keeps).
     pub fn publish_fx(&mut self) {
-        let rack = Box::new(self.make_rack());
-        if let Ok(mut slot) = self.shared.fx_in.lock() {
-            *slot = Some(rack);
+        #[cfg(windows)]
+        {
+            // A rack the audio thread never picked up gives its plugins back.
+            if let Some(mut stale) = self.shared.fx_in.lock().ok().and_then(|mut s| s.take()) {
+                self.pending_runners.extend(stale.take_runners());
+            }
         }
+        #[allow(unused_mut)]
+        let mut rack = self.make_rack();
+        #[cfg(windows)]
+        for (id, runner) in std::mem::take(&mut self.pending_runners) {
+            // a plugin no longer in the song is dropped here (its control destroys it)
+            let _ = rack.install(&id, runner);
+        }
+        if let Ok(mut slot) = self.shared.fx_in.lock() {
+            *slot = Some(Box::new(rack));
+        }
+    }
+
+    /// Load plugin effect x (UI thread) and keep it ready for the next rack.
+    fn load_plugin_fx(&mut self, fx: &Fx) -> bool {
+        #[cfg(windows)]
+        {
+            if self.plugin_controls.contains_key(&fx.id) {
+                return true; // already playing: the rack keeps its instance
+            }
+            let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
+            match crate::plugins::load(&path, self.sr(), Some(fx)) {
+                Ok(loaded) => {
+                    self.fx_controls.insert(fx.id.clone(), FxControls::for_plugin(fx));
+                    self.plugin_params.insert(fx.id.clone(), loaded.params);
+                    self.plugin_controls.insert(fx.id.clone(), loaded.control);
+                    self.pending_runners.push((fx.id.clone(), loaded.runner));
+                    self.fx_errors.remove(&fx.id);
+                    true
+                }
+                Err(e) => {
+                    self.fx_errors.insert(fx.id.clone(), e);
+                    false
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.fx_errors.insert(fx.id.clone(), "VST3 plugins play on Windows for now".into());
+            false
+        }
+    }
+
+    /// Let a plugin effect go: its instance leaves with the next rack swap.
+    fn retire_plugin(&mut self, id: &str) {
+        self.plugin_params.remove(id);
+        #[cfg(windows)]
+        if let Some(control) = self.plugin_controls.remove(id) {
+            self.retired_controls.push((control, Instant::now()));
+        }
+    }
+
+    /// Plugins in the song are loaded, plugins no longer in it let go (after undo).
+    fn sync_plugins(&mut self) {
+        let wanted: Vec<Fx> = self.all_fx().into_iter().filter(|f| f.plugin.is_some()).collect();
+        let gone: Vec<String> = self.plugin_params.keys().filter(|id| !wanted.iter().any(|f| &&f.id == id)).cloned().collect();
+        for id in gone {
+            self.retire_plugin(&id);
+        }
+        for fx in wanted {
+            self.load_plugin_fx(&fx);
+        }
+    }
+
+    /// Put an installed plugin on a lane (or the master).
+    pub fn add_plugin(&mut self, lane: Option<usize>, name: &str, path: &std::path::Path, prompt: Option<String>) -> Result<String, String> {
+        self.checkpoint();
+        let id = self.project.next_fx();
+        let fx = Fx {
+            id: id.clone(),
+            name: name.to_string(),
+            file: String::new(),
+            params: None,
+            bypass: None,
+            prompt,
+            plugin: Some(path.to_string_lossy().into_owned()),
+        };
+        self.project.chain_mut(lane).push(fx.clone());
+        if !self.load_plugin_fx(&fx) {
+            let why = self.fx_errors.remove(&id).unwrap_or_default();
+            self.project.chain_mut(lane).pop();
+            return Err(why);
+        }
+        self.publish_fx();
+        self.sel_changed = true;
+        self.save()?;
+        Ok(id)
+    }
+
+    /// A rack for an offline render: plugins get a second instance each
+    /// (one that will not load is left out, and named).
+    pub fn make_render_rack(&mut self) -> (FxRack, Vec<String>) {
+        #[allow(unused_mut)]
+        let mut rack = self.make_rack();
+        #[allow(unused_mut)]
+        let mut missing = Vec::new();
+        #[cfg(windows)]
+        for fx in self.all_fx().into_iter().filter(|f| f.plugin.is_some()) {
+            let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
+            match crate::plugins::load(&path, self.sr(), Some(&fx)) {
+                Ok(loaded) => {
+                    let _ = rack.install(&fx.id, loaded.runner);
+                    // the render drops its rack on the worker; this destroys the plugin later
+                    self.retired_controls.push((loaded.control, Instant::now()));
+                }
+                Err(_) => missing.push(fx.name.clone()),
+            }
+        }
+        (rack, missing)
+    }
+
+    /// The plugin handles a song switch must keep alive until the audio
+    /// thread lets go of this song's rack.
+    #[cfg(windows)]
+    pub fn take_plugin_controls(&mut self) -> Vec<vst3_host::realtime::RtControl> {
+        let mut out: Vec<_> = self.plugin_controls.drain().map(|(_, c)| c).collect();
+        out.extend(self.retired_controls.drain(..).map(|(c, _)| c));
+        out
+    }
+
+    #[cfg(windows)]
+    pub fn adopt_plugin_controls(&mut self, controls: Vec<vst3_host::realtime::RtControl>) {
+        self.retired_controls.extend(controls.into_iter().map(|c| (c, Instant::now())));
     }
 
     /// Add an effect written as `code` to a lane (or the master).
@@ -198,7 +349,7 @@ impl EditorState {
         let dir = self.dir();
         std::fs::create_dir_all(dir.join("fx")).map_err(|e| e.to_string())?;
         std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
-        let fx = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt };
+        let fx = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None };
         self.project.chain_mut(lane).push(fx);
         self.compile_fx(&id);
         self.publish_fx();
@@ -210,6 +361,7 @@ impl EditorState {
     pub fn remove_fx(&mut self, id: &str) -> Result<(), String> {
         let Some((lane, i)) = self.project.find_fx(id) else { return Ok(()) };
         self.project.chain_mut(lane).remove(i);
+        self.retire_plugin(id);
         self.fx_shaders.remove(id);
         self.fx_mtimes.remove(id);
         self.fx_controls.remove(id);
@@ -221,6 +373,19 @@ impl EditorState {
 
     /// Turn a knob: heard at once, remembered in the project.
     pub fn set_fx_param(&mut self, id: &str, index: usize, value: f64) {
+        if let Some(params) = self.plugin_params.get(id) {
+            // a plugin knob: normalized 0..1, through the plugin's control queue
+            let Some(p) = crate::plugins::knob_params(params).get(index).cloned() else { return };
+            #[cfg(windows)]
+            if let Some(c) = self.plugin_controls.get_mut(id) {
+                c.set_parameter(p.id, value.clamp(0.0, 1.0));
+            }
+            if let Some((lane, i)) = self.project.find_fx(id) {
+                self.project.chain_mut(lane)[i].set_param(&p.name, value);
+                self.dirty = true;
+            }
+            return;
+        }
         let Some(shader) = self.fx_shaders.get(id) else { return };
         let Some(name) = shader.params().get(index).map(|p| p.name.clone()) else { return };
         if let Some(c) = self.fx_controls.get(id) {
@@ -244,12 +409,18 @@ impl EditorState {
 
     /// The shader param behind knob `knob` (knobs skip `bpm`, set from the song).
     pub fn fx_param_index(&self, id: &str, knob: usize) -> Option<usize> {
+        if self.plugin_params.contains_key(id) {
+            return Some(knob);
+        }
         let shader = self.fx_shaders.get(id)?;
         shader.params().iter().enumerate().filter(|(_, p)| p.name != "bpm").nth(knob).map(|(i, _)| i)
     }
 
     /// The knobs of effect `id`: (name, value, min, max).
     pub fn fx_knobs(&self, id: &str) -> Vec<(String, f64, f64, f64)> {
+        if let (Some(params), Some(fx)) = (self.plugin_params.get(id), self.fx(id)) {
+            return crate::plugins::knob_params(params).into_iter().map(|p| (p.name.clone(), fx.param(&p.name).unwrap_or(p.default), 0.0, 1.0)).collect();
+        }
         let (Some(shader), Some(fx)) = (self.fx_shaders.get(id), self.fx(id)) else { return Vec::new() };
         shader
             .params()
@@ -270,6 +441,7 @@ impl EditorState {
         let changed: Vec<Fx> = self
             .all_fx()
             .into_iter()
+            .filter(|f| f.plugin.is_none())
             .filter(|f| {
                 let mtime = std::fs::metadata(dir.join(&f.file)).and_then(|m| m.modified()).ok();
                 self.fx_mtimes.get(&f.id) != Some(&mtime)
@@ -347,6 +519,18 @@ impl EditorState {
         // a rack the audio thread replaced is dropped here, not there
         if let Ok(mut back) = self.shared.fx_out.try_lock() {
             back.take();
+        }
+        // Plugins whose rack was just dropped are destroyed here; a retired
+        // handle stays a while for the swap to come round.
+        #[cfg(windows)]
+        {
+            for c in self.plugin_controls.values_mut() {
+                c.service_teardown();
+            }
+            self.retired_controls.retain_mut(|(c, since)| {
+                let destroyed = c.service_teardown();
+                !destroyed && since.elapsed().as_secs_f64() < 30.0
+            });
         }
         if !self.retired.is_empty()
             && self.shared.stems_seen.load(Ordering::Acquire) == self.shared.stems_gen.load(Ordering::Acquire)
@@ -714,11 +898,12 @@ impl EditorState {
         if self.focus.as_deref().is_some_and(|id| self.project.take_index(id).is_none()) {
             self.focus = None;
         }
-        // effects come back from their files (kept on disk for this)
-        let ids: Vec<String> = self.all_fx().iter().map(|f| f.id.clone()).collect();
+        // effects come back from their files (kept on disk for this), plugins reload
+        let ids: Vec<String> = self.all_fx().iter().filter(|f| f.plugin.is_none()).map(|f| f.id.clone()).collect();
         for id in ids {
             self.compile_fx(&id);
         }
+        self.sync_plugins();
         self.publish_fx();
         self.push_mix();
         self.select(Selection::None);

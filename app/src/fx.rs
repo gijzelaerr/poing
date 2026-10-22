@@ -34,6 +34,11 @@ impl FxControls {
             .collect();
         Arc::new(Self { params, bypass: AtomicBool::new(fx.bypassed()) })
     }
+    /// A plugin's: bypass only (its knobs go through the plugin's own queue).
+    pub fn for_plugin(fx: &Fx) -> Arc<Self> {
+        Arc::new(Self { params: Box::new([]), bypass: AtomicBool::new(fx.bypassed()) })
+    }
+
     pub fn set(&self, index: usize, value: f32) {
         if let Some(p) = self.params.get(index) {
             p.store(value.to_bits(), Ordering::Relaxed);
@@ -41,17 +46,37 @@ impl FxControls {
     }
 }
 
-/// One playing effect: its shader and the state the audio thread owns.
+/// A VST3 plugin running in the rack (Windows for now).
+#[cfg(windows)]
+pub type Runner = vst3_host::realtime::RealtimePluginRunner;
+
+/// The block size plugins are set up for; lane audio is fed to them in
+/// blocks this long.
+pub const PLUGIN_BLOCK: usize = 1024;
+
+/// What makes a unit's sound.
+enum Engine {
+    /// A Splash audio shader, with the state the audio thread owns.
+    Shader {
+        shader: aot::AudioShaderRef,
+        ctx: Box<[u32]>,
+        state: Box<[u32]>,
+        scratch: Box<[u32]>,
+        /// Param bits last handed to the shader.
+        applied: Box<[u32]>,
+        frame: u32,
+    },
+    /// A VST3 plugin. A rebuilt rack starts without one and takes it over
+    /// from the rack it replaces (`adopt`): never a reload.
+    #[cfg(windows)]
+    Plugin { runner: Option<Box<Runner>>, buffers: vst3_host::audio::AudioBuffers },
+}
+
+/// One playing effect.
 pub struct FxUnit {
     pub id: String,
-    pub shader: aot::AudioShaderRef,
     pub controls: Arc<FxControls>,
-    ctx: Box<[u32]>,
-    state: Box<[u32]>,
-    scratch: Box<[u32]>,
-    /// Param bits last handed to the shader.
-    applied: Box<[u32]>,
-    frame: u32,
+    engine: Engine,
 }
 
 impl FxUnit {
@@ -61,21 +86,43 @@ impl FxUnit {
         let applied = shader.params().iter().map(|p| p.default.to_bits()).collect();
         FxUnit {
             id: id.to_string(),
-            state: shader.state_init().into(),
-            scratch: vec![0u32; shader.scratch_words()].into_boxed_slice(),
-            ctx,
-            applied,
-            frame: 0,
             controls,
-            shader,
+            engine: Engine::Shader {
+                state: shader.state_init().into(),
+                scratch: vec![0u32; shader.scratch_words()].into_boxed_slice(),
+                ctx,
+                applied,
+                frame: 0,
+                shader,
+            },
         }
     }
 
-    /// Take over the state of the unit this one replaces (same effect, new
-    /// build): tails, delay lines and knob smoothing carry on. No allocation.
-    pub fn carry_from(&mut self, old: &FxUnit) {
-        self.shader.carry_state(&mut self.state, &old.shader, &old.state);
-        self.frame = old.frame;
+    /// A plugin slot (its instance arrives by `install` or `adopt`).
+    #[cfg(windows)]
+    pub fn plugin(id: &str, controls: Arc<FxControls>, sample_rate: u32) -> Self {
+        let buffers = vst3_host::audio::AudioBuffers::new(2, 2, PLUGIN_BLOCK, sample_rate as f64);
+        FxUnit { id: id.to_string(), controls, engine: Engine::Plugin { runner: None, buffers } }
+    }
+
+
+    /// Take over from the unit this one replaces: a shader's tails, delay lines
+    /// and knob smoothing carry on; a plugin instance moves over. No allocation.
+    pub fn carry_from(&mut self, old: &mut FxUnit) {
+        match (&mut self.engine, &mut old.engine) {
+            (Engine::Shader { shader, state, frame, .. }, Engine::Shader { shader: old_shader, state: old_state, frame: old_frame, .. }) => {
+                shader.carry_state(state, old_shader, old_state);
+                *frame = *old_frame;
+            }
+            #[cfg(windows)]
+            (Engine::Plugin { runner, .. }, Engine::Plugin { runner: old_runner, .. }) => {
+                if runner.is_none() {
+                    *runner = old_runner.take();
+                }
+            }
+            #[cfg(windows)]
+            _ => {}
+        }
     }
 
     /// Process l/r in place; `tmp` is scratch of at least MAX_FRAMES frames.
@@ -83,41 +130,55 @@ impl FxUnit {
         if self.controls.bypass.load(Ordering::Relaxed) {
             return;
         }
-        for (k, target) in self.controls.params.iter().enumerate() {
-            let bits = target.load(Ordering::Relaxed);
-            if bits != self.applied[k] {
-                self.shader.set_param(&mut self.ctx, k, f32::from_bits(bits));
-                self.applied[k] = bits;
+        match &mut self.engine {
+            Engine::Shader { shader, ctx, state, scratch, applied, frame } => {
+                for (k, target) in self.controls.params.iter().enumerate() {
+                    let bits = target.load(Ordering::Relaxed);
+                    if bits != applied[k] {
+                        shader.set_param(ctx, k, f32::from_bits(bits));
+                        applied[k] = bits;
+                    }
+                }
+                let n = l.len().min(r.len());
+                let mut done = 0;
+                while done < n {
+                    let k = (n - done).min(aot::MAX_FRAMES as usize).min(tmp_l.len());
+                    ctx[aot::CTX_FRAME as usize] = *frame;
+                    tmp_l[..k].fill(0.0);
+                    tmp_r[..k].fill(0.0);
+                    shader.run(ctx, state, scratch, &l[done..done + k], &r[done..done + k], &mut tmp_l[..k], &mut tmp_r[..k], k);
+                    // A shader that blows up goes quiet instead of deafening anyone.
+                    for j in 0..k {
+                        l[done + j] = if tmp_l[j].is_finite() { tmp_l[j].clamp(-4.0, 4.0) } else { 0.0 };
+                        r[done + j] = if tmp_r[j].is_finite() { tmp_r[j].clamp(-4.0, 4.0) } else { 0.0 };
+                    }
+                    *frame = frame.wrapping_add(k as u32);
+                    done += k;
+                }
             }
-        }
-        let n = l.len().min(r.len());
-        let mut done = 0;
-        while done < n {
-            let k = (n - done).min(aot::MAX_FRAMES as usize).min(tmp_l.len());
-            self.ctx[aot::CTX_FRAME as usize] = self.frame;
-            tmp_l[..k].fill(0.0);
-            tmp_r[..k].fill(0.0);
-            self.shader.run(
-                &mut self.ctx,
-                &mut self.state,
-                &mut self.scratch,
-                &l[done..done + k],
-                &r[done..done + k],
-                &mut tmp_l[..k],
-                &mut tmp_r[..k],
-                k,
-            );
-            // A shader that blows up goes quiet instead of deafening anyone.
-            for j in 0..k {
-                l[done + j] = if tmp_l[j].is_finite() { tmp_l[j].clamp(-4.0, 4.0) } else { 0.0 };
-                r[done + j] = if tmp_r[j].is_finite() { tmp_r[j].clamp(-4.0, 4.0) } else { 0.0 };
+            #[cfg(windows)]
+            Engine::Plugin { runner, buffers } => {
+                let Some(runner) = runner.as_mut() else { return };
+                let n = l.len().min(r.len());
+                let mut done = 0;
+                while done < n {
+                    let k = (n - done).min(PLUGIN_BLOCK);
+                    buffers.block_size = k;
+                    buffers.inputs[0][..k].copy_from_slice(&l[done..done + k]);
+                    buffers.inputs[1][..k].copy_from_slice(&r[done..done + k]);
+                    if runner.process(buffers).is_ok() {
+                        let (out_l, out_r) = (&buffers.outputs[0], &buffers.outputs[buffers.outputs.len().min(2) - 1]);
+                        for j in 0..k {
+                            l[done + j] = if out_l[j].is_finite() { out_l[j].clamp(-4.0, 4.0) } else { 0.0 };
+                            r[done + j] = if out_r[j].is_finite() { out_r[j].clamp(-4.0, 4.0) } else { 0.0 };
+                        }
+                    }
+                    done += k;
+                }
             }
-            self.frame = self.frame.wrapping_add(k as u32);
-            done += k;
         }
     }
 }
-
 /// Frames a lane buffer holds; mix blocks are cut to this.
 pub const LANE_FRAMES: usize = 1 << 14;
 
@@ -146,14 +207,41 @@ impl FxRack {
         self.lanes.get(lane).is_some_and(|c| !c.is_empty())
     }
 
-    /// Carry every kept effect's state over from the rack this one replaces.
-    pub fn adopt(&mut self, old: &FxRack) {
-        let olds = || old.lanes.iter().flatten().chain(old.master.iter());
+    /// Carry every kept effect over from the rack this one replaces: shader
+    /// state, and plugin instances (moved, not reloaded). No allocation.
+    pub fn adopt(&mut self, old: &mut FxRack) {
         for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
-            if let Some(o) = olds().find(|o| o.id == unit.id) {
+            if let Some(o) = old.lanes.iter_mut().flatten().chain(old.master.iter_mut()).find(|o| o.id == unit.id) {
                 unit.carry_from(o);
             }
         }
+    }
+
+    /// Give plugin unit `id` its instance (a newly loaded plugin).
+    #[cfg(windows)]
+    pub fn install(&mut self, id: &str, new: Box<Runner>) -> Result<(), Box<Runner>> {
+        for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
+            if let (true, Engine::Plugin { runner, .. }) = (unit.id == id, &mut unit.engine) {
+                *runner = Some(new);
+                return Ok(());
+            }
+        }
+        Err(new)
+    }
+
+    /// Take every plugin instance out (a rack that never reached the audio
+    /// thread hands them back instead of destroying them).
+    #[cfg(windows)]
+    pub fn take_runners(&mut self) -> Vec<(String, Box<Runner>)> {
+        let mut out = Vec::new();
+        for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
+            if let Engine::Plugin { runner, .. } = &mut unit.engine {
+                if let Some(r) = runner.take() {
+                    out.push((unit.id.clone(), r));
+                }
+            }
+        }
+        out
     }
 
     /// Run lane `lane`'s chain over the first `n` frames of the lane buffer.
@@ -200,8 +288,14 @@ pub fn build_rack(
         chain
             .iter()
             .filter_map(|fx| {
-                let shader = compiled(&fx.id)?;
                 let c = controls(&fx.id)?;
+                if fx.plugin.is_some() {
+                    #[cfg(windows)]
+                    return Some(FxUnit::plugin(&fx.id, c, sr));
+                    #[cfg(not(windows))]
+                    return None;
+                }
+                let shader = compiled(&fx.id)?;
                 Some(FxUnit::new(&fx.id, shader, c, sr))
             })
             .collect()
@@ -218,7 +312,7 @@ mod tests {
 
     fn unit(code: &str) -> FxUnit {
         let shader = compile_source(code).unwrap();
-        let fx = Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None };
+        let fx = Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None };
         let controls = FxControls::new(&shader, &fx, None);
         FxUnit::new("fx1", shader, controls, 48000)
     }

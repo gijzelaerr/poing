@@ -33,6 +33,36 @@ fn main() {
         let shown = plugin.format_parameter(p.id, p.value).unwrap_or_default();
         println!("  {:>10}  {:<28} {:.3}  ({shown})", p.id, p.name, p.value);
     }
+    if std::env::args().any(|a| a == "--thread") {
+        // As Poing runs it: a runner made here, processed on another thread.
+        let (mut runner, mut control) = vst3_host::realtime::RealtimePluginRunner::new(plugin, 512);
+        runner.start().expect("start");
+        let worker = std::thread::spawn(move || {
+            let mut buffers = AudioBuffers::new(2, 2, 1024, 48_000.0);
+            let mut results = Vec::new();
+            for b in 0..20 {
+                for i in 0..1024 {
+                    let x = 0.3 * (std::f32::consts::TAU * 220.0 * (b * 1024 + i) as f32 / 48_000.0).sin();
+                    buffers.inputs[0][i] = x;
+                    buffers.inputs[1][i] = x;
+                }
+                buffers.block_size = if b % 2 == 0 { 1024 } else { 300 };
+                let t = Instant::now();
+                let r = runner.process(&mut buffers);
+                results.push(format!("{:?} {:.2}ms", r.is_ok(), t.elapsed().as_secs_f64() * 1e3));
+                if let Err(e) = r {
+                    results.push(format!("error: {e}"));
+                    break;
+                }
+            }
+            (runner, results)
+        });
+        let (runner, results) = worker.join().expect("worker panicked");
+        println!("processed on another thread: {}", results.join(", "));
+        drop(runner);
+        println!("teardown serviced: {}", control.service_teardown());
+        return;
+    }
     plugin.start_processing().expect("start");
     let mut buffers = AudioBuffers::new(2, 2, 1024, 48_000.0);
     let (mut peak_in, mut peak_out, mut sum_diff) = (0.0f32, 0.0f32, 0.0f64);

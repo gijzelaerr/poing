@@ -10,6 +10,7 @@ pub use makepad_widgets;
 mod audio;
 mod fx;
 mod fx_writer;
+mod plugins;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
@@ -281,6 +282,22 @@ enum Open {
     Audio(PathBuf),
 }
 
+/// Is a text field (or a slider's typed value) taking the keyboard? Then
+/// keys are text; otherwise they are shortcuts (a clicked button keeps the
+/// focus but does not want keys).
+fn typing(ui: &WidgetRef, cx: &Cx) -> bool {
+    let focus = cx.key_focus();
+    if focus.is_empty() {
+        return false;
+    }
+    let fields = [ids!(describe_input), ids!(note_input), ids!(section_input)];
+    if fields.iter().any(|id| ui.widget(cx, *id).area() == focus) {
+        return true;
+    }
+    let sliders = [ids!(track_gain), ids!(region_gain), ids!(take_blend), ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+    sliders.iter().any(|id| ui.slider(cx, *id).has_text_focus(cx))
+}
+
 /// What a path handed to Poing (an argument or a drop) opens: a song to
 /// import, a `.poing` bundle or a project file.
 fn target_for(path: &Path) -> Option<Open> {
@@ -416,6 +433,12 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         return "A job is still running; describe the next take when it is done.".into();
     }
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    // An installed plugin named with nothing selected: on the master.
+    if matches!(st.sel, Selection::None | Selection::Section(_)) {
+        if let Some(result) = add_named_plugin(st, None, text) {
+            return result;
+        }
+    }
     // An effect on the whole mix ("... on the master")
     if is_master_effect_text(text) && !matches!(st.sel, Selection::Track(_) | Selection::Region(_)) {
         return write_effect(st, jobs, bundle, None, text);
@@ -516,6 +539,23 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
     format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", section.label, section.start, section.end)
 }
 
+/// Describe that names an installed plugin ("Raum on the vocals"): put it on
+/// the lane, or the master. None when no plugin is named.
+fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Option<String> {
+    let names: Vec<String> = st.plugin_library.iter().map(|(n, _)| n.clone()).collect();
+    let name = model::plugin_named(text, &names)?.clone();
+    let path = st.plugin_library.iter().find(|(n, _)| *n == name)?.1.clone();
+    let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
+    Some(match st.add_plugin(lane, &name, &path, Some(text.to_string())) {
+        Ok(_) => {
+            let i = st.project.chain(lane).len() - 1;
+            st.select(Selection::Fx(lane, i));
+            format!("{name} is on {place}. Its main knobs are below; lanes are not delay-compensated yet.")
+        }
+        Err(e) => format!("{name} could not be added: {e}"),
+    })
+}
+
 /// Claude writes an effect for a lane (or the master, `None`) from `text`.
 fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option<usize>, text: &str) -> String {
     let a = st.project.analysis.clone().unwrap_or_default();
@@ -547,6 +587,10 @@ fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option
 fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize, range: Option<(f64, f64)>, text: &str) -> String {
     let track = st.project.tracks[lane].clone();
     let lane_file = st.project.track_path(&st.path, lane);
+    // An installed plugin by name goes on the lane as it is.
+    if let Some(result) = add_named_plugin(st, Some(lane), text) {
+        return result;
+    }
     let intent = lane_intent(text, &track.id);
     if intent == LaneIntent::Effect {
         return write_effect(st, jobs, bundle, Some(lane), text);
@@ -776,9 +820,13 @@ impl App {
                 if analyse {
                     self.start_analysis(&mut st);
                 }
-                if let Some(old) = self.state.replace(st) {
-                    // Its stem sets may still be in the audio thread's hands for a callback.
+                if let Some(mut old) = self.state.replace(st) {
+                    // Its stem sets and plugins may still be in the audio thread's hands.
+                    #[cfg(windows)]
+                    let controls = old.take_plugin_controls();
                     if let Some(st) = &mut self.state {
+                        #[cfg(windows)]
+                        st.adopt_plugin_controls(controls);
                         for set in old.into_retired() {
                             st.retire(set);
                         }
@@ -843,9 +891,11 @@ impl App {
             Selection::Fx(lane, i) if i < st.project.chain(lane).len() => {
                 let fx = st.project.chain(lane)[i].clone();
                 let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
-                let state = match st.fx_errors.get(&fx.id) {
-                    Some(e) => format!("   ·   does not compile: {}", e.chars().take(120).collect::<String>()),
-                    None => format!("   ·   edit {} to change it live", fx.file),
+                let state = match (st.fx_errors.get(&fx.id), fx.plugin.is_some()) {
+                    (Some(e), true) => format!("   ·   {}", e.chars().take(120).collect::<String>()),
+                    (Some(e), false) => format!("   ·   does not compile: {}", e.chars().take(120).collect::<String>()),
+                    (None, true) => "   ·   VST3 plugin, its main knobs".to_string(),
+                    (None, false) => format!("   ·   edit {} to change it live", fx.file),
                 };
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
                 let knobs = st.fx_knobs(&fx.id);
@@ -1007,7 +1057,19 @@ impl MatchEvent for App {
     /// Play through the system's default output (the audio callback only
     /// runs once an output device is opened).
     fn handle_audio_devices(&mut self, cx: &mut Cx, devices: &AudioDevicesEvent) {
-        cx.use_audio_outputs(&devices.default_output());
+        for d in &devices.descs {
+            log!("poing: audio device {d}");
+        }
+        let out = devices.default_output();
+        log!("poing: playing through {:?}", out);
+        // The device list can come empty first and complete a moment later.
+        let none = "No audio output is available (is another app holding the sound card?): playback stays silent until one is free. Export still works.";
+        if out.is_empty() {
+            self.set_status(cx, none);
+        } else if self.ui.label(cx, ids!(status_label)).text() == none {
+            self.set_status(cx, "");
+        }
+        cx.use_audio_outputs(&out);
     }
 
     fn handle_startup(&mut self, cx: &mut Cx) {
@@ -1017,6 +1079,11 @@ impl MatchEvent for App {
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let ui = self.ui.clone();
+        // A clicked button keeps the keyboard focus and would answer Space
+        // (Export again): give the keys back to the song.
+        if !typing(&ui, cx) && !cx.key_focus().is_empty() {
+            cx.set_key_focus(Area::Empty);
+        }
         let buttons = [ids!(rec0), ids!(rec1), ids!(rec2), ids!(rec3), ids!(rec4), ids!(rec5), ids!(rec6), ids!(rec7)];
         if let Some(i) = buttons.iter().position(|b| ui.button(cx, *b).clicked(actions)) {
             if let Some(p) = self.recent.get(i).cloned() {
@@ -1033,16 +1100,15 @@ impl MatchEvent for App {
         }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
             let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
-            let job = Job::Render {
-                stems: st.stems.clone(),
-                mix: st.mix_snapshot(),
-                rack: Box::new(st.make_rack()),
-                sr: st.sr(),
-                out_dir,
-                name: st.project.name.clone(),
-            };
+            // plugins get a second instance for the render
+            let (rack, missing) = st.make_render_rack();
+            let job = Job::Render { stems: st.stems.clone(), mix: st.mix_snapshot(), rack: Box::new(rack), sr: st.sr(), out_dir, name: st.project.name.clone() };
             let queued = self.jobs.as_ref().map(|j| j.submit(job)).unwrap_or(false);
-            status = Some(if queued { "Rendering...".into() } else { "Render worker is not running".into() });
+            status = Some(match (queued, missing.is_empty()) {
+                (false, _) => "Render worker is not running".into(),
+                (true, true) => "Rendering...".into(),
+                (true, false) => format!("Rendering without {} (it would not load a second time)...", missing.join(", ")),
+            });
         }
 
         if let Some((text, _)) = ui.text_input(cx, ids!(describe_input)).returned(actions) {
@@ -1217,8 +1283,7 @@ impl AppMain for App {
         // Shortcuts work anywhere but in a text field (which keeps its own keys).
         if let Event::KeyDown(ke) = event {
             if let Some(st) = self.state.as_mut() {
-                let focus = cx.key_focus();
-                if (focus.is_empty() || focus == st.timeline_area) && timeline::shortcut(st, ke) {
+                if !typing(&self.ui, cx) && timeline::shortcut(st, ke) {
                     self.ui.widget(cx, ids!(timeline)).redraw(cx);
                 }
             }
@@ -1227,6 +1292,11 @@ impl AppMain for App {
         match &mut self.state {
             Some(st) => {
                 st.collect_retired();
+                // The audio callback panicked: Makepad dropped it, so say why.
+                if let Some(note) = makepad_widgets::makepad_platform::audio_output_fence::take_audio_output_panic_note(0) {
+                    log!("poing: audio stopped: {note}");
+                    self.ui.label(cx, ids!(status_label)).set_text(cx, &format!("Audio stopped: {note}"));
+                }
                 if let Some(note) = st.notice.take() {
                     self.ui.label(cx, ids!(status_label)).set_text(cx, &note);
                     self.status_at = Some(std::time::Instant::now());

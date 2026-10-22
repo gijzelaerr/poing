@@ -95,6 +95,35 @@ pub const EFFECT_WORDS: [&str; 34] = [
     "highpass", "bitcrush", "crush", "lofi", "wah", "widen", "wider", "stereo", "gate", "galm", "vervorm",
 ];
 
+/// The installed plugin a Describe names, if any: whole words of the plugin's
+/// name, also without its vendor's first word or a trailing version number
+/// ("pro-q" finds "FabFilter Pro-Q 3"). The longest name named wins.
+pub fn plugin_named<'a>(text: &str, plugins: &'a [String]) -> Option<&'a String> {
+    let t = format!(" {} ", text.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', " "));
+    let aliases = |name: &str| -> Vec<String> {
+        let n = name.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', " ");
+        let words: Vec<&str> = n.split_whitespace().collect();
+        let mut out = vec![words.join(" ")];
+        let unversioned: Vec<&str> = match words.split_last() {
+            Some((last, rest)) if !rest.is_empty() && last.chars().all(|c| c.is_ascii_digit() || c == 'v') => rest.to_vec(),
+            _ => words.clone(),
+        };
+        out.push(unversioned.join(" "));
+        for w in [&words, &unversioned] {
+            if w.len() > 1 {
+                out.push(w[1..].join(" "));
+            }
+        }
+        out.retain(|a| a.len() >= 4);
+        out
+    };
+    plugins
+        .iter()
+        .filter_map(|p| aliases(p).into_iter().filter(|a| t.contains(&format!(" {a} "))).map(|a| a.len()).max().map(|l| (l, p)))
+        .max_by_key(|(l, _)| *l)
+        .map(|(_, p)| p)
+}
+
 /// Does a Describe ask for an audio effect?
 pub fn is_effect_text(text: &str) -> bool {
     let t = text.to_lowercase();
@@ -231,6 +260,9 @@ pub struct Fx {
     pub bypass: Option<bool>,
     /// The Describe it was written from.
     pub prompt: Option<String>,
+    /// A VST3 plugin instead of a shader: its bundle path (then `file` is
+    /// empty and `params` hold normalized values by parameter name).
+    pub plugin: Option<String>,
 }
 
 #[derive(SerJson, DeJson, Clone, Debug)]
@@ -533,6 +565,22 @@ mod tests {
         assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace(Some("bass".into())));
         assert_eq!(lane_intent("warm rhodes instead", "other"), LaneIntent::Replace(Some("keyboard".into())));
         assert_eq!(lane_intent("make it nicer", "other"), LaneIntent::Replace(None));
+    }
+
+    #[test]
+    fn installed_plugins_are_found_by_name() {
+        let plugins: Vec<String> = ["FabFilter Pro-Q 3", "FabFilter Pro-C 2", "Raum", "Replika XT", "Supercharger GT", "Supercharger", "Love"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found = |t: &str| plugin_named(t, &plugins).cloned();
+        assert_eq!(found("add Raum on the vocals"), Some("Raum".into()));
+        assert_eq!(found("pro-q on the bass"), Some("FabFilter Pro-Q 3".into()));
+        assert_eq!(found("FabFilter Pro-C please"), Some("FabFilter Pro-C 2".into()));
+        assert_eq!(found("supercharger gt, gently"), Some("Supercharger GT".into()), "the longer name wins");
+        assert_eq!(found("add some reverb"), None, "a plain effect is a shader");
+        assert_eq!(found("add tight disco drums"), None);
+        assert_eq!(found("lovely warm tape"), None, "whole words only");
     }
 
     #[test]
