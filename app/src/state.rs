@@ -17,6 +17,8 @@ pub enum Selection {
     Track(usize),
     Region(usize),
     Section(usize),
+    /// An effect: its lane (None: the master) and place in the chain.
+    Fx(Option<usize>, usize),
 }
 
 pub struct EditorState {
@@ -219,6 +221,12 @@ impl EditorState {
             self.project.chain_mut(lane)[i].bypass = Some(bypass);
             self.dirty = true;
         }
+    }
+
+    /// The shader param behind knob `knob` (knobs skip `bpm`, set from the song).
+    pub fn fx_param_index(&self, id: &str, knob: usize) -> Option<usize> {
+        let shader = self.fx_shaders.get(id)?;
+        shader.params().iter().enumerate().filter(|(_, p)| p.name != "bpm").nth(knob).map(|(i, _)| i)
     }
 
     /// The knobs of effect `id`: (name, value, min, max).
@@ -552,6 +560,12 @@ impl EditorState {
 
     pub fn delete_selected(&mut self) {
         match self.sel {
+            Selection::Fx(lane, i) => {
+                if let Some(id) = self.project.chain(lane).get(i).map(|f| f.id.clone()) {
+                    let _ = self.remove_fx(&id);
+                    self.select(Selection::None);
+                }
+            }
             Selection::Region(i) if i < self.project.regions().len() => {
                 self.project.regions_mut().remove(i);
                 self.select(Selection::None);

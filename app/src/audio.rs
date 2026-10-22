@@ -518,6 +518,8 @@ pub enum Job {
     Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
     /// Split `lane` into dry voice and echo; the dry voice is the take.
     Dereverb { bundle: PathBuf, take: Take, lane: PathBuf, sr: u32 },
+    /// Claude writes an effect for a lane (None: the master).
+    WriteFx { bundle: PathBuf, lane: Option<usize>, request: String, context: String },
     /// A new part: lego plays it, then it is cleaned and fitted into the gaps.
     Layer { bundle: PathBuf, take: Take, lego: LegoJob, clean: LayerJob, sr: u32 },
 }
@@ -561,6 +563,8 @@ pub enum JobUpdate {
     Analyzed { bundle: PathBuf, stems: Vec<(String, String, Stem)> },
     /// A take finished rendering and is decoded at the project rate.
     TakeReady { bundle: PathBuf, take: Take, stem: Stem },
+    /// An effect Claude wrote and Poing checked, for lane `lane` (None: master).
+    FxReady { bundle: PathBuf, lane: Option<usize>, name: String, code: String, request: String, note: String },
 }
 
 pub struct Jobs {
@@ -584,6 +588,7 @@ impl Jobs {
                         Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, &up_tx),
                         Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, &up_tx),
                         Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, &up_tx),
+                        Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, &up_tx),
                     }
                 }
             })
@@ -1109,6 +1114,28 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
     }
     let _ = std::fs::remove_file(&played);
     finish_take(bundle, take, &cleaned, sr, tx, &fail);
+}
+
+/// Have Claude write an effect, check it, and hand it to the UI.
+fn write_fx(bundle: &Path, lane: Option<usize>, request: String, context: &str, tx: &Sender<JobUpdate>) {
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Effect  ·  {message}"), progress })
+    };
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The effect could not be made: {why}") });
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let work = bundle.join("fx").join("drafts").join(stamp.to_string());
+    match crate::fx_writer::write_effect(&request, context, &work, &progress) {
+        Ok(w) if crate::fx::compile_source(&w.code).is_ok() => {
+            let note = if w.problems.is_empty() {
+                format!("checked in {} round{}", w.rounds, if w.rounds == 1 { "" } else { "s" })
+            } else {
+                format!("plays, but the check still says: {}", w.problems.join("; "))
+            };
+            send(tx, JobUpdate::FxReady { bundle: bundle.to_path_buf(), lane, name: w.name, code: w.code, request, note });
+        }
+        Ok(w) => fail(w.problems.join("; ")),
+        Err(e) => fail(e),
+    }
 }
 
 /// Move a rendered take into place, decode it and hand it to the UI.

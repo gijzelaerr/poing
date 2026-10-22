@@ -1,6 +1,7 @@
-//! The arrangement view: ruler, sections lane, one lane per stem (header with
-//! M/S, waveform, regions) and the playhead. Immediate-mode rects and text;
-//! all mouse and keyboard editing of the arrangement happens here.
+//! The arrangement view: ruler, sections, chords, takes, one lane per stem
+//! (header with M/S and effect chips, waveform, regions), the master strip
+//! and the playhead. Immediate-mode shapes and text; all mouse and keyboard
+//! editing of the arrangement happens here.
 
 use crate::audio::PEAK_BLOCK;
 use crate::model::REGION_KINDS;
@@ -11,23 +12,79 @@ script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
 
+    mod.widgets.DrawShapeBase = #(DrawShape::script_component(vm))
+    set_type_default() do #(DrawShape::script_shader(vm)){
+        ..mod.draw.DrawQuad
+    }
+
     mod.widgets.DawTimelineBase = #(DawTimeline::register_widget(vm))
 
     mod.widgets.DawTimeline = set_type_default() do mod.widgets.DawTimelineBase{
         width: Fill
         height: Fill
-        draw_bg +: {color: #x16181d}
-        draw_text +: {color: #xd8dce4}
+        draw_bg +: {color: #x0f1013}
+        // A rounded box with a vertical gradient and an optional border.
+        draw_shape +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                // `sdf.box` draws twice the radius it is given
+                sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, self.radius * 0.5)
+                sdf.fill_keep(mix(self.color, self.color2, self.pos.y))
+                if self.border_size > 0.0 {
+                    sdf.stroke(self.border_color, self.border_size)
+                }
+                return sdf.result
+            }
+        }
+        draw_text +: {
+            color: #xeceef2
+            text_style: theme.font_regular{font_size: 8.5}
+        }
+        draw_bold +: {
+            color: #xeceef2
+            text_style: theme.font_bold{font_size: 9.5}
+        }
+        draw_clock +: {
+            color: #xeceef2
+            text_style: theme.font_bold{font_size: 13}
+        }
     }
 }
 
-const HEADER_W: f64 = 200.0;
-const RULER_H: f64 = 22.0;
-const SECT_H: f64 = 26.0;
-const CHORD_H: f64 = 18.0;
-const TAKES_H: f64 = 24.0;
-const GAP: f64 = 6.0;
+/// A rounded, shaded shape (see the pixel shader above).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawShape {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    color: Vec4f,
+    #[live]
+    color2: Vec4f,
+    #[live]
+    border_color: Vec4f,
+    #[live]
+    radius: f32,
+    #[live]
+    border_size: f32,
+}
+
+const HEADER_W: f64 = 196.0;
+const RULER_H: f64 = 30.0;
+const SECT_H: f64 = 28.0;
+const CHORD_H: f64 = 20.0;
+const TAKES_H: f64 = 30.0;
+const MASTER_H: f64 = 34.0;
+const GAP: f64 = 8.0;
+const LANE_GAP: f64 = 3.0;
 const EDGE_PX: f64 = 6.0;
+
+const ACCENT: u32 = 0x0a84ff;
+const TEXT: u32 = 0xeceef2;
+const TEXT_2: u32 = 0x8d939e;
+const CARD: u32 = 0x16181d;
+const HEADER: u32 = 0x1b1e24;
+const HAIRLINE: u32 = 0x262a31;
 
 #[derive(Clone, Copy, Default)]
 struct Geo {
@@ -40,6 +97,7 @@ struct Geo {
     lanes_y: f64,
     lane_h: f64,
     n: usize,
+    master_y: f64,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -68,7 +126,13 @@ pub struct DawTimeline {
     #[live]
     draw_rect: DrawColor,
     #[live]
+    draw_shape: DrawShape,
+    #[live]
     draw_text: DrawText,
+    #[live]
+    draw_bold: DrawText,
+    #[live]
+    draw_clock: DrawText,
     #[rust]
     area: Area,
     #[rust]
@@ -80,43 +144,71 @@ pub struct DawTimeline {
     /// Take chips as drawn: (rect, take id; None is the original).
     #[rust]
     chips: Vec<(Rect, Option<String>)>,
+    /// Effect chips as drawn: (rect, lane or master, index in its chain).
+    #[rust]
+    fx_chips: Vec<(Rect, Option<usize>, usize)>,
 }
 
 fn rgba(hex: u32, a: f32) -> Vec4f {
     vec4(((hex >> 16) & 0xff) as f32 / 255.0, ((hex >> 8) & 0xff) as f32 / 255.0, (hex & 0xff) as f32 / 255.0, a)
 }
 
-const TRACK_COLORS: [u32; 8] = [0xe8a54b, 0xb39ddb, 0x4fc3f7, 0x26a69a, 0xef5350, 0x9ccc65, 0xf06292, 0xffd54f];
+/// The same colour a little darker (for gradients).
+fn shade(c: Vec4f, f: f32) -> Vec4f {
+    vec4(c.x * f, c.y * f, c.z * f, c.w)
+}
+
+/// A lane's colour, by what it is.
+fn track_color(id: &str, i: usize) -> u32 {
+    const OTHERS: [u32; 6] = [0xff375f, 0x5e5ce6, 0xffd60a, 0x64d2ff, 0xbf5af2, 0x30d158];
+    match id {
+        "original" => 0x8e8e93,
+        "vocals" => 0xbf5af2,
+        "drums" => 0x64d2ff,
+        "bass" => 0x30d158,
+        "other" => 0xff9f0a,
+        _ => OTHERS[i % OTHERS.len()],
+    }
+}
 
 fn region_color(kind: &str) -> u32 {
     match kind {
-        "bad" => 0xff5252,
-        "regenerate" => 0xffab40,
-        "too_loud" => 0xff4081,
-        "too_quiet" => 0x40c4ff,
-        "mute" => 0x9e9e9e,
-        _ => 0x69f0ae,
+        "bad" => 0xff453a,
+        "regenerate" => 0xff9f0a,
+        "too_loud" => 0xff375f,
+        "too_quiet" => 0x64d2ff,
+        "mute" => 0x8e8e93,
+        _ => 0x30d158,
     }
 }
 
 fn section_color(label: &str) -> u32 {
     let l = label.to_lowercase();
     if l.starts_with("chorus") {
-        0xc0703a
+        0xb4602c
     } else if l.starts_with("verse") {
-        0x2f7f78
+        0x23706b
     } else if l.starts_with("bridge") {
-        0x7b5ea7
-    } else if l.starts_with("inst") || l.starts_with("drop") || l.starts_with("break") {
-        0x4f8a3c
+        0x6a4fa0
+    } else if l.starts_with("inst") || l.starts_with("drop") || l.starts_with("break") || l.starts_with("interlude") {
+        0x3f7a34
     } else {
-        0x4a5568
+        0x3a404c
     }
 }
 
 fn fmt_time(t: f64) -> String {
     let t = t.max(0.0);
     format!("{}:{:04.1}", (t / 60.0) as u32, t % 60.0)
+}
+
+/// At most `n` characters, with an ellipsis when cut.
+fn cut(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
 }
 
 /// Region kind index for the inspector dropdown.
@@ -157,10 +249,10 @@ impl DawTimeline {
         y >= self.geo.sect_y && y < self.geo.sect_y + SECT_H
     }
     fn mute_box(&self, lane: usize) -> Rect {
-        Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 62.0, self.lane_y(lane) + 8.0), size: dvec2(24.0, 18.0) }
+        Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 58.0, self.lane_y(lane) + 9.0), size: dvec2(22.0, 18.0) }
     }
     fn solo_box(&self, lane: usize) -> Rect {
-        Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 34.0, self.lane_y(lane) + 8.0), size: dvec2(24.0, 18.0) }
+        Rect { pos: dvec2(self.geo.rect.pos.x + HEADER_W - 32.0, self.lane_y(lane) + 9.0), size: dvec2(22.0, 18.0) }
     }
     fn clamp_scroll(&self, st: &mut EditorState) {
         let visible = self.geo.w / st.pps;
@@ -197,24 +289,45 @@ impl DawTimeline {
         self.draw_rect.color = color;
         self.draw_rect.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(w.max(1.0), h.max(1.0)) });
     }
-    fn outline(&mut self, cx: &mut Cx2d, x: f64, y: f64, w: f64, h: f64, color: Vec4f) {
-        self.rect(cx, x, y, w, 2.0, color);
-        self.rect(cx, x, y + h - 2.0, w, 2.0, color);
-        self.rect(cx, x, y, 2.0, h, color);
-        self.rect(cx, x + w - 2.0, y, 2.0, h, color);
+    /// A rounded box shading from `top` to `bottom`.
+    fn shape(&mut self, cx: &mut Cx2d, r: Rect, radius: f64, top: Vec4f, bottom: Vec4f) {
+        self.shape_bordered(cx, r, radius, top, bottom, vec4(0.0, 0.0, 0.0, 0.0), 0.0);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn shape_bordered(&mut self, cx: &mut Cx2d, r: Rect, radius: f64, top: Vec4f, bottom: Vec4f, border: Vec4f, border_size: f64) {
+        self.draw_shape.color = top;
+        self.draw_shape.color2 = bottom;
+        self.draw_shape.border_color = border;
+        self.draw_shape.border_size = border_size as f32;
+        self.draw_shape.radius = radius as f32;
+        self.draw_shape.draw_abs(cx, r);
     }
     fn text(&mut self, cx: &mut Cx2d, x: f64, y: f64, color: Vec4f, s: &str) {
         self.draw_text.color = color;
         self.draw_text.draw_abs(cx, dvec2(x, y), s);
     }
+    fn bold(&mut self, cx: &mut Cx2d, x: f64, y: f64, color: Vec4f, s: &str) {
+        self.draw_bold.color = color;
+        self.draw_bold.draw_abs(cx, dvec2(x, y), s);
+    }
+    /// A pill with a label; returns its rect.
+    fn pill(&mut self, cx: &mut Cx2d, x: f64, y: f64, h: f64, label: &str, fill: Vec4f, ink: Vec4f) -> Rect {
+        let w = label.chars().count() as f64 * 5.6 + 16.0;
+        let r = Rect { pos: dvec2(x, y), size: dvec2(w, h) };
+        self.shape(cx, r, h * 0.5, fill, shade(fill, 0.92));
+        self.text(cx, x + 8.0, y + (h - 11.0) * 0.5, ink, label);
+        r
+    }
 
-    /// Waveform of stem stem in a lane: min/max of the peak blocks under each pixel column.
+    /// A lane's waveform: the peaks under each pixel column, drawn twice
+    /// (the full swing faint, its inner half solid) for depth.
     fn wave(&mut self, cx: &mut Cx2d, st: &EditorState, stem: usize, ly: f64, lane_h: f64, color: Vec4f) {
         let Some(s) = st.stems.get(stem).cloned() else { return };
-        let scale = (lane_h * 0.46) / s.peak_abs as f64;
+        let scale = (lane_h * 0.42) / s.peak_abs as f64;
         let mid = ly + lane_h * 0.5;
         let sr = st.sr() as f64;
         let (x0, w) = (self.geo.x0, self.geo.w);
+        let faint = vec4(color.x, color.y, color.z, color.w * 0.45);
         for px in 0..(w as usize) {
             let t0 = st.scroll_t + px as f64 / st.pps;
             if t0 >= st.duration() {
@@ -230,7 +343,40 @@ impl DawTimeline {
                 mn = mn.min(a);
                 mx = mx.max(b);
             }
-            self.rect(cx, x0 + px as f64, mid - mx as f64 * scale, 1.0, ((mx - mn) as f64 * scale).max(1.0), color);
+            let (top, bot) = (mid - mx as f64 * scale, mid - mn as f64 * scale);
+            self.rect(cx, x0 + px as f64, top, 1.0, (bot - top).max(1.0), faint);
+            let (it, ib) = (mid - mx as f64 * scale * 0.5, mid - mn as f64 * scale * 0.5);
+            self.rect(cx, x0 + px as f64, it, 1.0, (ib - it).max(1.0), color);
+        }
+    }
+
+    /// A row of effect chips from (x, y); the chain's own "+" is not drawn
+    /// (effects are added by Describe).
+    fn fx_chips_row(&mut self, cx: &mut Cx2d, st: &EditorState, lane: Option<usize>, x: f64, y: f64, max_x: f64) {
+        let chain: Vec<(String, bool, bool)> = st
+            .project
+            .chain(lane)
+            .iter()
+            .map(|f| (cut(&f.name, 14), f.bypassed(), st.fx_errors.contains_key(&f.id)))
+            .collect();
+        let mut cx_ = x;
+        for (i, (name, bypassed, broken)) in chain.into_iter().enumerate() {
+            let selected = st.sel == Selection::Fx(lane, i);
+            let fill = if selected {
+                rgba(ACCENT, 1.0)
+            } else if broken {
+                rgba(0xff453a, 0.35)
+            } else {
+                rgba(0x2a2e37, if bypassed { 0.5 } else { 1.0 })
+            };
+            let ink = if selected { rgba(0xffffff, 1.0) } else { rgba(TEXT, if bypassed { 0.45 } else { 0.9 }) };
+            let w = name.chars().count() as f64 * 5.6 + 16.0;
+            if cx_ + w > max_x {
+                break;
+            }
+            let r = self.pill(cx, cx_, y, 16.0, &name, fill, ink);
+            self.fx_chips.push((r, lane, i));
+            cx_ += r.size.x + 4.0;
         }
     }
 
@@ -255,23 +401,25 @@ impl DawTimeline {
                 .map(|i| (st.project.tracks.len() + i, st.project.takes()[i].clone()))
                 .collect()
         };
-        let lane_h = ((rect.size.y - (lanes_y - rect.pos.y)) / (n + layers.len()).max(1) as f64).clamp(40.0, 140.0);
+        let avail = rect.size.y - (lanes_y - rect.pos.y) - MASTER_H - GAP;
+        let lane_h = (avail / (n + layers.len()).max(1) as f64).clamp(44.0, 150.0);
+        let master_y = rect.pos.y + rect.size.y - MASTER_H;
         self.geo = Geo {
             rect,
             x0: rect.pos.x + HEADER_W,
-            w: (rect.size.x - HEADER_W).max(10.0),
+            w: (rect.size.x - HEADER_W - 8.0).max(10.0),
             sect_y: rect.pos.y + RULER_H,
             chord_y,
             takes_y,
             lanes_y,
             lane_h,
             n,
+            master_y,
         };
         if st.pps <= 0.0 && st.duration() > 0.0 {
             st.pps = self.geo.w / st.duration();
             st.scroll_t = 0.0;
         }
-        self.draw_text.text_style.font_size = 8.5;
         let playing = st.shared.playing();
         let ph = st.playhead();
         if playing {
@@ -283,50 +431,60 @@ impl DawTimeline {
             self.next_frame = cx.new_next_frame();
         }
         let (x0, w) = (self.geo.x0, self.geo.w);
-        let white = rgba(0xd8dce4, 1.0);
-        let dim = rgba(0x8a93a6, 1.0);
+        let left = rect.pos.x;
+        let white = rgba(TEXT, 1.0);
+        let dim = rgba(TEXT_2, 1.0);
+        let faint = rgba(TEXT_2, 0.7);
+        self.fx_chips.clear();
 
-        // ruler: a tick every 1/2/5/10/15/30/60 s, whichever is >= 60 px apart
-        self.rect(cx, rect.pos.x, rect.pos.y, rect.size.x, RULER_H, rgba(0x0f1115, 1.0));
-        let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0].into_iter().find(|s| s * st.pps >= 60.0).unwrap_or(60.0);
+        // header column and clock
+        self.rect(cx, left, rect.pos.y, HEADER_W - 4.0, rect.size.y, rgba(0x121317, 1.0));
+        self.draw_clock.color = white;
+        self.draw_clock.draw_abs(cx, dvec2(left + 14.0, rect.pos.y + 6.0), &fmt_time(ph));
+        self.text(cx, left + 100.0, rect.pos.y + 11.0, faint, &format!("/ {}", fmt_time(st.duration())));
+
+        // ruler: a tick every 1/2/5/10/15/30/60 s, whichever is >= 70 px apart
+        let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0].into_iter().find(|s| s * st.pps >= 70.0).unwrap_or(60.0);
         let mut t = (st.scroll_t / step).floor() * step;
         while t <= st.scroll_t + w / st.pps {
             let x = self.x_of(st, t);
             if x >= x0 {
-                self.rect(cx, x, rect.pos.y + 12.0, 1.0, RULER_H - 12.0, dim);
-                self.text(cx, x + 3.0, rect.pos.y + 3.0, dim, fmt_time(t).trim_end_matches(".0"));
+                self.rect(cx, x, rect.pos.y + RULER_H - 7.0, 1.0, 7.0, rgba(HAIRLINE, 1.0));
+                self.text(cx, x + 4.0, rect.pos.y + 10.0, faint, fmt_time(t).trim_end_matches(".0"));
             }
             t += step;
         }
-        let clock = format!("{}  /  {}", fmt_time(ph), fmt_time(st.duration()));
-        self.text(cx, rect.pos.x + 8.0, rect.pos.y + 4.0, white, &clock);
 
         // sections
         let sy = self.geo.sect_y;
-        self.text(cx, rect.pos.x + 8.0, sy + 7.0, dim, "Sections");
+        self.text(cx, left + 14.0, sy + 8.0, dim, "Sections");
         for i in 0..st.project.sections().len() {
             let s = st.project.sections()[i].clone();
             if let Some((x, sw)) = self.span(st, s.start, s.end) {
-                self.rect(cx, x, sy + 2.0, sw - 1.0, SECT_H - 4.0, rgba(section_color(&s.label), 0.85));
-                if sw > 30.0 {
-                    self.text(cx, x + 5.0, sy + 7.0, white, &s.label);
-                }
+                let c = rgba(section_color(&s.label), 1.0);
+                let r = Rect { pos: dvec2(x + 1.0, sy + 3.0), size: dvec2((sw - 2.0).max(2.0), SECT_H - 6.0) };
                 if st.sel == Selection::Section(i) {
-                    self.outline(cx, x, sy + 2.0, sw - 1.0, SECT_H - 4.0, rgba(0xffffff, 0.9));
+                    self.shape_bordered(cx, r, 6.0, shade(c, 1.15), c, rgba(0xffffff, 0.9), 1.5);
+                } else {
+                    self.shape(cx, r, 6.0, c, shade(c, 0.82));
+                }
+                if sw > 36.0 {
+                    self.bold(cx, x + 8.0, sy + 8.0, white, &cut(&s.label, ((sw - 14.0) / 6.5) as usize));
                 }
             }
         }
 
-        // analysis progress: a thin bar under the sections lane
+        // background job progress: a thin accent line under the sections
         if let Some((_, p)) = st.analysing.clone() {
-            self.rect(cx, x0, sy + SECT_H - 3.0, w, 3.0, rgba(0x343a46, 1.0));
-            self.rect(cx, x0, sy + SECT_H - 3.0, w * p.clamp(0.0, 1.0) as f64, 3.0, rgba(0x4fc3f7, 1.0));
+            self.shape(cx, Rect { pos: dvec2(x0, sy + SECT_H - 2.0), size: dvec2(w, 2.0) }, 1.0, rgba(HAIRLINE, 1.0), rgba(HAIRLINE, 1.0));
+            let pw = (w * p.clamp(0.0, 1.0) as f64).max(2.0);
+            self.shape(cx, Rect { pos: dvec2(x0, sy + SECT_H - 2.0), size: dvec2(pw, 2.0) }, 1.0, rgba(ACCENT, 1.0), rgba(ACCENT, 1.0));
             self.next_frame = cx.new_next_frame();
         }
 
-        // chords
+        // chords: names on a quiet line, the one playing in the accent
         if !chords.is_empty() {
-            self.text(cx, rect.pos.x + 8.0, chord_y + 3.0, dim, "Chords");
+            self.text(cx, left + 14.0, chord_y + 4.0, dim, "Chords");
             let cur = chords.iter().position(|c| ph >= c.start && ph < c.end);
             for (i, c) in chords.iter().enumerate() {
                 if c.label == "N" {
@@ -334,92 +492,108 @@ impl DawTimeline {
                 }
                 if let Some((x, cw)) = self.span(st, c.start, c.end) {
                     let on = cur == Some(i);
-                    self.rect(cx, x, chord_y + 1.0, cw - 1.0, CHORD_H - 2.0, rgba(if on { 0x3d4658 } else { 0x23272f }, 1.0));
-                    if cw > c.label.chars().count() as f64 * 6.0 + 6.0 {
-                        self.text(cx, x + 3.0, chord_y + 3.0, if on { white } else { dim }, &c.label);
+                    if cw >= 18.0 {
+                        self.rect(cx, x, chord_y + 5.0, 1.0, CHORD_H - 10.0, rgba(HAIRLINE, 1.0));
+                    }
+                    if on {
+                        self.shape(cx, Rect { pos: dvec2(x + 1.0, chord_y + 2.0), size: dvec2((cw - 2.0).max(2.0), CHORD_H - 4.0) }, 4.0, rgba(ACCENT, 0.25), rgba(ACCENT, 0.2));
+                    }
+                    if cw > c.label.chars().count() as f64 * 6.0 + 8.0 {
+                        self.text(cx, x + 5.0, chord_y + 4.0, if on { white } else { dim }, &c.label);
                     }
                 }
             }
         }
 
-        // takes: Original, Take 1, Take 2 ... click one to hear it (A/B)
+        // takes: Original, Take 1 · vocals, ... click to switch (A/B)
         self.chips.clear();
         if !st.project.takes().is_empty() {
-            self.text(cx, rect.pos.x + 8.0, takes_y + 6.0, dim, "Takes");
+            self.text(cx, left + 14.0, takes_y + 9.0, dim, "Takes");
             let mut x = x0;
             let names: Vec<(String, Option<String>)> = std::iter::once(("Original".to_string(), None))
                 .chain(st.project.takes().iter().map(|t| {
                     let n = t.id.trim_start_matches('t');
                     let label = match (t.scope.as_str(), t.track.as_deref()) {
                         ("lane" | "layer", Some(track)) => format!("Take {n} · {track}"),
+                        ("section", _) => format!("Take {n} · {:.0}s", t.start),
                         _ => format!("Take {n}"),
                     };
                     (label, Some(t.id.clone()))
                 }))
                 .collect();
             for (label, id) in names {
-                let w = label.chars().count() as f64 * 6.5 + 18.0;
                 let on = match &id {
                     None => st.active.is_empty(),
                     Some(id) => st.take_on(id),
                 };
-                self.rect(cx, x, takes_y + 3.0, w, TAKES_H - 6.0, rgba(if on { 0x4fc3f7 } else { 0x2c313b }, 1.0));
-                self.text(cx, x + 9.0, takes_y + 6.0, if on { rgba(0x111111, 1.0) } else { white }, &label);
-                self.chips.push((Rect { pos: dvec2(x, takes_y + 3.0), size: dvec2(w, TAKES_H - 6.0) }, id));
-                x += w + 6.0;
+                let (fill, ink) = if on { (rgba(ACCENT, 1.0), rgba(0xffffff, 1.0)) } else { (rgba(0x23262d, 1.0), rgba(TEXT, 0.85)) };
+                let r = self.pill(cx, x, takes_y + 5.0, 20.0, &label, fill, ink);
+                self.chips.push((r, id));
+                x += r.size.x + 6.0;
             }
         }
 
         // a song take: one lane with its waveform
         if let Some((stem, id)) = &song_take {
-            let ly = lanes_y;
-            let h = (rect.size.y - (lanes_y - rect.pos.y)).max(40.0);
-            self.rect(cx, rect.pos.x, ly, rect.size.x, h - 1.0, rgba(0x1c1f26, 1.0));
-            self.rect(cx, rect.pos.x, ly, HEADER_W - 2.0, h - 1.0, rgba(0x22262e, 1.0));
-            self.rect(cx, rect.pos.x, ly, 4.0, h - 1.0, rgba(0x4fc3f7, 1.0));
-            self.text(cx, rect.pos.x + 12.0, ly + 9.0, white, &format!("Take {}", id.trim_start_matches('t')));
-            self.text(cx, rect.pos.x + 12.0, ly + 27.0, dim, "whole song");
-            self.wave(cx, st, *stem, ly, h.min(260.0), rgba(0x4fc3f7, 0.85));
+            let h = (master_y - GAP - lanes_y).max(44.0);
+            let card = Rect { pos: dvec2(left + 6.0, lanes_y), size: dvec2(rect.size.x - 12.0, h) };
+            self.shape(cx, card, 8.0, rgba(CARD, 1.0), rgba(CARD, 1.0));
+            self.shape(cx, Rect { pos: dvec2(left + 6.0, lanes_y), size: dvec2(HEADER_W - 12.0, h) }, 8.0, rgba(HEADER, 1.0), rgba(HEADER, 1.0));
+            self.shape(cx, Rect { pos: dvec2(left + 16.0, lanes_y + 14.0), size: dvec2(8.0, 8.0) }, 8.0, rgba(ACCENT, 1.0), rgba(ACCENT, 1.0));
+            self.bold(cx, left + 30.0, lanes_y + 10.0, white, &format!("Take {}", id.trim_start_matches('t')));
+            self.text(cx, left + 30.0, lanes_y + 28.0, dim, "the whole song");
+            self.wave(cx, st, *stem, lanes_y, h.min(280.0), rgba(ACCENT, 0.9));
         }
 
-        // lanes
+        // lanes: a card each, header on the left
         let gains = st.project.track_gains();
         for i in 0..n {
             let ly = self.lane_y(i);
             let tr = st.project.tracks[i].clone();
-            let col = TRACK_COLORS[i % TRACK_COLORS.len()];
+            let col = rgba(track_color(&tr.id, i), 1.0);
             let audible = gains[i] > 0.0;
-            self.rect(cx, rect.pos.x, ly, rect.size.x, lane_h - 1.0, rgba(if i % 2 == 0 { 0x1c1f26 } else { 0x191b21 }, 1.0));
-            let hsel = st.sel == Selection::Track(i);
-            self.rect(cx, rect.pos.x, ly, HEADER_W - 2.0, lane_h - 1.0, rgba(if hsel { 0x2c3340 } else { 0x22262e }, 1.0));
-            self.rect(cx, rect.pos.x, ly, 4.0, lane_h - 1.0, rgba(col, if audible { 1.0 } else { 0.3 }));
-            self.text(cx, rect.pos.x + 12.0, ly + 9.0, if audible { white } else { dim }, &tr.name);
-            self.text(cx, rect.pos.x + 12.0, ly + 27.0, dim, &format!("{:+.1} dB", tr.gain()));
+            let lh = lane_h - LANE_GAP;
+            let selected = st.sel == Selection::Track(i);
+            self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(rect.size.x - 12.0, lh) }, 8.0, rgba(CARD, 1.0), rgba(0x14161a, 1.0));
+            let head = Rect { pos: dvec2(left + 6.0, ly), size: dvec2(HEADER_W - 12.0, lh) };
+            if selected {
+                self.shape_bordered(cx, head, 8.0, rgba(0x232833, 1.0), rgba(0x1f232c, 1.0), rgba(ACCENT, 0.9), 1.5);
+            } else {
+                self.shape(cx, head, 8.0, rgba(HEADER, 1.0), rgba(0x181a1f, 1.0));
+            }
+            let dot = if audible { col } else { vec4(col.x, col.y, col.z, 0.35) };
+            self.shape(cx, Rect { pos: dvec2(left + 16.0, ly + 14.0), size: dvec2(8.0, 8.0) }, 8.0, dot, dot);
+            self.bold(cx, left + 30.0, ly + 10.0, if audible { white } else { dim }, &cut(&tr.name, 16));
+            self.text(cx, left + 30.0, ly + 27.0, dim, &format!("{:+.1} dB", tr.gain()));
             let (mb, sb) = (self.mute_box(i), self.solo_box(i));
-            self.rect(cx, mb.pos.x, mb.pos.y, mb.size.x, mb.size.y, rgba(if tr.muted() { 0xe53935 } else { 0x343a46 }, 1.0));
-            self.text(cx, mb.pos.x + 8.0, mb.pos.y + 3.0, white, "M");
-            self.rect(cx, sb.pos.x, sb.pos.y, sb.size.x, sb.size.y, rgba(if tr.soloed() { 0xfdd835 } else { 0x343a46 }, 1.0));
-            self.text(cx, sb.pos.x + 8.0, sb.pos.y + 3.0, if tr.soloed() { rgba(0x111111, 1.0) } else { white }, "S");
-
-            self.wave(cx, st, i, ly, lane_h, rgba(col, if audible { 0.85 } else { 0.25 }));
+            let (mf, mi) = if tr.muted() { (rgba(0xff453a, 1.0), rgba(0xffffff, 1.0)) } else { (rgba(0x2a2e37, 1.0), rgba(TEXT, 0.8)) };
+            self.shape(cx, mb, 5.0, mf, shade(mf, 0.9));
+            self.text(cx, mb.pos.x + 7.0, mb.pos.y + 3.5, mi, "M");
+            let (sf, si) = if tr.soloed() { (rgba(0xffd60a, 1.0), rgba(0x111111, 1.0)) } else { (rgba(0x2a2e37, 1.0), rgba(TEXT, 0.8)) };
+            self.shape(cx, sb, 5.0, sf, shade(sf, 0.9));
+            self.text(cx, sb.pos.x + 7.5, sb.pos.y + 3.5, si, "S");
+            if lh >= 62.0 {
+                self.fx_chips_row(cx, st, Some(i), left + 16.0, ly + lh - 22.0, left + HEADER_W - 10.0);
+            }
+            self.wave(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.25) });
         }
 
         // layers: one lane each, at their blend
         for (j, (stem, t)) in layers.iter().enumerate() {
             let ly = self.lane_y(n + j);
-            self.rect(cx, rect.pos.x, ly, rect.size.x, lane_h - 1.0, rgba(0x1a1e25, 1.0));
-            self.rect(cx, rect.pos.x, ly, HEADER_W - 2.0, lane_h - 1.0, rgba(0x22262e, 1.0));
-            self.rect(cx, rect.pos.x, ly, 4.0, lane_h - 1.0, rgba(0x4fc3f7, 1.0));
+            let lh = lane_h - LANE_GAP;
+            self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(rect.size.x - 12.0, lh) }, 8.0, rgba(0x14202d, 1.0), rgba(0x121a24, 1.0));
+            self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(HEADER_W - 12.0, lh) }, 8.0, rgba(0x18263a, 1.0), rgba(0x15202f, 1.0));
             let what = t.track.as_deref().unwrap_or("layer");
-            self.text(cx, rect.pos.x + 12.0, ly + 9.0, white, &format!("+ {what}"));
+            self.bold(cx, left + 16.0, ly + 10.0, white, &format!("+ {what}"));
             let level = format!("Take {}  ·  {:.0}%", t.id.trim_start_matches('t'), t.blend() * 100.0);
-            self.text(cx, rect.pos.x + 12.0, ly + 27.0, dim, &level);
-            self.wave(cx, st, *stem, ly, lane_h, rgba(0x4fc3f7, 0.85));
+            self.text(cx, left + 16.0, ly + 27.0, dim, &level);
+            self.wave(cx, st, *stem, ly, lh, rgba(ACCENT, 0.9));
         }
 
         // lyrics along the bottom of the vocals lane
-        if let Some(v) = st.project.track_index("vocals").filter(|_| song_take.is_none()) {
-            let y = self.lane_y(v) + lane_h - 16.0;
+        if let Some(v) = st.project.track_index("vocals").filter(|&v| song_take.is_none() && v < n) {
+            let y = self.lane_y(v) + lane_h - LANE_GAP - 17.0;
             let mut right = f64::MIN;
             for l in &lyrics {
                 let x = self.x_of(st, l.start).max(x0);
@@ -427,8 +601,8 @@ impl DawTimeline {
                     continue;
                 }
                 let on = ph >= l.start && ph < l.end;
-                self.text(cx, x + 2.0, y, if on { white } else { dim }, l.text.trim());
-                right = x + l.text.trim().chars().count() as f64 * 5.5;
+                self.text(cx, x + 4.0, y, if on { white } else { faint }, l.text.trim());
+                right = x + l.text.trim().chars().count() as f64 * 5.5 + 12.0;
             }
         }
 
@@ -441,18 +615,17 @@ impl DawTimeline {
             let Some(lane) = st.project.track_index(&r.track) else { continue };
             let ly = self.lane_y(lane);
             if let Some((x, rw)) = self.span(st, r.start, r.end) {
-                let c = region_color(&r.kind);
-                self.rect(cx, x, ly + 2.0, rw, lane_h - 5.0, rgba(c, 0.22));
-                self.rect(cx, x, ly + 2.0, rw, 14.0, rgba(c, 0.75));
+                let c = rgba(region_color(&r.kind), 1.0);
+                let body = Rect { pos: dvec2(x, ly + 3.0), size: dvec2(rw, lane_h - LANE_GAP - 6.0) };
+                let sel = st.sel == Selection::Region(ri);
+                let border = if sel { rgba(0xffffff, 0.95) } else { vec4(c.x, c.y, c.z, 0.7) };
+                self.shape_bordered(cx, body, 6.0, vec4(c.x, c.y, c.z, 0.16), vec4(c.x, c.y, c.z, 0.10), border, if sel { 1.5 } else { 1.0 });
                 let label = match r.kind.as_str() {
                     "bad" | "regenerate" | "mute" => r.kind.clone(),
                     _ => format!("{} {:+.1}dB", r.kind, r.gain()),
                 };
-                if rw > 24.0 {
-                    self.text(cx, x + 4.0, ly + 3.0, rgba(0x111111, 1.0), &label);
-                }
-                if st.sel == Selection::Region(ri) {
-                    self.outline(cx, x, ly + 2.0, rw, lane_h - 5.0, rgba(0xffffff, 0.95));
+                if rw > 40.0 {
+                    self.pill(cx, x + 4.0, ly + 6.0, 16.0, &cut(&label, ((rw - 24.0) / 5.6) as usize), c, rgba(0x111111, 1.0));
                 }
             }
         }
@@ -467,21 +640,32 @@ impl DawTimeline {
             .collect();
         for t in replacing.iter().filter(|_| n > 0) {
             let (y, h) = match t.track.as_deref().and_then(|id| st.project.track_index(id)).filter(|_| t.scope == "lane") {
-                Some(lane) => (self.lane_y(lane), lane_h - 1.0),
-                None => (lanes_y, lane_h * n as f64),
+                Some(lane) => (self.lane_y(lane), lane_h - LANE_GAP),
+                None => (lanes_y, lane_h * n as f64 - LANE_GAP),
             };
             if let Some((x, tw)) = self.span(st, t.start, t.end) {
-                self.rect(cx, x, y, tw, h, rgba(0x4fc3f7, 0.10));
-                self.outline(cx, x, y, tw, h, rgba(0x4fc3f7, 0.8));
-                self.rect(cx, x, y, tw.min(70.0), 16.0, rgba(0x4fc3f7, 1.0));
-                self.text(cx, x + 5.0, y + 2.0, rgba(0x111111, 1.0), &format!("Take {}", t.id.trim_start_matches('t')));
+                let r = Rect { pos: dvec2(x, y), size: dvec2(tw, h) };
+                self.shape_bordered(cx, r, 8.0, rgba(ACCENT, 0.12), rgba(ACCENT, 0.06), rgba(ACCENT, 0.9), 1.5);
+                if tw > 60.0 {
+                    self.pill(cx, x + 6.0, y + 6.0, 16.0, &format!("Take {}", t.id.trim_start_matches('t')), rgba(ACCENT, 1.0), rgba(0xffffff, 1.0));
+                }
             }
         }
 
-        // playhead
+        // master strip: the mix's own effects
+        let my = master_y;
+        self.shape(cx, Rect { pos: dvec2(left + 6.0, my), size: dvec2(rect.size.x - 12.0, MASTER_H - 6.0) }, 8.0, rgba(0x15171b, 1.0), rgba(0x15171b, 1.0));
+        self.bold(cx, left + 16.0, my + 8.0, dim, "Master");
+        self.fx_chips_row(cx, st, None, x0, my + 6.0, x0 + w);
+        if st.project.chain(None).is_empty() {
+            self.text(cx, x0, my + 8.0, faint, "Select a lane and describe an effect (\"tape saturation\", \"a warm plate reverb\") to add one");
+        }
+
+        // playhead: an accent line with a cap in the ruler
         let px = self.x_of(st, ph);
         if px >= x0 && px <= x0 + w {
-            self.rect(cx, px, rect.pos.y, 2.0, rect.size.y, rgba(0xffffff, 0.9));
+            self.rect(cx, px, rect.pos.y + RULER_H - 6.0, 1.5, master_y - rect.pos.y - RULER_H + 6.0, rgba(ACCENT, 0.95));
+            self.shape(cx, Rect { pos: dvec2(px - 5.0, rect.pos.y + RULER_H - 12.0), size: dvec2(11.0, 8.0) }, 3.0, rgba(ACCENT, 1.0), rgba(ACCENT, 1.0));
         }
     }
 }
@@ -497,9 +681,16 @@ impl Widget for DawTimeline {
                 cx.set_key_focus(self.area);
                 let (x, y) = (fe.abs.x, fe.abs.y);
                 let in_wave = x >= self.geo.x0;
-                if self.in_ruler(y) {
-                    st.seek(self.t_of(st, x));
-                    self.drag = Drag::Seek;
+                if let Some((_, lane, i)) = self.fx_chips.iter().find(|(r, _, _)| r.contains(fe.abs)).copied() {
+                    st.select(Selection::Fx(lane, i));
+                } else if self.in_ruler(y) {
+                    if fe.tap_count >= 2 {
+                        // double-click the ruler: fit the song
+                        st.pps = 0.0;
+                    } else {
+                        st.seek(self.t_of(st, x));
+                        self.drag = Drag::Seek;
+                    }
                 } else if self.in_sections(y) {
                     if let Some(edge) = self.section_edge_at(st, x) {
                         self.drag = Drag::SectionEdge { index: edge };
@@ -546,6 +737,8 @@ impl Widget for DawTimeline {
                     } else {
                         self.drag = Drag::Pending { track: lane, t0: self.t_of(st, x), x0: x };
                     }
+                } else if y >= self.geo.master_y && !in_wave {
+                    st.select(Selection::None);
                 }
                 self.area.redraw(cx);
             }
@@ -626,10 +819,21 @@ impl Widget for DawTimeline {
                 self.area.redraw(cx);
             }
             Hit::KeyDown(ke) => {
+                let cmd = ke.modifiers.control || ke.modifiers.logo;
                 match ke.key_code {
                     KeyCode::Space => st.toggle_play(),
                     KeyCode::Delete | KeyCode::Backspace => st.delete_selected(),
                     KeyCode::Home => st.seek(0.0),
+                    // F: fit the song in view
+                    KeyCode::KeyF => st.pps = 0.0,
+                    // B: split the section at the playhead (a blade)
+                    KeyCode::KeyB => {
+                        let t = st.playhead();
+                        st.split_section_at(t);
+                    }
+                    KeyCode::KeyS if cmd => {
+                        let _ = st.save();
+                    }
                     _ => {}
                 }
                 self.area.redraw(cx);

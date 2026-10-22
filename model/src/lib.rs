@@ -80,9 +80,34 @@ pub enum LaneIntent {
     AddLayer(String),
     /// "add ..." without an instrument Poing can tell.
     AddWhat,
+    /// An audio effect on the lane (saturation, reverb, delay ...): Claude
+    /// writes it as a Splash audio shader.
+    Effect,
     /// Anything else: play this lane's part again, as the named instrument or
     /// the lane's own kind (None: Poing cannot tell which instrument).
     Replace(Option<String>),
+}
+
+/// Words that ask for an audio effect.
+pub const EFFECT_WORDS: [&str; 34] = [
+    "saturat", "tape", "drive", "overdrive", "distort", "fuzz", "crunch", "reverb", "plate", "hall", "delay", "echo",
+    "chorus", "flang", "phaser", "tremolo", "vibrato", "compress", "limit", "eq", "equali", "filter", "lowpass",
+    "highpass", "bitcrush", "crush", "lofi", "wah", "widen", "wider", "stereo", "gate", "galm", "vervorm",
+];
+
+/// Does a Describe ask for an audio effect?
+pub fn is_effect_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    EFFECT_WORDS.iter().any(|e| words.iter().any(|w| if e.len() <= 3 { w == e } else { w.starts_with(e) }))
+        || t.contains("lo-fi")
+}
+
+/// Does a Describe with nothing selected ask for an effect on the whole mix
+/// (rather than a new version of the song)?
+pub fn is_master_effect_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    is_effect_text(&t) && ["master", "whole mix", "the mix", "everything", "whole song", "hele mix", "alles"].iter().any(|w| t.contains(w))
 }
 
 /// The lego instrument a Describe names, if any.
@@ -105,8 +130,13 @@ fn instrument_in(t: &str) -> Option<String> {
 pub fn lane_intent(text: &str, track: &str) -> LaneIntent {
     let t = text.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| t.split(|c: char| !c.is_alphanumeric()).any(|x| x == *w || x.starts_with(w)));
-    if has(&["echo", "reverb", "galm", "nagalm", "dry", "droog", "drier", "droger"]) {
+    // Less echo is taken out of the recording; more of anything is an effect.
+    let less = has(&["less", "minder", "remove", "no", "without", "zonder", "weg"]);
+    if (less && has(&["echo", "reverb", "galm", "nagalm"])) || has(&["dry", "droog", "drier", "droger"]) {
         return LaneIntent::Dereverb;
+    }
+    if is_effect_text(&t) {
+        return LaneIntent::Effect;
     }
     // The lane's own kind, when it is one lego plays.
     let own = matches!(track, "drums" | "bass" | "vocals").then(|| track.to_string());
@@ -503,6 +533,18 @@ mod tests {
         assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace(Some("bass".into())));
         assert_eq!(lane_intent("warm rhodes instead", "other"), LaneIntent::Replace(Some("keyboard".into())));
         assert_eq!(lane_intent("make it nicer", "other"), LaneIntent::Replace(None));
+    }
+
+    #[test]
+    fn effects_are_told_apart_from_echo_removal_and_new_parts() {
+        assert_eq!(lane_intent("tape saturation on the bass", "bass"), LaneIntent::Effect);
+        assert_eq!(lane_intent("add some reverb", "vocals"), LaneIntent::Effect);
+        assert_eq!(lane_intent("a slapback delay", "vocals"), LaneIntent::Effect);
+        assert_eq!(lane_intent("less echo", "vocals"), LaneIntent::Dereverb);
+        assert_eq!(lane_intent("minder galm op de stem", "vocals"), LaneIntent::Dereverb);
+        assert_eq!(lane_intent("add tight disco drums", "drums"), LaneIntent::AddLayer("drums".into()));
+        assert!(!is_master_effect_text("1960s beat pop, warm tape sound"), "a style is a cover, not an effect");
+        assert!(is_master_effect_text("gentle tape saturation on the whole mix"));
     }
 
     #[test]

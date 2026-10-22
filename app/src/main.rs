@@ -9,6 +9,7 @@ pub use makepad_widgets;
 
 mod audio;
 mod fx;
+mod fx_writer;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
@@ -16,7 +17,7 @@ mod timeline;
 use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
-use model::{default_gain_for, demucs_stem_for, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
+use model::{default_gain_for, demucs_stem_for, is_master_effect_text, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
 use timeline::kind_index;
@@ -26,52 +27,158 @@ app_main!(App);
 script_mod! {
     use mod.prelude.widgets.*
 
+    // Poing's look: near-black surfaces, one blue accent, few controls.
+    let ACCENT = #x0a84ff
+    let TEXT = #xeceef2
+    let TEXT_2 = #x8d939e
+    let SURFACE = #x15171c
+    let FIELD = #x1f2229
+    let HAIRLINE = #x2a2e36
+
+    // A round icon button (play/pause).
+    let RoundIconButton = ButtonFlatterIcon{
+        width: 34 height: 34
+        padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
+        margin: Inset{left: 0 right: 0 top: 0 bottom: 0}
+        align: Align{x: 0.5 y: 0.5}
+        icon_walk: Walk{width: 14 height: 14}
+        draw_icon +: {color: #xffffff}
+        draw_bg +: {
+            border_radius: 17.0
+            border_size: 0.0
+            color: ACCENT
+            color_hover: #x3399ff
+            color_down: #x0066cc
+            color_focus: ACCENT
+        }
+    }
+
+    // A quiet pill button with a label.
+    let PillButton = ButtonFlatter{
+        height: 28
+        padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
+        align: Align{x: 0.5 y: 0.5}
+        draw_text +: {
+            color: TEXT
+            color_hover: #xffffff
+            text_style: theme.font_regular{font_size: 9.5}
+        }
+        draw_bg +: {
+            border_radius: 14.0
+            border_size: 1.0
+            border_color: HAIRLINE
+            border_color_hover: #x3a3f49
+            color: FIELD
+            color_hover: #x272b33
+            color_down: #x30353f
+            color_focus: FIELD
+        }
+    }
+
+    let Caption = Label{
+        draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9}}
+    }
+
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
                 window.title: "Poing"
                 window.inner_size: vec2(1500, 900)
+                pass +: {clear_color: #x0f1013}
+                caption_bar +: {
+                    draw_bg.color: #x121317
+                    caption_label +: {label +: {draw_text +: {color: #x8d939e}}}
+                }
                 body +: {
                     flow: Down
                     show_bg: true
-                    draw_bg +: {color: #x121418}
+                    draw_bg +: {color: #x0f1013}
 
-                    transport := View{
-                        width: Fill height: Fit flow: Right spacing: 8
-                        padding: Inset{left: 10 right: 10 top: 8 bottom: 8}
-                        align: Align{y: 0.5}
-                        play_btn := Button{text: "Play"}
-                        start_btn := Button{text: "|<"}
-                        zoom_out_btn := Button{text: "Zoom -"}
-                        zoom_in_btn := Button{text: "Zoom +"}
-                        fit_btn := Button{text: "Fit"}
-                        split_btn := Button{text: "Split section at playhead"}
-                        save_btn := Button{text: "Save"}
-                        render_btn := Button{text: "Render mix"}
-                        project_label := Label{text: ""}
-                        describe_input := TextInput{width: Fill empty_text: "Describe a new version and press Enter, e.g. 1960s Beatles beat pop, warm tape"}
+                    topbar := View{
+                        width: Fill height: 56 flow: Right spacing: 14
+                        padding: Inset{left: 14 right: 14 top: 11 bottom: 11}
+                        show_bg: true
+                        draw_bg +: {color: #x121317}
+                        play_btn := RoundIconButton{
+                            draw_icon.svg: crate_resource("self:resources/icons/play.svg")
+                        }
+                        pause_btn := RoundIconButton{
+                            visible: false
+                            draw_icon.svg: crate_resource("self:resources/icons/pause.svg")
+                        }
+                        title_col := View{
+                            width: 260 height: Fill flow: Down spacing: 2
+                            project_label := Label{
+                                text: "Poing"
+                                draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 11}}
+                            }
+                            project_meta := Caption{text: ""}
+                        }
+                        describe_frame := RoundedView{
+                            width: Fill height: 34 flow: Right spacing: 8
+                            padding: Inset{left: 14 right: 6 top: 0 bottom: 0}
+                            show_bg: true
+                            draw_bg +: {color: FIELD border_radius: 17.0 border_size: 1.0 border_color: HAIRLINE}
+                            Icon{
+                                margin: Inset{top: 10 bottom: 0 left: 0 right: 0}
+                                icon_walk: Walk{width: 13 height: 13}
+                                draw_icon +: {
+                                    svg: crate_resource("self:resources/icons/sparkle.svg")
+                                    color: ACCENT
+                                }
+                            }
+                            describe_input := TextInputFlat{
+                                width: Fill height: 34
+                                empty_text: "Describe a change. Select a lane, section or region first to change just that part."
+                                padding: Inset{left: 2 right: 4 top: 8.2 bottom: 9.8}
+                                margin: Inset{left: 0 right: 0 top: 0 bottom: 0}
+                                draw_bg +: {
+                                    border_radius: 0.0 border_size: 0.0
+                                    color: #00000000 color_hover: #00000000 color_focus: #00000000
+                                    color_down: #00000000 color_empty: #00000000
+                                    border_color: #00000000 border_color_hover: #00000000
+                                    border_color_focus: #00000000 border_color_down: #00000000
+                                    border_color_empty: #00000000
+                                }
+                                draw_cursor +: {color: ACCENT}
+                                draw_text +: {
+                                    color: TEXT color_hover: TEXT color_focus: #xffffff
+                                    color_empty: #x6b717c color_empty_hover: #x7b818c
+                                    text_style: theme.font_regular{font_size: 10.5}
+                                }
+                            }
+                        }
+                        render_btn := PillButton{
+                            margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
+                            text: "Export"
+                        }
                     }
+                    View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
 
                     timeline := mod.widgets.DawTimeline{}
 
+                    View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
                     inspector := View{
-                        width: Fill height: 124 flow: Down spacing: 8
-                        padding: Inset{left: 14 right: 14 top: 10 bottom: 10}
+                        width: Fill height: Fit flow: Down spacing: 10
+                        padding: Inset{left: 18 right: 18 top: 12 bottom: 12}
                         show_bg: true
-                        draw_bg +: {color: #x1e2128}
-                        insp_title := Label{text: "Loading..."}
+                        draw_bg +: {color: #x15171c}
+                        insp_title := Label{
+                            text: "Loading..."
+                            draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 10}}
+                        }
                         region_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
                             kind_dd := DropDown{width: 140 labels: ["bad" "regenerate" "too_loud" "too_quiet" "mute" "gain"]}
                             region_gain := Slider{width: 260 text: "Gain dB" min: -24.0 max: 12.0 step: 0.5 precision: 1 default: 0.0}
                             note_input := TextInput{width: 380 empty_text: "Note for the AI: what is wrong, what to change"}
-                            delete_btn := Button{text: "Delete region"}
+                            delete_btn := PillButton{text: "Delete region"}
                         }
                         track_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
-                            track_gain := Slider{width: 300 text: "Track gain dB" min: -36.0 max: 12.0 step: 0.5 precision: 1 default: 0.0}
+                            track_gain := Slider{width: 300 text: "Level dB" min: -36.0 max: 12.0 step: 0.5 precision: 1 default: 0.0}
                             mute_cb := CheckBox{text: "Mute"}
                             solo_cb := CheckBox{text: "Solo"}
                         }
@@ -79,23 +186,34 @@ script_mod! {
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
                             section_input := TextInput{width: 200 empty_text: "section name"}
-                            merge_btn := Button{text: "Remove (merge into previous)"}
+                            merge_btn := PillButton{text: "Merge into previous"}
                         }
                         take_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
                             take_blend := Slider{width: 300 text: "Blend %" min: 0.0 max: 100.0 step: 1.0 precision: 0 default: 100.0}
-                            keep_btn := Button{text: "Keep as a new song"}
-                            delete_take_btn := Button{text: "Delete take"}
+                            keep_btn := PillButton{text: "Keep as a new song"}
+                            delete_take_btn := PillButton{text: "Delete take"}
                         }
-                        status_label := Label{text: ""}
+                        fx_row := View{
+                            visible: false width: Fill height: Fit flow: Right spacing: 12
+                            align: Align{y: 0.5}
+                            fx_k0 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_k1 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_k2 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_k3 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_k4 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_k5 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}
+                            fx_bypass := CheckBox{text: "Bypass"}
+                            fx_remove := PillButton{text: "Remove"}
+                        }
+                        status_label := Caption{text: ""}
                     }
                 }
             }
         }
     }
 }
-
 #[derive(Script, ScriptHook)]
 pub struct App {
     #[live]
@@ -158,18 +276,24 @@ fn import(audio: &Path, sr: u32) -> Result<(PathBuf, bool), String> {
     Ok((project_file, true))
 }
 
-/// "Song name · E minor · 125 bpm"
-fn song_title(p: &Project) -> String {
-    let mut t = p.name.clone();
+/// "E minor · 125 bpm · 2:14": what the analysis found, under the title.
+fn song_meta(p: &Project) -> String {
+    let mut parts = Vec::new();
     if let Some(a) = &p.analysis {
         if let Some(k) = &a.key {
-            t.push_str(&format!("  ·  {k}"));
+            parts.push(k.clone());
         }
         if let Some(bpm) = a.tempo {
-            t.push_str(&format!("  ·  {bpm:.0} bpm"));
+            parts.push(format!("{bpm:.0} bpm"));
         }
     }
-    t
+    parts.push(format!("{}:{:02}", (p.duration / 60.0) as u32, (p.duration % 60.0) as u32));
+    parts.join("  ·  ")
+}
+
+fn show_title(ui: &WidgetRef, cx: &mut Cx, p: &Project) {
+    ui.label(cx, ids!(project_label)).set_text(cx, &p.name);
+    ui.label(cx, ids!(project_meta)).set_text(cx, &song_meta(p));
 }
 
 /// Describe on the whole song: queue a YuE2 cover take rendered from the
@@ -184,6 +308,10 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         return "A job is still running; describe the next take when it is done.".into();
     }
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    // An effect on the whole mix ("... on the master")
+    if is_master_effect_text(text) && !matches!(st.sel, Selection::Track(_) | Selection::Region(_)) {
+        return write_effect(st, jobs, bundle, None, text);
+    }
     let abc = std::fs::read_to_string(bundle.join("score").join("score.abc")).ok().filter(|s| !s.trim().is_empty());
     let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
     if let Selection::Section(i) = st.sel {
@@ -280,11 +408,35 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
     format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", section.label, section.start, section.end)
 }
 
+/// Claude writes an effect for a lane (or the master, `None`) from `text`.
+fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option<usize>, text: &str) -> String {
+    let a = st.project.analysis.clone().unwrap_or_default();
+    let song = match (a.key, a.tempo) {
+        (Some(k), Some(bpm)) => format!("a song in {k} at {bpm:.0} bpm"),
+        _ => "a song".into(),
+    };
+    let (context, place) = match lane {
+        Some(l) => {
+            let t = &st.project.tracks[l];
+            (format!("the {} lane (its {} stem) of {song}", t.name, t.id), t.name.clone())
+        }
+        None => (format!("the master bus (the whole mix) of {song}"), "the master".into()),
+    };
+    if !jobs.submit(Job::WriteFx { bundle, lane, request: text.to_string(), context }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some(("Effect".into(), 0.0));
+    format!("Claude is writing \"{text}\" for {place}; Poing checks it before you hear it (under a minute)...")
+}
+
 /// Describe on a lane (or a region of it): less echo, or a new part added.
 fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize, range: Option<(f64, f64)>, text: &str) -> String {
     let track = st.project.tracks[lane].clone();
     let lane_file = st.project.track_path(&st.path, lane);
     let intent = lane_intent(text, &track.id);
+    if intent == LaneIntent::Effect {
+        return write_effect(st, jobs, bundle, Some(lane), text);
+    }
     // A replaced part comes in on the one: its range snaps to downbeats.
     let range = match (&intent, range) {
         (LaneIntent::Replace(_), Some((a, b))) => {
@@ -425,8 +577,7 @@ fn promote_take(st: &EditorState) -> Result<PathBuf, String> {
     Ok(project_file)
 }
 
-const HELP: &str =
-    "Click a track, section or region. Drag on a waveform to mark a region. Space = play/pause, Del = delete, Ctrl+wheel = zoom.";
+const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  F fit  ·  B split section  ·  Ctrl+wheel zoom  ·  Del delete";
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
@@ -458,7 +609,7 @@ impl App {
         })();
         match result {
             Ok((mut st, analyse)) => {
-                self.ui.label(cx, ids!(project_label)).set_text(cx, &song_title(&st.project));
+                show_title(&self.ui, cx, &st.project);
                 if shared.is_none() {
                     audio::start_output(cx, st.shared.clone(), st.sr());
                 }
@@ -498,8 +649,12 @@ impl App {
         }
         st.sel_changed = false;
         let ui = self.ui.clone();
-        ui.button(cx, ids!(play_btn)).set_text(cx, if st.shared.playing() { "Pause" } else { "Play" });
+        let playing = st.shared.playing();
+        ui.button(cx, ids!(play_btn)).set_visible(cx, !playing);
+        ui.button(cx, ids!(pause_btn)).set_visible(cx, playing);
+        ui.view(cx, ids!(topbar)).redraw(cx);
         let (mut show_region, mut show_track, mut show_section, mut show_take) = (false, false, false, false);
+        let mut show_fx = false;
         match st.sel {
             Selection::Region(i) if i < st.project.regions().len() => {
                 let r = st.project.regions()[i].clone();
@@ -520,6 +675,31 @@ impl App {
                 ui.check_box(cx, ids!(mute_cb)).set_active(cx, t.muted(), Animate::No);
                 ui.check_box(cx, ids!(solo_cb)).set_active(cx, t.soloed(), Animate::No);
                 show_track = true;
+            }
+            Selection::Fx(lane, i) if i < st.project.chain(lane).len() => {
+                let fx = st.project.chain(lane)[i].clone();
+                let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
+                let state = match st.fx_errors.get(&fx.id) {
+                    Some(e) => format!("   ·   does not compile: {}", e.chars().take(120).collect::<String>()),
+                    None => format!("   ·   edit {} to change it live", fx.file),
+                };
+                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
+                let knobs = st.fx_knobs(&fx.id);
+                let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+                for (k, id) in sliders.iter().enumerate() {
+                    let mut w = ui.widget(cx, *id);
+                    match knobs.get(k) {
+                        Some((name, value, min, max)) => {
+                            let (name, min, max) = (name.replace('_', " "), *min, *max);
+                            script_apply_eval!(cx, w, {text: #(name) min: #(min) max: #(max)});
+                            w.set_visible(cx, true);
+                            ui.slider(cx, *id).set_value(cx, *value);
+                        }
+                        None => w.set_visible(cx, false),
+                    }
+                }
+                ui.check_box(cx, ids!(fx_bypass)).set_active(cx, fx.bypassed(), Animate::No);
+                show_fx = true;
             }
             Selection::Section(i) if i < st.project.sections().len() => {
                 let s = st.project.sections()[i].clone();
@@ -563,6 +743,7 @@ impl App {
         ui.view(cx, ids!(track_row)).set_visible(cx, show_track);
         ui.view(cx, ids!(section_row)).set_visible(cx, show_section);
         ui.view(cx, ids!(take_row)).set_visible(cx, show_take);
+        ui.view(cx, ids!(fx_row)).set_visible(cx, show_fx);
         ui.widget(cx, ids!(timeline)).redraw(cx);
         ui.view(cx, ids!(inspector)).redraw(cx);
     }
@@ -598,6 +779,19 @@ impl App {
                     st.analysing = Some((message, progress));
                     line
                 }
+                JobUpdate::FxReady { bundle, lane, name, code, request, note } => {
+                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    st.analysing = None;
+                    let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
+                    match st.add_fx(lane, &name, &code, Some(request)) {
+                        Ok(_) => {
+                            let i = st.project.chain(lane).len() - 1;
+                            st.select(Selection::Fx(lane, i));
+                            format!("{name} is on {place} ({note}). Turn its knobs below, or edit its file to change it live.")
+                        }
+                        Err(e) => format!("{name} could not be added: {e}"),
+                    }
+                }
                 JobUpdate::TakeReady { bundle, mut take, stem } => {
                     let n = take.id.trim_start_matches('t').to_string();
                     take.end = take.start + stem.l.len() as f64 / stem_sr(&self.state) as f64;
@@ -622,7 +816,7 @@ impl App {
                         .and_then(|a| st.apply_analysis(a, stems));
                     match result {
                         Ok(()) => {
-                            self.ui.label(cx, ids!(project_label)).set_text(cx, &song_title(&st.project));
+                            show_title(&self.ui, cx, &st.project);
                             let a = st.project.analysis.as_ref();
                             format!(
                                 "Understood: {} sections, {} chords, {} lyric lines",
@@ -655,37 +849,8 @@ impl MatchEvent for App {
         let Some(st) = &mut self.state else { return };
         let mut status: Option<String> = None;
 
-        if ui.button(cx, ids!(play_btn)).clicked(actions) {
+        if ui.button(cx, ids!(play_btn)).clicked(actions) || ui.button(cx, ids!(pause_btn)).clicked(actions) {
             st.toggle_play();
-        }
-        if ui.button(cx, ids!(start_btn)).clicked(actions) {
-            st.seek(0.0);
-            st.scroll_t = 0.0;
-        }
-        let zoom = |st: &mut EditorState, f: f64| {
-            let center = st.playhead();
-            st.pps = (st.pps * f).clamp(1.0, 400.0);
-            st.scroll_t = (center - 2.0).max(0.0);
-        };
-        if ui.button(cx, ids!(zoom_in_btn)).clicked(actions) {
-            zoom(st, 1.6);
-        }
-        if ui.button(cx, ids!(zoom_out_btn)).clicked(actions) {
-            zoom(st, 1.0 / 1.6);
-        }
-        if ui.button(cx, ids!(fit_btn)).clicked(actions) {
-            st.pps = 0.0;
-            st.scroll_t = 0.0;
-        }
-        if ui.button(cx, ids!(split_btn)).clicked(actions) {
-            let t = st.playhead();
-            st.split_section_at(t);
-        }
-        if ui.button(cx, ids!(save_btn)).clicked(actions) {
-            status = Some(match st.save() {
-                Ok(()) => format!("Saved {} ({} regions)", st.path.display(), st.project.regions().len()),
-                Err(e) => format!("Save failed: {e}"),
-            });
         }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
             let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
@@ -731,6 +896,26 @@ impl MatchEvent for App {
             }
         }
 
+        if let Selection::Fx(lane, i) = st.sel {
+            if let Some(id) = st.project.chain(lane).get(i).map(|f| f.id.clone()) {
+                let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+                for (k, s) in sliders.iter().enumerate() {
+                    if let Some(v) = ui.slider(cx, *s).slided(actions) {
+                        // knobs list the shader's params minus `bpm`
+                        if let Some(index) = st.fx_param_index(&id, k) {
+                            st.set_fx_param(&id, index, v);
+                        }
+                    }
+                }
+                if let Some(on) = ui.check_box(cx, ids!(fx_bypass)).changed(actions) {
+                    st.set_fx_bypass(&id, on);
+                }
+                if ui.button(cx, ids!(fx_remove)).clicked(actions) {
+                    st.delete_selected();
+                    status = Some("Effect removed".into());
+                }
+            }
+        }
         if let Some(v) = ui.slider(cx, ids!(take_blend)).slided(actions) {
             if let Some(id) = st.focus.clone() {
                 st.set_blend(&id, v / 100.0);
