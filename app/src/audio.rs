@@ -264,7 +264,12 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
                 shared.stems_seen.store(gen, Ordering::Release);
             }
         }
-        let total = stems.iter().map(|s| s.l.len()).max().unwrap_or(0);
+        // The song ends with its lanes, or with the song take being heard.
+        let lanes = stems.iter().take(cache.gains.len()).map(|s| s.l.len()).max().unwrap_or(0);
+        let total = match cache.take {
+            Some(k) if k.song => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
+            _ => lanes,
+        };
         if !shared.playing() {
             return;
         }
@@ -328,12 +333,14 @@ pub struct Yue2Fixture {
 pub enum JobUpdate {
     Status(String),
     Done(String),
-    /// Analysis progress, 0..1 over the whole job.
-    Progress { message: String, progress: f32 },
+    /// Progress of the job for `bundle`, 0..1 over the whole job.
+    Progress { bundle: PathBuf, message: String, progress: f32 },
+    /// The analysis or take for `bundle` failed.
+    Failed { bundle: PathBuf, message: String },
     /// analysis.json is written and its stems decoded: (track id, file, stem).
     Analyzed { bundle: PathBuf, stems: Vec<(String, String, Stem)> },
     /// A take finished rendering and is decoded at the project rate.
-    TakeReady { take: Take, stem: Stem },
+    TakeReady { bundle: PathBuf, take: Take, stem: Stem },
 }
 
 pub struct Jobs {
@@ -502,12 +509,14 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let progress = |message: &str, progress: f32| send(tx, JobUpdate::Progress { message: message.into(), progress });
+    let progress =
+        |message: &str, progress: f32| send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: message.into(), progress });
+    let fail = |message: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message });
     progress("Starting analysis", 0.0);
     let dir = sidecar_dir();
     let log = match std::fs::File::create(bundle.join("analysis.log")) {
         Ok(f) => f,
-        Err(e) => return send(tx, JobUpdate::Done(format!("Analysis failed: {e}"))),
+        Err(e) => return fail(format!("Analysis failed: {e}")),
     };
     let mut cmd = Command::new("uv");
     cmd.arg("run").arg("--project").arg(&dir).arg("python").arg(dir.join("poing_analyze.py")).arg(audio).arg(bundle)
@@ -532,7 +541,7 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return send(tx, JobUpdate::Done(format!("Analysis needs `uv` on PATH ({e})"))),
+        Err(e) => return fail(format!("Analysis needs `uv` on PATH ({e})")),
     };
     let mut error = None;
     if let Some(out) = child.stdout.take() {
@@ -549,7 +558,7 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
     let ok = child.wait().map(|s| s.success()).unwrap_or(false);
     if !ok || error.is_some() {
         let why = error.unwrap_or_else(|| "the sidecar exited with an error".into());
-        return send(tx, JobUpdate::Done(format!("Analysis failed: {why} (see {})", bundle.join("analysis.log").display())));
+        return fail(format!("Analysis failed: {why} (see {})", bundle.join("analysis.log").display()));
     }
     progress("Loading stems", 1.0);
     let mut stems = Vec::new();
@@ -557,7 +566,7 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
         let file = format!("stems/{id}.wav");
         match load_stem(&bundle.join(&file), sr) {
             Ok(stem) => stems.push((id.to_string(), file, stem)),
-            Err(e) => return send(tx, JobUpdate::Done(format!("Analysis failed: {e}"))),
+            Err(e) => return fail(format!("Analysis failed: {e}")),
         }
     }
     send(tx, JobUpdate::Analyzed { bundle: bundle.to_path_buf(), stems });
@@ -638,8 +647,12 @@ fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Send
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
-    let fail = |why: String| send(tx, JobUpdate::Done(format!("Take {} failed: {why}", take.id)));
-    let progress = |message: &str, progress: f32| send(tx, JobUpdate::Progress { message: message.into(), progress });
+    let fail = |why: String| {
+        let message = format!("Take {} failed: {why}", take.id.trim_start_matches('t'));
+        send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message })
+    };
+    let progress =
+        |message: &str, progress: f32| send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: message.into(), progress });
     progress(&format!("Take {}  ·  Starting YuE2", take.id.trim_start_matches('t')), 0.0);
     let work = bundle.join("takes").join(&take.id);
     if let Err(e) = std::fs::create_dir_all(&work) {
@@ -692,7 +705,7 @@ fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Send
         return fail(format!("move {}: {e}", wav.display()));
     }
     match load_stem(&dest, sr) {
-        Ok(stem) => send(tx, JobUpdate::TakeReady { take, stem }),
+        Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
         Err(e) => fail(e),
     }
 }

@@ -209,11 +209,32 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         return "The job worker is not running".into();
     }
     st.analysing = Some((format!("Take {n}"), 0.0));
+    // The take number is spent even if the render fails: seeds never repeat.
+    let _ = st.save();
     if with_score {
         format!("Making take {n} from the song's score and lyrics (about a minute)...")
     } else {
         format!("Making take {n}; no score was found, so YuE2 writes its own (slower)...")
     }
+}
+
+/// The rate stems are decoded at (the open song's; all songs use 48 kHz).
+fn stem_sr(state: &Option<EditorState>) -> u32 {
+    state.as_ref().map_or(48000, |st| st.sr())
+}
+
+/// Add a finished take to a song that is no longer open.
+fn record_take(bundle: &Path, take: Take) -> Result<String, String> {
+    let file = bundle.join("project.json");
+    let mut p = Project::load(&file)?;
+    p.takes_made = Some(p.takes_made.unwrap_or(0).max(take_number(&take.id)));
+    p.takes_mut().push(take);
+    p.save(&file)?;
+    Ok(p.name)
+}
+
+fn take_number(id: &str) -> u64 {
+    id.trim_start_matches('t').parse().unwrap_or(0)
 }
 
 /// Keep a song take: it becomes a new song next to this one
@@ -276,9 +297,11 @@ impl App {
                     self.start_analysis(&mut st);
                 }
                 if let Some(old) = self.state.replace(st) {
-                    // Its stems may still be in the audio thread's hands for a callback.
+                    // Its stem sets may still be in the audio thread's hands for a callback.
                     if let Some(st) = &mut self.state {
-                        st.retire(old.stems);
+                        for set in old.into_retired() {
+                            st.retire(set);
+                        }
                     }
                 }
             }
@@ -365,34 +388,42 @@ impl App {
                 updates.push(u);
             }
         }
+        // Jobs belong to the song they were started for; the open song may have changed since.
+        let open_bundle = self.state.as_ref().and_then(|st| st.path.parent().map(Path::to_path_buf));
+        let mine = |b: &Path| open_bundle.as_deref() == Some(b);
         for u in updates {
             let status = match u {
-                JobUpdate::Status(s) => s,
-                JobUpdate::Done(s) => {
-                    if let Some(st) = &mut self.state {
+                JobUpdate::Status(s) | JobUpdate::Done(s) => s,
+                JobUpdate::Failed { bundle, message } => {
+                    if let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) {
                         st.analysing = None;
                     }
-                    s
+                    message
                 }
-                JobUpdate::Progress { message, progress } => {
+                JobUpdate::Progress { bundle, message, progress } => {
+                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
                     let what = if message.starts_with("Take") { "" } else { "Analysing  ·  " };
                     let line = format!("{what}{message}  {:.0}%", progress * 100.0);
-                    if let Some(st) = &mut self.state {
-                        st.analysing = Some((message, progress));
-                    }
+                    st.analysing = Some((message, progress));
                     line
                 }
-                JobUpdate::TakeReady { mut take, stem } => {
-                    let Some(st) = &mut self.state else { continue };
-                    take.end = take.start + stem.l.len() as f64 / st.sr() as f64;
+                JobUpdate::TakeReady { bundle, mut take, stem } => {
                     let n = take.id.trim_start_matches('t').to_string();
-                    match st.add_take(take, stem) {
-                        Ok(()) => format!("Take {n} is ready: playing it now. Click Original above the lanes to compare."),
-                        Err(e) => format!("Take {n} could not be added: {e}"),
+                    take.end = take.start + stem.l.len() as f64 / stem_sr(&self.state) as f64;
+                    match self.state.as_mut().filter(|_| mine(&bundle)) {
+                        Some(st) => match st.add_take(take, stem) {
+                            Ok(()) => format!("Take {n} is ready: playing it now. Click Original above the lanes to compare."),
+                            Err(e) => format!("Take {n} could not be added: {e}"),
+                        },
+                        // Its song is closed: record the take there for next time.
+                        None => match record_take(&bundle, take) {
+                            Ok(name) => format!("Take {n} of {name} is ready; it is there when you open that song."),
+                            Err(e) => format!("Take {n} could not be recorded: {e}"),
+                        },
                     }
                 }
                 JobUpdate::Analyzed { bundle, stems } => {
-                    let Some(st) = &mut self.state else { continue };
+                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
                     let file = bundle.join("analysis.json");
                     let result = std::fs::read_to_string(&file)
                         .map_err(|e| format!("read {}: {e}", file.display()))
@@ -485,7 +516,9 @@ impl MatchEvent for App {
                 });
             }
         }
-        if ui.button(cx, ids!(keep_btn)).clicked(actions) {
+        if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.analysing.is_some() {
+            status = Some("A job is still running; keep the take when it is done.".into());
+        } else if ui.button(cx, ids!(keep_btn)).clicked(actions) {
             match promote_take(st) {
                 Ok(project) => {
                     self.set_status(cx, "Opening the take as a new song; Poing is listening to it...");

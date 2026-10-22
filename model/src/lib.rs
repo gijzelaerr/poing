@@ -19,6 +19,8 @@ pub struct Project {
     pub analysis: Option<Analysis>,
     /// Generated versions, newest last. Never overwritten: a take is kept or deleted.
     pub takes: Option<Vec<Take>>,
+    /// Takes ever started, deleted ones included, so ids and seeds never repeat.
+    pub takes_made: Option<u64>,
 }
 
 /// One generated version of the song (scope `"song"`) or of a time range
@@ -156,6 +158,7 @@ impl Project {
             source: Some(source_file.to_string()),
             analysis: None,
             takes: Some(Vec::new()),
+            takes_made: None,
         }
     }
 
@@ -232,10 +235,13 @@ impl Project {
     pub fn take_index(&self, id: &str) -> Option<usize> {
         self.takes().iter().position(|t| t.id == id)
     }
-    /// The id and seed for the next take.
-    pub fn next_take(&self) -> (String, u64) {
-        let n = self.takes().iter().filter_map(|t| t.id.trim_start_matches('t').parse::<usize>().ok()).max().unwrap_or(0);
-        let seed = TAKE_SEEDS[n % TAKE_SEEDS.len()] + 1000 * (n / TAKE_SEEDS.len()) as u64;
+    /// Start a take: its id and seed. Counts up past deleted takes.
+    pub fn next_take(&mut self) -> (String, u64) {
+        let existing = self.takes().iter().filter_map(|t| t.id.trim_start_matches('t').parse::<u64>().ok()).max().unwrap_or(0);
+        let n = self.takes_made.unwrap_or(0).max(existing);
+        self.takes_made = Some(n + 1);
+        let i = n as usize;
+        let seed = TAKE_SEEDS[i % TAKE_SEEDS.len()] + 1000 * (i / TAKE_SEEDS.len()) as u64;
         (format!("t{}", n + 1), seed)
     }
 
@@ -299,6 +305,7 @@ mod tests {
             source: None,
             analysis: None,
             takes: None,
+            takes_made: None,
         }
     }
 
@@ -336,6 +343,9 @@ mod tests {
         };
         p.takes_mut().push(take);
         assert_eq!(p.next_take(), ("t2".to_string(), 1966));
+        // t2 was deleted (or never finished): the next one is still new
+        p.takes_mut().clear();
+        assert_eq!(p.next_take(), ("t3".to_string(), 2026));
     }
 
     #[test]

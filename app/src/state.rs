@@ -86,6 +86,14 @@ impl EditorState {
         }
     }
 
+    /// This song's stem sets the audio thread may still hold: its current one
+    /// and any not yet collected. For the next song to keep until it moved on.
+    pub fn into_retired(self) -> Vec<Stems> {
+        let mut sets = self.retired;
+        sets.push(self.stems);
+        sets
+    }
+
     /// Keep a stem set alive until the audio thread has let go of it.
     pub fn retire(&mut self, stems: Stems) {
         self.retired.push(stems);
