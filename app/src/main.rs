@@ -691,7 +691,7 @@ fn promote_take(st: &EditorState) -> Result<PathBuf, String> {
     Ok(project_file)
 }
 
-const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  F fit  ·  B split section  ·  Ctrl+wheel zoom  ·  Del delete";
+const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  L loop selection  ·  F fit  ·  B split section  ·  Ctrl+wheel zoom  ·  Del delete  ·  Ctrl+Z undo";
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {

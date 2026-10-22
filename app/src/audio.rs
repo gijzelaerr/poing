@@ -445,6 +445,10 @@ pub struct Shared {
     pub fx_out: Mutex<Option<Box<FxRack>>>,
     /// Peak levels since the UI last read them (f32 bits): lanes, then master.
     pub meters: [AtomicU32; METER_LANES + 1],
+    /// Loop playback over [loop_a, loop_b) frames while loop_on.
+    pub loop_on: AtomicBool,
+    pub loop_a: AtomicU64,
+    pub loop_b: AtomicU64,
 }
 
 impl Shared {
@@ -459,6 +463,9 @@ impl Shared {
             fx_in: Mutex::new(None),
             fx_out: Mutex::new(None),
             meters: std::array::from_fn(|_| AtomicU32::new(0)),
+            loop_on: AtomicBool::new(false),
+            loop_a: AtomicU64::new(0),
+            loop_b: AtomicU64::new(0),
         }
     }
     pub fn pos(&self) -> usize {
@@ -521,7 +528,14 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         if !shared.playing() {
             return;
         }
-        let start = shared.pos();
+        let mut start = shared.pos();
+        // A loop: wrap back to its start; the block is cut at its end below.
+        let looping = shared.loop_on.load(Ordering::Relaxed);
+        let (loop_a, loop_b) = (shared.loop_a.load(Ordering::Relaxed) as usize, shared.loop_b.load(Ordering::Relaxed) as usize);
+        let looping = looping && loop_b > loop_a + 64 && loop_b <= total;
+        if looping && (start >= loop_b || start < loop_a) {
+            start = loop_a;
+        }
         if start >= total {
             shared.set_playing(false);
             return;
@@ -534,7 +548,16 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         let n_src = ((dev_frames as f64 * ratio).ceil() as usize).min(total - start);
         l.resize(n_src, 0.0);
         r.resize(n_src, 0.0);
-        mix_metered(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack), Some(&shared.meters));
+        let mut next = start + n_src;
+        if looping && start + n_src > loop_b {
+            // up to the loop end, then on from its start
+            let first = loop_b - start;
+            mix_metered(&stems, &cache, sr, start, &mut l[..first], &mut r[..first], Some(&mut rack), Some(&shared.meters));
+            mix_metered(&stems, &cache, sr, loop_a, &mut l[first..], &mut r[first..], Some(&mut rack), Some(&shared.meters));
+            next = loop_a + (n_src - first);
+        } else {
+            mix_metered(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack), Some(&shared.meters));
+        }
         if !muted {
             let chans = out.channel_count();
             for i in 0..dev_frames {
@@ -550,7 +573,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
                 }
             }
         }
-        shared.seek(start + n_src);
+        shared.seek(next);
     });
 }
 

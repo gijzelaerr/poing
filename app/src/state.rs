@@ -62,6 +62,8 @@ pub struct EditorState {
     pub timeline_area: makepad_widgets::Area,
     /// Meter levels as shown (they fall back slowly): lanes, then master.
     pub meter_show: Vec<f32>,
+    /// The range playback loops over (seconds), if any.
+    pub loop_range: Option<(f64, f64)>,
 }
 
 impl EditorState {
@@ -76,6 +78,7 @@ impl EditorState {
             Some(s) => {
                 s.set_playing(false);
                 s.seek(0);
+                s.loop_on.store(false, Ordering::Relaxed);
                 if let Ok(mut m) = s.mix.lock() {
                     *m = mix;
                 }
@@ -120,6 +123,7 @@ impl EditorState {
             notice: None,
             timeline_area: makepad_widgets::Area::Empty,
             meter_show: vec![0.0; audio::METER_LANES + 1],
+            loop_range: None,
         }
         .with_fx()
     }
@@ -514,6 +518,40 @@ impl EditorState {
             let t = &self.project.takes()[i];
             (t.scope == "song").then_some((self.project.tracks.len() + i, t))
         })
+    }
+
+    /// Loop playback over a range (None: play through).
+    pub fn set_loop(&mut self, range: Option<(f64, f64)>) {
+        let sr = self.sr() as f64;
+        self.loop_range = range;
+        if let Some((a, b)) = range {
+            self.shared.loop_a.store((a.max(0.0) * sr) as u64, Ordering::Relaxed);
+            self.shared.loop_b.store((b * sr) as u64, Ordering::Relaxed);
+            if !(a..b).contains(&self.playhead()) {
+                self.seek(a);
+            }
+        }
+        self.shared.loop_on.store(range.is_some(), Ordering::Relaxed);
+    }
+
+    /// L: loop the selected section or region, or stop looping.
+    pub fn toggle_loop(&mut self) -> String {
+        let range = match self.sel {
+            Selection::Section(i) => self.project.sections().get(i).map(|s| (s.start, s.end, s.label.clone())),
+            Selection::Region(i) => self.project.regions().get(i).map(|r| (r.start, r.end, "region".to_string())),
+            _ => None,
+        };
+        match range {
+            Some((a, b, what)) if self.loop_range != Some((a, b)) => {
+                self.set_loop(Some((a, b)));
+                format!("Looping the {what} ({a:.1}s - {b:.1}s)  ·  L again to stop")
+            }
+            _ if self.loop_range.is_some() => {
+                self.set_loop(None);
+                "Loop off".into()
+            }
+            _ => "Select a section or region, then press L to loop it".into(),
+        }
     }
 
     pub fn duration(&self) -> f64 {

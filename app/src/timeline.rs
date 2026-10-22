@@ -472,6 +472,17 @@ impl DawTimeline {
         self.draw_clock.draw_abs(cx, dvec2(left + 14.0, rect.pos.y + 6.0), &fmt_time(ph));
         self.text(cx, left + 100.0, rect.pos.y + 11.0, faint, &format!("/ {}", fmt_time(st.duration())));
 
+        // the loop: a band on the ruler and a faint wash over the lanes
+        if let Some((a, b)) = st.loop_range {
+            if let Some((x, lw)) = self.span(st, a, b) {
+                self.shape(cx, Rect { pos: dvec2(x, rect.pos.y + 4.0), size: dvec2(lw, RULER_H - 8.0) }, 4.0, rgba(0xffd60a, 0.28), rgba(0xffd60a, 0.18));
+                self.rect(cx, x, rect.pos.y + RULER_H, lw, master_y - rect.pos.y - RULER_H, rgba(0xffd60a, 0.04));
+                if lw > 40.0 {
+                    self.text(cx, x + 6.0, rect.pos.y + 1.0, rgba(0xffd60a, 1.0), "loop");
+                }
+            }
+        }
+
         // ruler: a tick every 1/2/5/10/15/30/60 s, whichever is >= 70 px apart
         let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0].into_iter().find(|s| s * st.pps >= 70.0).unwrap_or(60.0);
         let mut t = (st.scroll_t / step).floor() * step;
@@ -715,6 +726,8 @@ pub fn shortcut(st: &mut EditorState, ke: &KeyEvent) -> bool {
         KeyCode::KeyY if cmd => st.notice = st.undo(true),
         KeyCode::Home => st.seek(0.0),
         KeyCode::End => st.seek(st.duration()),
+        // L: loop the selected section or region
+        KeyCode::KeyL if !cmd => st.notice = Some(st.toggle_loop()),
         // F: fit the song in view
         KeyCode::KeyF if !cmd => st.pps = 0.0,
         // B: split the section at the playhead (a blade)
