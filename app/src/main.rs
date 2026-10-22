@@ -12,10 +12,10 @@ pub(crate) use poing_model as model;
 mod state;
 mod timeline;
 
-use audio::{Job, JobUpdate, Jobs, Stem};
+use audio::{Job, JobUpdate, Jobs, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
-use model::{default_gain_for, Analysis, Project, REGION_KINDS};
+use model::{default_gain_for, Analysis, Project, Take, REGION_KINDS};
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
 use timeline::kind_index;
@@ -48,6 +48,7 @@ script_mod! {
                         save_btn := Button{text: "Save"}
                         render_btn := Button{text: "Render mix"}
                         project_label := Label{text: ""}
+                        describe_input := TextInput{width: Fill empty_text: "Describe a new version and press Enter, e.g. 1960s Beatles beat pop, warm tape"}
                     }
 
                     timeline := mod.widgets.DawTimeline{}
@@ -78,6 +79,12 @@ script_mod! {
                             align: Align{y: 0.5}
                             section_input := TextInput{width: 200 empty_text: "section name"}
                             merge_btn := Button{text: "Remove (merge into previous)"}
+                        }
+                        take_row := View{
+                            visible: false width: Fill height: Fit flow: Right spacing: 14
+                            align: Align{y: 0.5}
+                            keep_btn := Button{text: "Keep as a new song"}
+                            delete_take_btn := Button{text: "Delete take"}
                         }
                         status_label := Label{text: ""}
                     }
@@ -160,31 +167,120 @@ fn song_title(p: &Project) -> String {
     t
 }
 
+/// Describe on the whole song: queue a YuE2 cover take rendered from the
+/// bundle's score (chords and melody kept) and its sung lyrics. A
+/// `lyrics.txt` in the bundle (hand-corrected) wins over the transcription.
+fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
+    let Some(jobs) = jobs else { return "The job worker is not running".into() };
+    if !st.project.is_analysed() {
+        return "Poing is still listening to the song. Describe it again when the lanes are in.".into();
+    }
+    if st.analysing.is_some() {
+        return "A job is still running; describe the next take when it is done.".into();
+    }
+    let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let abc = std::fs::read_to_string(bundle.join("score").join("score.abc")).ok().filter(|s| !s.trim().is_empty());
+    let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
+    // Key and tempo anchor the style, as in the cover that worked.
+    let mut style = text.to_string();
+    if let Some(a) = &st.project.analysis {
+        if let Some(k) = a.key.as_ref().filter(|k| !text.contains(k.as_str())) {
+            style.push_str(&format!(", {k}"));
+        }
+        if let Some(bpm) = a.tempo.filter(|_| !text.contains("bpm")) {
+            style.push_str(&format!(", {bpm:.0} bpm"));
+        }
+    }
+    let (id, seed) = st.project.next_take();
+    let take = Take {
+        file: format!("takes/{id}.wav"),
+        id,
+        scope: "song".into(),
+        start: 0.0,
+        end: 0.0,
+        engine: "yue2".into(),
+        prompt: text.to_string(),
+        seed,
+    };
+    let n = take.id.trim_start_matches('t').to_string();
+    let with_score = abc.is_some();
+    let fixture = Yue2Fixture { style, lyrics, seed, cot: "full".into(), abc };
+    if !jobs.submit(Job::Generate { bundle, take, fixture, sr: st.sr() }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some((format!("Take {n}"), 0.0));
+    if with_score {
+        format!("Making take {n} from the song's score and lyrics (about a minute)...")
+    } else {
+        format!("Making take {n}; no score was found, so YuE2 writes its own (slower)...")
+    }
+}
+
+/// Keep a song take: it becomes a new song next to this one
+/// (`<name> take N.poing`), which is then analysed like any import.
+fn promote_take(st: &EditorState) -> Result<PathBuf, String> {
+    let (_, take) = st.song_take().ok_or("no song take is playing")?;
+    let dir = st.path.parent().ok_or("project has no folder")?;
+    let name = format!("{} take {}", st.project.name, take.id.trim_start_matches('t'));
+    let bundle = dir.parent().unwrap_or(dir).join(format!("{name}.poing"));
+    let project_file = bundle.join("project.json");
+    if project_file.exists() {
+        return Ok(project_file);
+    }
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("create {}: {e}", bundle.display()))?;
+    std::fs::copy(dir.join(&take.file), bundle.join("original.wav")).map_err(|e| e.to_string())?;
+    // Hand-corrected lyrics still describe the new song.
+    let _ = std::fs::copy(dir.join("lyrics.txt"), bundle.join("lyrics.txt"));
+    Project::import(&name, "original.wav", take.end - take.start, st.sr()).save(&project_file)?;
+    Ok(project_file)
+}
+
 const HELP: &str =
     "Click a track, section or region. Drag on a waveform to mark a region. Space = play/pause, Del = delete, Ctrl+wheel = zoom.";
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
+        self.open(cx, open_target());
+    }
+
+    /// Open a project or import a song. The audio output is installed once;
+    /// later songs reuse its Shared and swap their stems in by generation.
+    fn open(&mut self, cx: &mut Cx, target: Open) {
+        let shared = self.state.as_ref().map(|st| st.shared.clone());
         let result = (|| -> Result<(EditorState, bool), String> {
-            let (path, analyse) = match open_target() {
-                Open::Project(path) => (path, false),
-                Open::Audio(audio) => import(&audio, 48000)?,
+            let path = match target {
+                Open::Project(path) => path,
+                Open::Audio(audio) => import(&audio, 48000)?.0,
             };
-            let project = Project::load(&path)?;
+            let mut project = Project::load(&path)?;
+            let analyse = project.source.is_some() && !project.is_analysed();
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            // A take whose audio is gone is dropped rather than failing the song.
+            project.takes_mut().retain(|t| dir.join(&t.file).exists());
             let mut stems: Vec<Stem> = Vec::new();
             for i in 0..project.tracks.len() {
                 stems.push(audio::load_stem(&project.track_path(&path, i), project.sr())?);
             }
-            Ok((EditorState::new(project, path, stems), analyse))
+            for t in project.takes() {
+                stems.push(audio::load_stem(&dir.join(&t.file), project.sr())?);
+            }
+            Ok((EditorState::new(project, path, stems, shared.clone()), analyse))
         })();
         match result {
             Ok((mut st, analyse)) => {
                 self.ui.label(cx, ids!(project_label)).set_text(cx, &song_title(&st.project));
-                audio::start_output(cx, st.shared.clone(), st.sr());
+                if shared.is_none() {
+                    audio::start_output(cx, st.shared.clone(), st.sr());
+                }
                 if analyse {
                     self.start_analysis(&mut st);
                 }
-                self.state = Some(st);
+                if let Some(old) = self.state.replace(st) {
+                    // Its stems may still be in the audio thread's hands for a callback.
+                    if let Some(st) = &mut self.state {
+                        st.retire(old.stems);
+                    }
+                }
             }
             Err(e) => {
                 self.ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Could not open: {e}"));
@@ -211,7 +307,7 @@ impl App {
         st.sel_changed = false;
         let ui = self.ui.clone();
         ui.button(cx, ids!(play_btn)).set_text(cx, if st.shared.playing() { "Pause" } else { "Play" });
-        let (mut show_region, mut show_track, mut show_section) = (false, false, false);
+        let (mut show_region, mut show_track, mut show_section, mut show_take) = (false, false, false, false);
         match st.sel {
             Selection::Region(i) if i < st.project.regions().len() => {
                 let r = st.project.regions()[i].clone();
@@ -239,11 +335,21 @@ impl App {
                 ui.text_input(cx, ids!(section_input)).set_text(cx, &s.label);
                 show_section = true;
             }
-            _ => ui.label(cx, ids!(insp_title)).set_text(cx, HELP),
+            _ => match st.song_take() {
+                Some((_, t)) => {
+                    let n = t.id.trim_start_matches('t');
+                    let len = t.end - t.start;
+                    let title = format!("Take {n}  ·  {}  ·  seed {}  ·  {}:{:02}", t.prompt, t.seed, (len / 60.0) as u32, (len % 60.0) as u32);
+                    ui.label(cx, ids!(insp_title)).set_text(cx, &title);
+                    show_take = true;
+                }
+                None => ui.label(cx, ids!(insp_title)).set_text(cx, HELP),
+            },
         }
         ui.view(cx, ids!(region_row)).set_visible(cx, show_region);
         ui.view(cx, ids!(track_row)).set_visible(cx, show_track);
         ui.view(cx, ids!(section_row)).set_visible(cx, show_section);
+        ui.view(cx, ids!(take_row)).set_visible(cx, show_take);
         ui.widget(cx, ids!(timeline)).redraw(cx);
         ui.view(cx, ids!(inspector)).redraw(cx);
     }
@@ -269,11 +375,21 @@ impl App {
                     s
                 }
                 JobUpdate::Progress { message, progress } => {
-                    let line = format!("Analysing  ·  {message}  {:.0}%", progress * 100.0);
+                    let what = if message.starts_with("Take") { "" } else { "Analysing  ·  " };
+                    let line = format!("{what}{message}  {:.0}%", progress * 100.0);
                     if let Some(st) = &mut self.state {
                         st.analysing = Some((message, progress));
                     }
                     line
+                }
+                JobUpdate::TakeReady { mut take, stem } => {
+                    let Some(st) = &mut self.state else { continue };
+                    take.end = take.start + stem.l.len() as f64 / st.sr() as f64;
+                    let n = take.id.trim_start_matches('t').to_string();
+                    match st.add_take(take, stem) {
+                        Ok(()) => format!("Take {n} is ready: playing it now. Click Original above the lanes to compare."),
+                        Err(e) => format!("Take {n} could not be added: {e}"),
+                    }
                 }
                 JobUpdate::Analyzed { bundle, stems } => {
                     let Some(st) = &mut self.state else { continue };
@@ -354,6 +470,31 @@ impl MatchEvent for App {
             let job = Job::Render { stems: st.stems.clone(), mix: st.mix_snapshot(), sr: st.sr(), out_dir, name: st.project.name.clone() };
             let queued = self.jobs.as_ref().map(|j| j.submit(job)).unwrap_or(false);
             status = Some(if queued { "Rendering...".into() } else { "Render worker is not running".into() });
+        }
+
+        if let Some((text, _)) = ui.text_input(cx, ids!(describe_input)).returned(actions) {
+            if !text.trim().is_empty() {
+                status = Some(describe(st, self.jobs.as_ref(), text.trim()));
+            }
+        }
+        if ui.button(cx, ids!(delete_take_btn)).clicked(actions) {
+            if let Some(id) = st.audition.clone() {
+                status = Some(match st.delete_take(&id) {
+                    Ok(()) => "Take deleted".into(),
+                    Err(e) => format!("Delete failed: {e}"),
+                });
+            }
+        }
+        if ui.button(cx, ids!(keep_btn)).clicked(actions) {
+            match promote_take(st) {
+                Ok(project) => {
+                    self.set_status(cx, "Opening the take as a new song; Poing is listening to it...");
+                    self.open(cx, Open::Project(project));
+                    self.refresh_inspector(cx);
+                    return;
+                }
+                Err(e) => status = Some(format!("Keep failed: {e}")),
+            }
         }
 
         if let Selection::Region(i) = st.sel {

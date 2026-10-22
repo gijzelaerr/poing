@@ -4,7 +4,19 @@ An AI-native music workstation. Drop in a song and Poing shows how it's built: s
 
 Native and fast on macOS, Windows and Linux. Built on [Makepad](https://github.com/makepad/makepad) 2.0, with local open-weight models (YuE2, ACE-Step, MiniMax-Music3, BS-RoFormer and others).
 
-**Status:** restarting (October 2026). The plan is in [docs/PLAN.md](docs/PLAN.md). The earlier Poing, a MusicGen VST3/CLAP plugin, is archived at tag [`legacy-musicgen-plugin`](https://github.com/gijzelaerr/poing/tree/legacy-musicgen-plugin).
+**Status:** early development (October 2026), Windows/CUDA first. The plan is in [docs/PLAN.md](docs/PLAN.md). The earlier Poing, a MusicGen VST3/CLAP plugin, is archived at tag [`legacy-musicgen-plugin`](https://github.com/gijzelaerr/poing/tree/legacy-musicgen-plugin).
+
+## Try it
+
+```
+cargo run --release -p poing -- path/to/song.mp3
+```
+
+- **Understand:** opening a song creates `song.poing/` next to it and analyses it in the background (uv, `sidecar/`): Demucs stems, SheetSage2 sections/key/chords/score, Whisper lyrics. About 2.5 minutes on an RTX 4070 Ti.
+- **Describe:** type a style in the top bar and press Enter. Poing renders a whole-song cover take with native YuE2 from the song's own score and lyrics, so the chords, melody and words stay. About 45 s. A `lyrics.txt` in the bundle (hand-corrected, `[Verse]`-tagged) wins over the transcription.
+- **Takes:** chips above the lanes switch between the original and each take (A/B). *Keep as a new song* opens the take as its own song and analyses it.
+
+YuE2 needs Makepad's `yue2_render` (built with CUDA; set `POING_YUE2_RENDER`) and the `m-a-p/YuE2-3B` and `m-a-p/YuE2-Vae` weights in the Hugging Face cache (or `POING_YUE2_MODEL` / `POING_YUE2_VAE`). `POING_MUTE=1` keeps test instances silent.
 
 ## Namesake
 

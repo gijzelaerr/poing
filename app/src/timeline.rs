@@ -25,6 +25,7 @@ const HEADER_W: f64 = 200.0;
 const RULER_H: f64 = 22.0;
 const SECT_H: f64 = 26.0;
 const CHORD_H: f64 = 18.0;
+const TAKES_H: f64 = 24.0;
 const GAP: f64 = 6.0;
 const EDGE_PX: f64 = 6.0;
 
@@ -35,6 +36,7 @@ struct Geo {
     w: f64,
     sect_y: f64,
     chord_y: f64,
+    takes_y: f64,
     lanes_y: f64,
     lane_h: f64,
     n: usize,
@@ -75,6 +77,9 @@ pub struct DawTimeline {
     drag: Drag,
     #[rust]
     next_frame: NextFrame,
+    /// Take chips as drawn: (rect, take id; None is the original).
+    #[rust]
+    chips: Vec<(Rect, Option<String>)>,
 }
 
 fn rgba(hex: u32, a: f32) -> Vec4f {
@@ -146,7 +151,7 @@ impl DawTimeline {
         y >= self.geo.rect.pos.y && y < self.geo.sect_y
     }
     fn in_chords(&self, y: f64) -> bool {
-        y >= self.geo.chord_y && y < self.geo.lanes_y
+        y >= self.geo.chord_y && y < self.geo.takes_y
     }
     fn in_sections(&self, y: f64) -> bool {
         y >= self.geo.sect_y && y < self.geo.sect_y + SECT_H
@@ -203,12 +208,42 @@ impl DawTimeline {
         self.draw_text.draw_abs(cx, dvec2(x, y), s);
     }
 
+    /// Waveform of stem stem in a lane: min/max of the peak blocks under each pixel column.
+    fn wave(&mut self, cx: &mut Cx2d, st: &EditorState, stem: usize, ly: f64, lane_h: f64, color: Vec4f) {
+        let Some(s) = st.stems.get(stem).cloned() else { return };
+        let scale = (lane_h * 0.46) / s.peak_abs as f64;
+        let mid = ly + lane_h * 0.5;
+        let sr = st.sr() as f64;
+        let (x0, w) = (self.geo.x0, self.geo.w);
+        for px in 0..(w as usize) {
+            let t0 = st.scroll_t + px as f64 / st.pps;
+            if t0 >= st.duration() {
+                break;
+            }
+            let b0 = (t0 * sr) as usize / PEAK_BLOCK;
+            let b1 = (((t0 + 1.0 / st.pps) * sr) as usize / PEAK_BLOCK).max(b0 + 1).min(s.peaks.len());
+            if b0 >= b1 {
+                break;
+            }
+            let (mut mn, mut mx) = (f32::MAX, f32::MIN);
+            for &(a, b) in &s.peaks[b0..b1] {
+                mn = mn.min(a);
+                mx = mx.max(b);
+            }
+            self.rect(cx, x0 + px as f64, mid - mx as f64 * scale, 1.0, ((mx - mn) as f64 * scale).max(1.0), color);
+        }
+    }
+
     fn draw_all(&mut self, cx: &mut Cx2d, st: &mut EditorState, rect: Rect) {
         let n = st.project.tracks.len();
         let chords = st.project.analysis.as_ref().and_then(|a| a.chords.clone()).unwrap_or_default();
         let lyrics = st.project.analysis.as_ref().and_then(|a| a.lyrics.clone()).unwrap_or_default();
         let chord_y = rect.pos.y + RULER_H + SECT_H;
-        let lanes_y = chord_y + if chords.is_empty() { 0.0 } else { CHORD_H } + GAP;
+        let takes_y = chord_y + if chords.is_empty() { 0.0 } else { CHORD_H };
+        let lanes_y = takes_y + if st.project.takes().is_empty() { 0.0 } else { TAKES_H } + GAP;
+        let song_take = st.song_take().map(|(stem, t)| (stem, t.id.clone()));
+        // While a song take plays it is the only lane: the stems are not what you hear.
+        let n = if song_take.is_some() { 0 } else { n };
         let lane_h = ((rect.size.y - (lanes_y - rect.pos.y)) / n.max(1) as f64).clamp(40.0, 140.0);
         self.geo = Geo {
             rect,
@@ -216,6 +251,7 @@ impl DawTimeline {
             w: (rect.size.x - HEADER_W).max(10.0),
             sect_y: rect.pos.y + RULER_H,
             chord_y,
+            takes_y,
             lanes_y,
             lane_h,
             n,
@@ -295,6 +331,36 @@ impl DawTimeline {
             }
         }
 
+        // takes: Original, Take 1, Take 2 ... click one to hear it (A/B)
+        self.chips.clear();
+        if !st.project.takes().is_empty() {
+            self.text(cx, rect.pos.x + 8.0, takes_y + 6.0, dim, "Takes");
+            let mut x = x0;
+            let names: Vec<(String, Option<String>)> = std::iter::once(("Original".to_string(), None))
+                .chain(st.project.takes().iter().map(|t| (format!("Take {}", t.id.trim_start_matches('t')), Some(t.id.clone()))))
+                .collect();
+            for (label, id) in names {
+                let w = label.chars().count() as f64 * 6.5 + 18.0;
+                let on = st.audition == id;
+                self.rect(cx, x, takes_y + 3.0, w, TAKES_H - 6.0, rgba(if on { 0x4fc3f7 } else { 0x2c313b }, 1.0));
+                self.text(cx, x + 9.0, takes_y + 6.0, if on { rgba(0x111111, 1.0) } else { white }, &label);
+                self.chips.push((Rect { pos: dvec2(x, takes_y + 3.0), size: dvec2(w, TAKES_H - 6.0) }, id));
+                x += w + 6.0;
+            }
+        }
+
+        // a song take: one lane with its waveform
+        if let Some((stem, id)) = &song_take {
+            let ly = lanes_y;
+            let h = (rect.size.y - (lanes_y - rect.pos.y)).max(40.0);
+            self.rect(cx, rect.pos.x, ly, rect.size.x, h - 1.0, rgba(0x1c1f26, 1.0));
+            self.rect(cx, rect.pos.x, ly, HEADER_W - 2.0, h - 1.0, rgba(0x22262e, 1.0));
+            self.rect(cx, rect.pos.x, ly, 4.0, h - 1.0, rgba(0x4fc3f7, 1.0));
+            self.text(cx, rect.pos.x + 12.0, ly + 9.0, white, &format!("Take {}", id.trim_start_matches('t')));
+            self.text(cx, rect.pos.x + 12.0, ly + 27.0, dim, "whole song");
+            self.wave(cx, st, *stem, ly, h.min(260.0), rgba(0x4fc3f7, 0.85));
+        }
+
         // lanes
         let gains = st.project.track_gains();
         for i in 0..n {
@@ -314,37 +380,11 @@ impl DawTimeline {
             self.rect(cx, sb.pos.x, sb.pos.y, sb.size.x, sb.size.y, rgba(if tr.soloed() { 0xfdd835 } else { 0x343a46 }, 1.0));
             self.text(cx, sb.pos.x + 8.0, sb.pos.y + 3.0, if tr.soloed() { rgba(0x111111, 1.0) } else { white }, "S");
 
-            // waveform: min/max of the peak blocks under each pixel column
-            let stem = &st.stems[i];
-            let scale = (lane_h * 0.46) / stem.peak_abs as f64;
-            let mid = ly + lane_h * 0.5;
-            let sr = st.sr() as f64;
-            let wave_col = rgba(col, if audible { 0.85 } else { 0.25 });
-            let mut cols: Vec<(f64, f64, f64)> = Vec::with_capacity(w as usize);
-            for px in 0..(w as usize) {
-                let t0 = st.scroll_t + px as f64 / st.pps;
-                if t0 >= st.duration() {
-                    break;
-                }
-                let b0 = (t0 * sr) as usize / PEAK_BLOCK;
-                let b1 = (((t0 + 1.0 / st.pps) * sr) as usize / PEAK_BLOCK).max(b0 + 1).min(stem.peaks.len());
-                if b0 >= b1 {
-                    break;
-                }
-                let (mut mn, mut mx) = (f32::MAX, f32::MIN);
-                for &(a, b) in &stem.peaks[b0..b1] {
-                    mn = mn.min(a);
-                    mx = mx.max(b);
-                }
-                cols.push((x0 + px as f64, mid - mx as f64 * scale, ((mx - mn) as f64 * scale).max(1.0)));
-            }
-            for (x, y, h) in cols {
-                self.rect(cx, x, y, 1.0, h, wave_col);
-            }
+            self.wave(cx, st, i, ly, lane_h, rgba(col, if audible { 0.85 } else { 0.25 }));
         }
 
         // lyrics along the bottom of the vocals lane
-        if let Some(v) = st.project.track_index("vocals") {
+        if let Some(v) = st.project.track_index("vocals").filter(|_| song_take.is_none()) {
             let y = self.lane_y(v) + lane_h - 16.0;
             let mut right = f64::MIN;
             for l in &lyrics {
@@ -360,6 +400,9 @@ impl DawTimeline {
 
         // regions over the lanes
         for ri in 0..st.project.regions().len() {
+            if song_take.is_some() {
+                break;
+            }
             let r = st.project.regions()[ri].clone();
             let Some(lane) = st.project.track_index(&r.track) else { continue };
             let ly = self.lane_y(lane);
@@ -412,6 +455,11 @@ impl Widget for DawTimeline {
                             st.select(Selection::Section(i));
                             st.seek(start);
                         }
+                    }
+                } else if y >= self.geo.takes_y && y < self.geo.lanes_y {
+                    if let Some((_, id)) = self.chips.iter().find(|(r, _)| r.contains(fe.abs)).cloned() {
+                        st.select(Selection::None);
+                        st.set_audition(id);
                     }
                 } else if self.in_chords(y) {
                     if in_wave {

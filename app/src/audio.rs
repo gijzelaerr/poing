@@ -2,7 +2,7 @@
 //! mixer (shared by live playback and the offline render) and the job worker.
 use makepad_micro_serde::*;
 
-use crate::model::Project;
+use crate::model::{Project, Take};
 use makepad_widgets::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,16 +84,27 @@ pub struct MixRegion {
     pub factor: f32,
 }
 
+/// The take being auditioned: stem `stem` (after the tracks in the stem set)
+/// plays in place of the lanes over [start, end]; a song take replaces them all.
+#[derive(Clone, Copy, Default)]
+pub struct MixTake {
+    pub stem: usize,
+    pub start: f64,
+    pub end: f64,
+    pub song: bool,
+}
+
 /// Everything the mixer needs; rebuilt from the Project whenever it changes.
 #[derive(Clone, Default)]
 pub struct MixParams {
     pub version: u64,
     pub gains: Vec<f32>,
     pub regions: Vec<MixRegion>,
+    pub take: Option<MixTake>,
 }
 
 impl MixParams {
-    pub fn from_project(p: &Project, version: u64) -> Self {
+    pub fn from_project(p: &Project, version: u64, audition: Option<&str>) -> Self {
         let regions = p
             .regions()
             .iter()
@@ -103,7 +114,21 @@ impl MixParams {
                 (factor != 1.0).then(|| MixRegion { track, start: r.start, end: r.end, factor })
             })
             .collect();
-        Self { version, gains: p.track_gains(), regions }
+        let take = audition.and_then(|id| p.take_index(id)).map(|i| {
+            let t = &p.takes()[i];
+            MixTake { stem: p.tracks.len() + i, start: t.start, end: t.end, song: t.scope == "song" }
+        });
+        Self { version, gains: p.track_gains(), regions, take }
+    }
+
+    /// How much of the take is heard at t (0 = lanes only, 1 = take only).
+    #[inline]
+    fn take_weight(&self, t: f64) -> f32 {
+        match self.take {
+            None => 0.0,
+            Some(k) if k.song => 1.0,
+            Some(k) => (((t - k.start) / REGION_RAMP_S).clamp(0.0, 1.0) * ((k.end - t) / REGION_RAMP_S).clamp(0.0, 1.0)) as f32,
+        }
     }
 
     /// Gain of one track at time t (seconds), with short linear ramps at region edges.
@@ -131,20 +156,46 @@ pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out
     out_l.iter_mut().for_each(|x| *x = 0.0);
     out_r.iter_mut().for_each(|x| *x = 0.0);
     let inv_sr = 1.0 / sr as f64;
-    for (ti, s) in stems.iter().enumerate() {
-        if mix.gains.get(ti).copied().unwrap_or(0.0) == 0.0 {
-            continue;
+    let t0 = start as f64 * inv_sr;
+    let t1 = (start + out_l.len()) as f64 * inv_sr;
+    // The take's span touches this block: lanes fade out under it.
+    let take_here = mix.take.filter(|k| k.song || (k.end > t0 - REGION_RAMP_S && k.start < t1 + REGION_RAMP_S));
+    if take_here.is_some_and(|k| k.song) {
+        // A song take is the whole song: the lanes are silent.
+    } else {
+        for (ti, s) in stems.iter().enumerate() {
+            if mix.gains.get(ti).copied().unwrap_or(0.0) == 0.0 {
+                continue;
+            }
+            let varies = take_here.is_some() || mix.regions.iter().any(|r| r.track == ti);
+            let flat = mix.gain_at(ti, t0);
+            for i in 0..out_l.len() {
+                let f = start + i;
+                if f >= s.l.len() {
+                    break;
+                }
+                let g = if varies {
+                    let t = f as f64 * inv_sr;
+                    mix.gain_at(ti, t) * (1.0 - mix.take_weight(t))
+                } else {
+                    flat
+                };
+                out_l[i] += s.l[f] * g;
+                out_r[i] += s.r[f] * g;
+            }
         }
-        let has_regions = mix.regions.iter().any(|r| r.track == ti);
-        let flat = mix.gain_at(ti, start as f64 * inv_sr);
+    }
+    if let Some(k) = take_here {
+        let Some(s) = stems.get(k.stem) else { return };
+        let offset = (k.start.max(0.0) * sr as f64) as usize;
         for i in 0..out_l.len() {
             let f = start + i;
-            if f >= s.l.len() {
-                break;
+            if f < offset || f - offset >= s.l.len() {
+                continue;
             }
-            let g = if has_regions { mix.gain_at(ti, f as f64 * inv_sr) } else { flat };
-            out_l[i] += s.l[f] * g;
-            out_r[i] += s.r[f] * g;
+            let w = mix.take_weight(f as f64 * inv_sr);
+            out_l[i] += s.l[f - offset] * w;
+            out_r[i] += s.r[f - offset] * w;
         }
     }
 }
@@ -257,6 +308,19 @@ pub enum Job {
     /// Understand a song: run the analysis sidecar on `audio`, writing into the
     /// `bundle`, then decode the new stems at `sr`.
     Analyze { audio: PathBuf, bundle: PathBuf, sr: u32 },
+    /// Render a take with native YuE2 from `fixture` into `bundle/<take.file>`.
+    Generate { bundle: PathBuf, take: Take, fixture: Yue2Fixture, sr: u32 },
+}
+
+/// What `yue2_render --fixture` reads: style, section-tagged lyrics, seed,
+/// chain of thought ("full" keeps the score's chords) and the ABC score.
+#[derive(SerJson, Clone)]
+pub struct Yue2Fixture {
+    pub style: String,
+    pub lyrics: String,
+    pub seed: u64,
+    pub cot: String,
+    pub abc: Option<String>,
 }
 
 /// Progress and results the worker sends to the UI (after each send it raises
@@ -268,6 +332,8 @@ pub enum JobUpdate {
     Progress { message: String, progress: f32 },
     /// analysis.json is written and its stems decoded: (track id, file, stem).
     Analyzed { bundle: PathBuf, stems: Vec<(String, String, Stem)> },
+    /// A take finished rendering and is decoded at the project rate.
+    TakeReady { take: Take, stem: Stem },
 }
 
 pub struct Jobs {
@@ -287,6 +353,7 @@ impl Jobs {
                     match job {
                         Job::Render { stems, mix, sr, out_dir, name } => render(&stems, &mix, sr, &out_dir, &name, &up_tx),
                         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
+                        Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, &up_tx),
                     }
                 }
             })
@@ -494,4 +561,177 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
         }
     }
     send(tx, JobUpdate::Analyzed { bundle: bundle.to_path_buf(), stems });
+}
+
+/// A Hugging Face model's local snapshot: `HF_HUB_CACHE`, `HF_HOME/hub`, else
+/// `~/.cache/huggingface/hub`, newest snapshot first.
+fn hf_snapshot(repo: &str) -> Option<PathBuf> {
+    let hub = std::env::var_os("HF_HUB_CACHE").map(PathBuf::from).or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub"))).or_else(|| {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        Some(PathBuf::from(home).join(".cache").join("huggingface").join("hub"))
+    })?;
+    let snaps = hub.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
+    let mut dirs: Vec<_> = std::fs::read_dir(snaps).ok()?.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).collect();
+    dirs.sort_by_key(|e| std::cmp::Reverse(e.metadata().and_then(|m| m.modified()).ok()));
+    dirs.first().map(|e| e.path())
+}
+
+/// Native YuE2 (Makepad's `yue2_render`): `POING_YUE2_RENDER`, else on PATH.
+/// Weights: `POING_YUE2_MODEL` / `POING_YUE2_VAE`, else the Hugging Face cache.
+fn yue2_command() -> Result<(Command, PathBuf, PathBuf), String> {
+    let exe = std::env::var_os("POING_YUE2_RENDER").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("yue2_render"));
+    let model = std::env::var_os("POING_YUE2_MODEL").map(PathBuf::from).or_else(|| hf_snapshot("m-a-p/YuE2-3B"))
+        .ok_or("YuE2-3B weights not found (set POING_YUE2_MODEL)")?;
+    let vae = std::env::var_os("POING_YUE2_VAE").map(PathBuf::from).or_else(|| hf_snapshot("m-a-p/YuE2-Vae"))
+        .ok_or("YuE2-Vae weights not found (set POING_YUE2_VAE)")?;
+    let mut cmd = Command::new(exe);
+    // The CUDA runtime DLLs live in the toolkit's bin\x64 since CUDA 13.
+    #[cfg(windows)]
+    if let Some(cuda) = cuda_root() {
+        let mut paths = vec![cuda.join("bin").join("x64"), cuda.join("bin")];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    Ok((cmd, model, vae))
+}
+
+/// The CUDA toolkit: `CUDA_PATH` (set by its installer, but missing in
+/// processes started before the install), else the newest default install.
+#[cfg(windows)]
+fn cuda_root() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("CUDA_PATH") {
+        return Some(PathBuf::from(p));
+    }
+    let base = PathBuf::from(std::env::var_os("ProgramFiles")?).join("NVIDIA GPU Computing Toolkit").join("CUDA");
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(base).ok()?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect();
+    versions.sort_by_key(|p| {
+        let v = p.file_name().and_then(|n| n.to_str()).unwrap_or("").trim_start_matches('v').to_string();
+        v.split('.').map(|n| n.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>()
+    });
+    versions.pop()
+}
+
+/// Map a `yue2_render` progress line ("Codec { done: 812, max: 6000 }") to 0..1
+/// over the whole render.
+fn yue2_progress(line: &str) -> Option<(&'static str, f32)> {
+    let (stage, rest) = line.split_once(" {")?;
+    let nums: Vec<f32> = rest.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
+    let frac = match nums.as_slice() {
+        [done, total, ..] if *total > 0.0 => (done / total).clamp(0.0, 1.0),
+        _ => return None,
+    };
+    let (label, a, b) = match stage.trim() {
+        "Score" => ("Planning", 0.0, 0.05),
+        "Codec" => ("Singing", 0.05, 0.5),
+        "Flow" => ("Shaping the sound", 0.5, 0.95),
+        "Decode" => ("Decoding", 0.95, 1.0),
+        _ => return None,
+    };
+    Some((label, a + (b - a) * frac))
+}
+
+/// Render one take with native YuE2, relaying its progress, then decode it.
+/// The fixture, the render log and the raw output stay in `takes/<id>/`.
+fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Sender<JobUpdate>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let fail = |why: String| send(tx, JobUpdate::Done(format!("Take {} failed: {why}", take.id)));
+    let progress = |message: &str, progress: f32| send(tx, JobUpdate::Progress { message: message.into(), progress });
+    progress(&format!("Take {}  ·  Starting YuE2", take.id.trim_start_matches('t')), 0.0);
+    let work = bundle.join("takes").join(&take.id);
+    if let Err(e) = std::fs::create_dir_all(&work) {
+        return fail(e.to_string());
+    }
+    let fixture_path = work.join("fixture.json");
+    if let Err(e) = std::fs::write(&fixture_path, fixture.serialize_json()) {
+        return fail(e.to_string());
+    }
+    let (mut cmd, model, vae) = match yue2_command() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    cmd.arg("--model").arg(model).arg("--vae").arg(vae).arg("--fixture").arg(&fixture_path).arg("--out").arg(&work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return fail(format!("yue2_render did not start ({e}); set POING_YUE2_RENDER")),
+    };
+    let mut log = std::fs::File::create(work.join("render.log")).ok();
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            if let Some((label, p)) = yue2_progress(&line) {
+                progress(&format!("Take {}  ·  {label}", take.id.trim_start_matches('t')), p);
+            }
+        }
+    }
+    match child.wait() {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            // 0xC0000135 on Windows: a DLL (the CUDA runtime) was not found.
+            let code = s.code().map(|c| format!("{:#X}", c as u32)).unwrap_or_default();
+            return fail(format!("yue2_render exited with {code} (see {})", work.join("render.log").display()));
+        }
+        Err(e) => return fail(e.to_string()),
+    }
+    let wav = work.join("song.wav");
+    let dest = bundle.join(&take.file);
+    if let Err(e) = std::fs::rename(&wav, &dest).or_else(|_| std::fs::copy(&wav, &dest).map(|_| ())) {
+        return fail(format!("move {}: {e}", wav.display()));
+    }
+    match load_stem(&dest, sr) {
+        Ok(stem) => send(tx, JobUpdate::TakeReady { take, stem }),
+        Err(e) => fail(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mix_into, yue2_progress, MixParams, MixTake, Stem};
+    use std::sync::Arc;
+
+    fn constant(v: f32, frames: usize) -> Arc<Stem> {
+        Arc::new(Stem { l: vec![v; frames], r: vec![v; frames], peaks: Vec::new(), peak_abs: v })
+    }
+
+    #[test]
+    fn a_song_take_replaces_the_lanes() {
+        let stems = vec![constant(0.25, 1000), constant(1.0, 1500)];
+        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 0.0, end: 1.5, song: true }), ..Default::default() };
+        let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
+        mix_into(&stems, &mix, 1000, 1200, &mut l, &mut r);
+        assert!(l.iter().chain(&r).all(|&x| x == 1.0), "past the lanes' end the take still plays alone");
+    }
+
+    #[test]
+    fn a_section_take_crossfades_in_its_range() {
+        // lanes 0.25 everywhere; a 0.4 s take placed at 0.3 s
+        let stems = vec![constant(0.25, 1000), constant(1.0, 400)];
+        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 0.3, end: 0.7, song: false }), ..Default::default() };
+        let (mut l, mut r) = (vec![0.0; 1000], vec![0.0; 1000]);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        assert_eq!(l[100], 0.25, "before the take: lanes");
+        assert_eq!(l[500], 1.0, "inside: the take alone");
+        assert_eq!(l[900], 0.25, "after: lanes again");
+        assert!(l[305] > 0.25 && l[305] < 1.0, "the edge is a ramp, not a click");
+    }
+
+    #[test]
+    fn yue2_progress_lines() {
+        assert_eq!(yue2_progress("Flow { done: 16, total: 32 }"), Some(("Shaping the sound", 0.725)));
+        assert_eq!(yue2_progress("Codec { done: 0, max: 6000 }"), Some(("Singing", 0.05)));
+        assert_eq!(yue2_progress("codec: 3306 tokens 18.34s (196.3 tok/s) = 132.2s audio"), None);
+    }
 }

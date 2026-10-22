@@ -80,23 +80,51 @@ def merge_sections(rows, min_len=2.0):
     return secs
 
 
-def structure(audio: Path, device: str):
+def rebuild_abc(model, score: Path) -> bool:
+    """SheetSage2 refuses to write ABC when a bar repeats a beat ID (1,2,3,4,4).
+    Drop the repeated beat rows and rebuild score.abc from its MIDI and labs."""
+    import importlib
+    try:
+        pkg = type(model).__module__.rsplit(".", 1)[0]
+        notation = importlib.import_module(pkg + ".notation_sheetsage2")
+        fixed = []
+        for row in (score / "beat.lab").read_text().splitlines():
+            parts = row.split()
+            if len(parts) < 2 or not parts[1].isdigit():
+                continue
+            beat, prev = int(parts[1]), int(fixed[-1].split()[1]) if fixed else None
+            if prev is None or beat == 1 or beat == prev + 1:
+                fixed.append(row)
+        (score / "beat_fixed.lab").write_text("\n".join(fixed) + "\n")
+        abc = notation.build_rebuilt_abc_score(
+            score / "melody.mid", score / "beat_fixed.lab", score / "chord.lab", score / "key.lab",
+            score / "structure.lab", meter_conflict="infer", melody_only=False)
+        (score / "score.abc").write_text(notation.score_to_abc(abc), encoding="utf-8")
+        return True
+    except Exception as exc:  # the score is a bonus; the labs carry the analysis
+        print(f"score rebuild failed: {exc!r}", file=sys.stderr)
+        return False
+
+
+def structure(audio: Path, bundle: Path, device: str):
     import torch
     from transformers import AutoModel
     emit("structure", overall("structure", 0.0), "Finding sections, key, chords and beats")
     model = AutoModel.from_pretrained(os.environ.get("POING_SHEETSAGE", "m-a-p/SheetSage2"),
                                       trust_remote_code=True).eval().to(device)
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            model.transcribe(str(audio), output_dir=tmp)
-        except (ValueError, RuntimeError) as exc:
-            # The ABC score can fail on a beat-grid glitch; the labs are still written.
-            emit("structure", overall("structure", 0.8), f"score unavailable ({exc}); using annotations")
-        tmp = Path(tmp)
-        beats = [(float(r[0]), int(r[1])) for r in read_lab(tmp / "beat.lab") if r[1].isdigit()]
-        key_rows = read_lab(tmp / "key.lab")
-        chord_rows = read_lab(tmp / "chord.lab")
-        struct_rows = read_lab(tmp / "structure.lab")
+    # The score (ABC, MIDI, labs) stays in the bundle: covers are rendered from it.
+    score = bundle / "score"
+    score.mkdir(exist_ok=True)
+    try:
+        model.transcribe(str(audio), output_dir=str(score))
+    except (ValueError, RuntimeError) as exc:
+        print(f"transcribe: {exc!r}", file=sys.stderr)
+    if not (score / "score.abc").exists() and not rebuild_abc(model, score):
+        emit("structure", overall("structure", 0.8), "No score; using annotations")
+    beats = [(float(r[0]), int(r[1])) for r in read_lab(score / "beat.lab") if r[1].isdigit()]
+    key_rows = read_lab(score / "key.lab")
+    chord_rows = read_lab(score / "chord.lab")
+    struct_rows = read_lab(score / "structure.lab")
     del model
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -181,7 +209,7 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         emit("start", 0.0, f"Analysing on {device}")
         separate(audio, bundle, device)
-        result = structure(audio, device)
+        result = structure(audio, bundle, device)
         result["lyrics"] = lyrics(bundle / "stems" / "vocals.wav", device)
         result["stems"] = {s: f"stems/{s}.wav" for s in ("vocals", "drums", "bass", "other")}
         (bundle / "analysis.json").write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")

@@ -17,7 +17,30 @@ pub struct Project {
     pub source: Option<String>,
     /// What the analysis found; absent until it has run.
     pub analysis: Option<Analysis>,
+    /// Generated versions, newest last. Never overwritten: a take is kept or deleted.
+    pub takes: Option<Vec<Take>>,
 }
+
+/// One generated version of the song (scope `"song"`) or of a time range
+/// (scope `"section"`, played in place of the lanes between start and end).
+#[derive(SerJson, DeJson, Clone, Debug)]
+pub struct Take {
+    pub id: String,
+    pub scope: String,
+    pub start: f64,
+    pub end: f64,
+    /// `"yue2"` (score + lyrics cover) or `"acestep"` (repaint).
+    pub engine: String,
+    /// The Describe text it was made from.
+    pub prompt: String,
+    pub seed: u64,
+    /// Audio file relative to the project.
+    pub file: String,
+}
+
+/// Seeds for successive takes: fixed so a take can be made again, varied so
+/// the next take sounds different. 1234 made the first liked It's Autumn cover.
+pub const TAKE_SEEDS: [u64; 6] = [1234, 1966, 2026, 42, 7, 831001];
 
 /// Song understanding, as written by the analysis sidecar (`analysis.json`).
 #[derive(SerJson, DeJson, Clone, Debug, Default)]
@@ -132,6 +155,7 @@ impl Project {
             regions: Some(Vec::new()),
             source: Some(source_file.to_string()),
             analysis: None,
+            takes: Some(Vec::new()),
         }
     }
 
@@ -172,6 +196,7 @@ impl Project {
         let mut p = Project::deserialize_json_lenient(&text).map_err(|e| format!("parse {}: {e:?}", path.display()))?;
         p.sections.get_or_insert_with(Vec::new);
         p.regions.get_or_insert_with(Vec::new);
+        p.takes.get_or_insert_with(Vec::new);
         Ok(p)
     }
 
@@ -196,6 +221,46 @@ impl Project {
     }
     pub fn regions_mut(&mut self) -> &mut Vec<Region> {
         self.regions.get_or_insert_with(Vec::new)
+    }
+
+    pub fn takes(&self) -> &Vec<Take> {
+        self.takes.as_ref().expect("filled on load")
+    }
+    pub fn takes_mut(&mut self) -> &mut Vec<Take> {
+        self.takes.get_or_insert_with(Vec::new)
+    }
+    pub fn take_index(&self, id: &str) -> Option<usize> {
+        self.takes().iter().position(|t| t.id == id)
+    }
+    /// The id and seed for the next take.
+    pub fn next_take(&self) -> (String, u64) {
+        let n = self.takes().iter().filter_map(|t| t.id.trim_start_matches('t').parse::<usize>().ok()).max().unwrap_or(0);
+        let seed = TAKE_SEEDS[n % TAKE_SEEDS.len()] + 1000 * (n / TAKE_SEEDS.len()) as u64;
+        (format!("t{}", n + 1), seed)
+    }
+
+    /// Lyrics tagged by section, the way YuE2 wants them: `[Verse]` then its
+    /// lines, a blank line between sections. A line belongs to the section its
+    /// middle falls in; sections without words keep their tag.
+    pub fn sung_lyrics(&self) -> String {
+        let lines = self.analysis.as_ref().and_then(|a| a.lyrics.as_ref());
+        let mut out = Vec::new();
+        for s in self.sections() {
+            let tag: String = s.label.chars().filter(|c| !c.is_ascii_digit()).collect();
+            let tag = tag.trim();
+            let mut chars = tag.chars();
+            let tag = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
+            let mut block = format!("[{tag}]");
+            for l in lines.into_iter().flatten() {
+                let mid = 0.5 * (l.start + l.end);
+                if mid >= s.start && mid < s.end && !l.text.trim().is_empty() {
+                    block.push('\n');
+                    block.push_str(l.text.trim());
+                }
+            }
+            out.push(block);
+        }
+        out.join("\n\n") + "\n"
     }
 
     pub fn track_path(&self, project_path: &Path, i: usize) -> PathBuf {
@@ -233,7 +298,44 @@ mod tests {
             regions: Some(regions),
             source: None,
             analysis: None,
+            takes: None,
         }
+    }
+
+    #[test]
+    fn sung_lyrics_are_tagged_by_section() {
+        let mut p = project(vec![]);
+        *p.sections_mut() = vec![
+            Section { start: 0.0, end: 5.0, label: "intro".into() },
+            Section { start: 5.0, end: 20.0, label: "verse 2".into() },
+        ];
+        p.analysis = Some(Analysis {
+            lyrics: Some(vec![
+                LyricLine { start: 6.0, end: 9.0, text: " Ah, hear the wind ".into() },
+                LyricLine { start: 9.0, end: 12.0, text: "See the birds".into() },
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(p.sung_lyrics(), "[Intro]\n\n[Verse]\nAh, hear the wind\nSee the birds\n");
+    }
+
+    #[test]
+    fn next_take_counts_up_with_fixed_seeds() {
+        let mut p = project(vec![]);
+        p.takes = Some(Vec::new());
+        assert_eq!(p.next_take(), ("t1".to_string(), 1234));
+        let take = Take {
+            id: "t1".into(),
+            scope: "song".into(),
+            start: 0.0,
+            end: 1.0,
+            engine: "yue2".into(),
+            prompt: "x".into(),
+            seed: 1234,
+            file: "takes/t1.wav".into(),
+        };
+        p.takes_mut().push(take);
+        assert_eq!(p.next_take(), ("t2".to_string(), 1966));
     }
 
     #[test]

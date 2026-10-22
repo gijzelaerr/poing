@@ -2,7 +2,7 @@
 //! widget through Scope data.
 
 use crate::audio::{MixParams, Shared, Stem, Stems};
-use crate::model::{default_gain_for, Analysis, Project, Region};
+use crate::model::{default_gain_for, Analysis, Project, Region, Take};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -22,8 +22,10 @@ pub struct EditorState {
     pub shared: Arc<Shared>,
     /// Stem sets the audio thread may still hold; dropped here once it moved on.
     retired: Vec<Stems>,
-    /// Analysis in progress: (message, 0..1). None when idle.
+    /// Background job in progress (analysis or a take): (message, 0..1).
     pub analysing: Option<(String, f32)>,
+    /// The take being heard instead of the lanes (A/B); None plays the lanes.
+    pub audition: Option<String>,
     pub sel: Selection,
     /// pixels per second; 0 asks the timeline to fit the song on its next draw
     pub pps: f64,
@@ -37,8 +39,28 @@ pub struct EditorState {
 }
 
 impl EditorState {
-    pub fn new(project: Project, path: PathBuf, stems: Vec<Stem>) -> Self {
-        let mix = MixParams::from_project(&project, 0);
+    /// `shared`: the audio output's state when one is already playing another
+    /// song; this song's stems and mix are published into it.
+    pub fn new(project: Project, path: PathBuf, stems: Vec<Stem>, shared: Option<Arc<Shared>>) -> Self {
+        let stems: Stems = Arc::new(stems.into_iter().map(Arc::new).collect());
+        // Mix versions keep counting up across songs, so the callback sees the change.
+        let mix_version = shared.as_ref().and_then(|s| s.mix.lock().ok().map(|m| m.version + 1)).unwrap_or(0);
+        let mix = MixParams::from_project(&project, mix_version, None);
+        let shared = match shared {
+            Some(s) => {
+                s.set_playing(false);
+                s.seek(0);
+                if let Ok(mut m) = s.mix.lock() {
+                    *m = mix;
+                }
+                if let Ok(mut set) = s.stems.lock() {
+                    *set = stems.clone();
+                }
+                s.stems_gen.fetch_add(1, Ordering::AcqRel);
+                s
+            }
+            None => Arc::new(Shared::new(mix, stems.clone())),
+        };
         let next_region = project
             .regions()
             .iter()
@@ -46,22 +68,27 @@ impl EditorState {
             .max()
             .unwrap_or(0)
             + 1;
-        let stems: Stems = Arc::new(stems.into_iter().map(Arc::new).collect());
         Self {
             project,
             path,
-            shared: Arc::new(Shared::new(mix, stems.clone())),
+            shared,
             stems,
             retired: Vec::new(),
             analysing: None,
+            audition: None,
             sel: Selection::None,
             pps: 0.0,
             scroll_t: 0.0,
             sel_changed: true,
             dirty: false,
-            mix_version: 0,
+            mix_version,
             next_region,
         }
+    }
+
+    /// Keep a stem set alive until the audio thread has let go of it.
+    pub fn retire(&mut self, stems: Stems) {
+        self.retired.push(stems);
     }
 
     pub fn sr(&self) -> u32 {
@@ -72,15 +99,18 @@ impl EditorState {
     /// playing, sections and chords appear, and the project is saved.
     pub fn apply_analysis(&mut self, analysis: Analysis, stems: Vec<(String, String, Stem)>) -> Result<(), String> {
         let files: Vec<(String, String)> = stems.iter().map(|(id, file, _)| (id.clone(), file.clone())).collect();
+        let before = self.project.tracks.len();
         let added = self.project.apply_analysis(analysis, &files);
-        let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+        // The stem set is tracks then takes: new lanes go between them.
+        let mut lanes: Vec<Arc<Stem>> = self.stems[..before].to_vec();
         for (id, _, stem) in stems {
             if self.project.track_index(&id).is_some_and(|i| added.contains(&i)) {
                 lanes.push(Arc::new(stem));
             }
         }
-        if lanes.len() != self.project.tracks.len() {
-            return Err(format!("analysis lanes {} != tracks {}", lanes.len(), self.project.tracks.len()));
+        lanes.extend(self.stems[before..].iter().cloned());
+        if lanes.len() != self.project.tracks.len() + self.project.takes().len() {
+            return Err(format!("analysis lanes {} != tracks + takes", lanes.len()));
         }
         self.publish_stems(Arc::new(lanes));
         self.push_mix();
@@ -107,8 +137,61 @@ impl EditorState {
             self.retired.clear();
         }
     }
+    /// A new take joins the stem set and is auditioned straight away.
+    pub fn add_take(&mut self, take: Take, stem: Stem) -> Result<(), String> {
+        let id = take.id.clone();
+        self.project.takes_mut().push(take);
+        let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+        lanes.push(Arc::new(stem));
+        self.publish_stems(Arc::new(lanes));
+        self.analysing = None;
+        self.set_audition(Some(id));
+        self.save()
+    }
+
+    /// Delete a take: its audio file goes, the stem set shrinks.
+    pub fn delete_take(&mut self, id: &str) -> Result<(), String> {
+        let Some(i) = self.project.take_index(id) else { return Ok(()) };
+        if self.audition.as_deref() == Some(id) {
+            self.set_audition(None);
+        }
+        let take = self.project.takes_mut().remove(i);
+        let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+        lanes.remove(self.project.tracks.len() + i);
+        self.publish_stems(Arc::new(lanes));
+        self.push_mix();
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_file(dir.join(&take.file));
+        }
+        self.save()
+    }
+
+    /// Hear a take instead of the lanes (None: back to the lanes).
+    pub fn set_audition(&mut self, id: Option<String>) {
+        let before = self.duration();
+        self.audition = id.filter(|id| self.project.take_index(id).is_some());
+        self.push_mix();
+        self.sel_changed = true;
+        if (self.duration() - before).abs() > 0.5 {
+            self.pps = 0.0; // a song take has its own length: fit it
+        }
+        if self.playhead() > self.duration() {
+            self.seek(0.0);
+        }
+    }
+
+    /// The song take being heard, if any.
+    pub fn song_take(&self) -> Option<(usize, &Take)> {
+        let i = self.project.take_index(self.audition.as_deref()?)?;
+        let t = &self.project.takes()[i];
+        (t.scope == "song").then_some((self.project.tracks.len() + i, t))
+    }
+
     pub fn duration(&self) -> f64 {
-        self.project.duration
+        match self.song_take() {
+            Some((_, t)) => t.end,
+            None => self.project.duration,
+        }
     }
     pub fn playhead(&self) -> f64 {
         self.shared.pos() as f64 / self.sr() as f64
@@ -129,7 +212,7 @@ impl EditorState {
     /// The lock is held only for the swap; the audio thread only try_locks.
     pub fn push_mix(&mut self) {
         self.mix_version += 1;
-        let mix = MixParams::from_project(&self.project, self.mix_version);
+        let mix = MixParams::from_project(&self.project, self.mix_version, self.audition.as_deref());
         if let Ok(mut m) = self.shared.mix.lock() {
             *m = mix;
         }
@@ -137,7 +220,7 @@ impl EditorState {
     }
 
     pub fn mix_snapshot(&self) -> MixParams {
-        MixParams::from_project(&self.project, self.mix_version)
+        MixParams::from_project(&self.project, self.mix_version, self.audition.as_deref())
     }
 
     pub fn select(&mut self, sel: Selection) {
