@@ -65,6 +65,13 @@ pub struct EditorState {
     pub meter_show: Vec<f32>,
     /// The range playback loops over (seconds), if any.
     pub loop_range: Option<(f64, f64)>,
+    /// The selected note: (MIDI lane, index in its notes).
+    pub note_sel: Option<(usize, usize)>,
+    /// The length new notes get (the last one drawn), in beats.
+    pub note_len: f64,
+    /// MIDI lanes' instruments by track id: compiled shader and knobs.
+    inst_shaders: HashMap<String, AudioShaderRef>,
+    pub inst_controls: HashMap<String, Arc<FxControls>>,
     /// Installed VST3 plugins (name, bundle path), found on disk.
     pub plugin_library: Vec<(String, PathBuf)>,
     /// Each plugin effect's parameters (by effect id).
@@ -139,6 +146,10 @@ impl EditorState {
             timeline_area: makepad_widgets::Area::Empty,
             meter_show: vec![0.0; audio::METER_LANES + 1],
             loop_range: None,
+            note_sel: None,
+            note_len: 1.0,
+            inst_shaders: HashMap::new(),
+            inst_controls: HashMap::new(),
             plugin_library: crate::plugins::library(),
             plugin_params: HashMap::new(),
             #[cfg(windows)]
@@ -156,6 +167,7 @@ impl EditorState {
         for id in ids {
             self.compile_fx(&id);
         }
+        self.compile_instruments();
         self.publish_fx();
         self
     }
@@ -203,7 +215,83 @@ impl EditorState {
 
     /// A rack for the song as it is now (fresh effect state).
     pub fn make_rack(&self) -> FxRack {
-        fx::build_rack(&self.project, &|id| self.fx_shaders.get(id).cloned(), &|id| self.fx_controls.get(id).cloned())
+        let mut rack = fx::build_rack(&self.project, &|id| self.fx_shaders.get(id).cloned(), &|id| self.fx_controls.get(id).cloned());
+        // MIDI lanes: their notes on the song's beat grid, played by their instruments
+        let grid = poing_model::BeatGrid::of(&self.project);
+        let sr = self.sr();
+        for (i, t) in self.project.tracks.iter().enumerate() {
+            let (Some(notes), Some(shader), Some(c)) = (&t.notes, self.inst_shaders.get(&t.id), self.inst_controls.get(&t.id)) else { continue };
+            let synth = crate::synth::Synth::new(shader.clone(), c.clone(), sr);
+            rack.midi.push(crate::synth::MidiLane::new(i, crate::synth::events(notes, &grid, sr), synth));
+        }
+        rack
+    }
+
+    /// Compile every MIDI lane's instrument from the bundle.
+    fn compile_instruments(&mut self) {
+        let dir = self.dir();
+        let tracks: Vec<Track> = self.project.tracks.iter().filter(|t| t.is_midi()).cloned().collect();
+        for t in tracks {
+            let Some(inst) = &t.instrument else { continue };
+            let code = std::fs::read_to_string(dir.join(&inst.file)).map_err(|e| e.to_string());
+            match code.and_then(|c| fx::compile_instrument(&c)) {
+                Ok(shader) => {
+                    let controls = self.inst_controls.get(&t.id).cloned().filter(|c| c.params.len() == shader.params().len());
+                    let controls = controls.unwrap_or_else(|| FxControls::new(&shader, inst, None));
+                    self.inst_controls.insert(t.id.clone(), controls);
+                    self.inst_shaders.insert(t.id.clone(), shader);
+                    self.fx_errors.remove(&t.id);
+                }
+                Err(e) => {
+                    self.fx_errors.insert(t.id.clone(), e);
+                }
+            }
+        }
+    }
+
+    /// A new MIDI lane: notes played by an instrument written as code.
+    pub fn add_midi_track(&mut self, name: &str, code: &str, notes: Vec<poing_model::Note>, prompt: Option<String>) -> Result<usize, String> {
+        fx::compile_instrument(code)?;
+        self.checkpoint();
+        let n = (1..).find(|n| self.project.track_index(&format!("midi{n}")).is_none()).unwrap_or(1);
+        let id = format!("midi{n}");
+        let file = format!("instruments/{id}.splash");
+        let dir = self.dir();
+        std::fs::create_dir_all(dir.join("instruments")).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
+        let instrument = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None };
+        let tracks = self.project.tracks.len();
+        self.project.tracks.push(Track {
+            id,
+            name: name.to_string(),
+            file: String::new(),
+            gain_db: None,
+            mute: None,
+            solo: None,
+            fx: None,
+            notes: Some(notes),
+            instrument: Some(instrument),
+        });
+        // the stem set is tracks then takes: a silent placeholder goes in between
+        let mut lanes: Vec<Arc<Stem>> = self.stems[..tracks].to_vec();
+        lanes.push(Arc::new(Stem::new(Vec::new(), Vec::new())));
+        lanes.extend(self.stems[tracks..].iter().cloned());
+        self.publish_stems(Arc::new(lanes));
+        self.compile_instruments();
+        self.push_mix();
+        self.publish_fx();
+        self.sel_changed = true;
+        self.save()?;
+        Ok(tracks)
+    }
+
+    /// Replace a MIDI lane's notes (an edit): heard from the next rack.
+    pub fn set_notes(&mut self, lane: usize, notes: Vec<poing_model::Note>) {
+        if let Some(t) = self.project.tracks.get_mut(lane).filter(|t| t.is_midi()) {
+            t.notes = Some(notes);
+            self.dirty = true;
+            self.publish_fx();
+        }
     }
 
     /// Hand the audio thread a rack for the current effects (it carries
@@ -614,6 +702,8 @@ impl EditorState {
                     mute: None,
                     solo: None,
                     fx: None,
+                    notes: None,
+                    instrument: None,
                 });
                 lanes.push(Arc::new(placed));
                 format!("Take {n} is now a lane of its own")
@@ -775,6 +865,9 @@ impl EditorState {
     }
 
     pub fn select(&mut self, sel: Selection) {
+        if self.note_sel.is_some_and(|(l, _)| sel != Selection::Track(l)) {
+            self.note_sel = None;
+        }
         self.sel = sel;
         self.sel_changed = true;
     }
@@ -800,6 +893,16 @@ impl EditorState {
     /// nothing selected, the take shown in the inspector. Says what it did
     /// (for the status line); everything can be undone.
     pub fn delete_selected(&mut self) -> Option<String> {
+        // a selected note goes first (its lane stays selected)
+        if let Some((lane, idx)) = self.note_sel.take() {
+            let mut notes = self.project.tracks.get(lane)?.notes.clone()?;
+            if idx < notes.len() {
+                self.checkpoint();
+                notes.remove(idx);
+                self.set_notes(lane, notes);
+                return Some("Removed a note  ·  Ctrl+Z to undo".into());
+            }
+        }
         let done = match self.sel {
             Selection::Fx(lane, i) => {
                 let fx = self.project.chain(lane).get(i).cloned()?;
@@ -904,6 +1007,7 @@ impl EditorState {
             self.compile_fx(&id);
         }
         self.sync_plugins();
+        self.compile_instruments();
         self.publish_fx();
         self.push_mix();
         self.select(Selection::None);

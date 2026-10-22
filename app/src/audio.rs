@@ -385,6 +385,22 @@ pub fn mix_metered(
             || mix.takes.iter().flatten().any(|k| matches!(k.kind, TakeKind::Section) || k.kind == TakeKind::Lane(ti));
         let flat = mix.gains[ti];
         let lane_gain = |t: f64| if varies { mix.lane_gain_at(ti, t) } else { flat };
+        // A MIDI lane: its instrument plays the notes into the lane buffer.
+        if let Some(rk) = rack.as_deref_mut().filter(|r| r.has_midi(ti)) {
+            rk.render_midi(ti, start as u64, n);
+            for i in 0..n {
+                let g = lane_gain((start + i) as f64 * inv_sr);
+                rk.lane_l[i] *= g;
+                rk.lane_r[i] *= g;
+            }
+            rk.process_lane(ti, n);
+            for i in 0..n {
+                out_l[i] += rk.lane_l[i];
+                out_r[i] += rk.lane_r[i];
+            }
+            meter(meters, ti, peak_of(&rk.lane_l[..n], &rk.lane_r[..n]));
+            continue;
+        }
         match rack.as_deref_mut().filter(|r| r.lane_has_fx(ti)) {
             Some(rk) => {
                 // The lane and its takes, through the lane's effects.
@@ -492,6 +508,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut stems_gen = shared.stems_gen.load(Ordering::Acquire);
     let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
     let mut rack = Box::new(FxRack::empty());
+    let mut was_playing = false;
     cx.audio_output(0, move |info, out| {
         out.zero();
         // A new effects rack: adopt the old one's state, hand the old one back
@@ -526,7 +543,13 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
             None => lanes,
         };
         if !shared.playing() {
+            was_playing = false;
             return;
+        }
+        if !was_playing {
+            // resumed: notes held when it paused are let go
+            rack.midi_jumped();
+            was_playing = true;
         }
         let mut start = shared.pos();
         // A loop: wrap back to its start; the block is cut at its end below.
@@ -590,6 +613,8 @@ pub enum Job {
     Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
     /// Split `lane` into dry voice and echo; the dry voice is the take.
     Dereverb { bundle: PathBuf, take: Take, lane: PathBuf, sr: u32 },
+    /// Claude writes a MIDI part (its role) over a range of grid beats of the song.
+    WriteMidi { bundle: PathBuf, request: String, role: String, sheet: String, bars: crate::midi_writer::Bars, range: (f64, f64) },
     /// Claude writes an effect for a lane (None: the master).
     WriteFx { bundle: PathBuf, lane: Option<usize>, request: String, context: String },
     /// A new part: lego plays it, then it is cleaned and fitted into the gaps.
@@ -635,6 +660,8 @@ pub enum JobUpdate {
     Analyzed { bundle: PathBuf, stems: Vec<(String, String, Stem)> },
     /// A take finished rendering and is decoded at the project rate.
     TakeReady { bundle: PathBuf, take: Take, stem: Stem },
+    /// A MIDI part Claude wrote, checked and snapped to the grid.
+    MidiReady { bundle: PathBuf, name: String, role: String, notes: Vec<poing_model::Note>, request: String, note: String },
     /// An effect Claude wrote and Poing checked, for lane `lane` (None: master).
     FxReady { bundle: PathBuf, lane: Option<usize>, name: String, code: String, request: String, note: String },
 }
@@ -661,6 +688,7 @@ impl Jobs {
                         Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, &up_tx),
                         Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, &up_tx),
                         Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, &up_tx),
+                        Job::WriteMidi { bundle, request, role, sheet, bars, range } => write_midi(&bundle, request, &role, &sheet, bars, range, &up_tx),
                     }
                 }
             })
@@ -1186,6 +1214,27 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
     }
     let _ = std::fs::remove_file(&played);
     finish_take(bundle, take, &cleaned, sr, tx, &fail);
+}
+
+/// Have Claude write a MIDI part, check it, and hand it to the UI.
+fn write_midi(bundle: &Path, request: String, role: &str, sheet: &str, bars: crate::midi_writer::Bars, range: (f64, f64), tx: &Sender<JobUpdate>) {
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Part  ·  {message}"), progress })
+    };
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let work = bundle.join("instruments").join("drafts").join(stamp.to_string());
+    match crate::midi_writer::write_part(&request, role, sheet, bars, range, &work, &progress) {
+        Ok(w) if !w.notes.is_empty() => {
+            let note = if w.problems.is_empty() {
+                format!("{} notes, checked in {} round{}", w.notes.len(), w.rounds, if w.rounds == 1 { "" } else { "s" })
+            } else {
+                format!("{} notes; the check still says: {}", w.notes.len(), w.problems.join("; "))
+            };
+            send(tx, JobUpdate::MidiReady { bundle: bundle.to_path_buf(), name: w.name, role: role.to_string(), notes: w.notes, request, note });
+        }
+        Ok(w) => send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The part could not be made: {}", w.problems.join("; ")) }),
+        Err(e) => send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The part could not be made: {e}") }),
+    }
 }
 
 /// Have Claude write an effect, check it, and hand it to the UI.

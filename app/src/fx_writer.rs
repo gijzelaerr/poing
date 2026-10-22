@@ -82,7 +82,7 @@ pub fn problems(code: &str) -> Vec<String> {
 }
 
 /// Ask Claude Code once (headless, no tools); returns its text answer.
-fn ask(system_file: &Path, prompt: &str, work: &Path) -> Result<String, String> {
+pub(crate) fn ask(system_file: &Path, prompt: &str, work: &Path) -> Result<String, String> {
     let mut cmd = Command::new("claude");
     cmd.args(["-p", "--tools", "", "--no-session-persistence", "--output-format", "text", "--system-prompt-file"])
         .arg(system_file)

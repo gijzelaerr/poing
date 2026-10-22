@@ -1,0 +1,27 @@
+// Poing lead: a pulse wave with slow width movement and a touch of vibrato,
+// through a resonant low-pass: melodies that cut through.
+let cutoff = param(3000, 200, 14000)
+let res = param(0.3, 0, 0.95)
+let vibrato = param(0.15, 0, 1)
+
+var phase = 0.0
+var lfo = 0.0
+var f = Svf{}
+var env = Adsr{}
+
+fn block() {
+    svf_set(f, clamp(cutoff, 60.0, sample_rate * 0.45), 0.5 + res * 6.0)
+}
+
+fn voice() {
+    lfo = advance(lfo, 5.5 / sample_rate)
+    let wobble = 1.0 + sin(TAU * lfo) * vibrato * 0.006
+    let dt = freq * wobble / sample_rate
+    phase = advance(phase, dt)
+    let width = 0.5 + 0.15 * sin(TAU * lfo * 0.13)
+    let amp = adsr(env, 0.01, 0.4, 0.75, 0.15)
+    if gate == 0.0 && amp < 0.0001 {
+        stop()
+    }
+    svf_lp(f, pulse_blep(phase, dt, width)) * amp * (0.35 + 0.65 * velocity) * 0.3
+}

@@ -124,6 +124,32 @@ pub fn plugin_named<'a>(text: &str, plugins: &'a [String]) -> Option<&'a String>
         .map(|(_, p)| p)
 }
 
+/// A MIDI part a Describe asks for (with no lane selected): "add a bassline",
+/// "a drum beat in midi", "chords on keys". The built-in instrument it gets:
+/// bass, keys, lead or drums. None: not a part.
+pub fn midi_part(text: &str) -> Option<&'static str> {
+    let t = text.to_lowercase();
+    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let has = |ws: &[&str]| ws.iter().any(|w| words.iter().any(|x| x.starts_with(w)));
+    let asks = has(&["add", "write", "make", "voeg", "maak", "midi"]);
+    let part = if has(&["drum", "beat", "groove", "percussion", "hihat", "kick", "trommel"]) {
+        Some("drums")
+    } else if has(&["bass"]) {
+        Some("bass")
+    } else if has(&["chord", "pad", "keys", "piano", "organ", "string", "akkoord"]) {
+        Some("keys")
+    } else if has(&["melod", "lead", "hook", "riff", "arp", "counter", "solo"]) {
+        Some("lead")
+    } else {
+        None
+    };
+    match (asks, part) {
+        (true, Some(p)) => Some(p),
+        (true, None) if has(&["midi"]) => Some("lead"),
+        _ => None,
+    }
+}
+
 /// Does a Describe ask for an audio effect?
 pub fn is_effect_text(text: &str) -> bool {
     let t = text.to_lowercase();
@@ -244,6 +270,106 @@ pub struct Track {
     pub solo: Option<bool>,
     /// Effects on this lane, in order (Splash audio shaders).
     pub fx: Option<Vec<Fx>>,
+    /// A MIDI lane: notes played by `instrument` (then `file` is empty).
+    pub notes: Option<Vec<Note>>,
+    /// The instrument of a MIDI lane: a Splash `voice()` shader (`file`) or,
+    /// later, an instrument plugin.
+    pub instrument: Option<Fx>,
+}
+
+/// A note on a MIDI lane, in beats of the song's beat grid.
+#[derive(SerJson, DeJson, Clone, Debug, PartialEq)]
+pub struct Note {
+    pub start: f64,
+    pub len: f64,
+    /// MIDI note number (60 = middle C).
+    pub pitch: u8,
+    /// 0..1
+    pub vel: f64,
+}
+
+impl Track {
+    pub fn is_midi(&self) -> bool {
+        self.notes.is_some()
+    }
+}
+
+/// The song's beats as times (from the analysis), so MIDI notes in beats
+/// follow a played-in tempo: between detected beats it interpolates, past
+/// either end it goes on at the median beat length.
+#[derive(Clone, Debug)]
+pub struct BeatGrid {
+    /// Seconds of beat 0, 1, 2 ...
+    times: Vec<f64>,
+    /// Seconds per beat beyond the detected ones.
+    period: f64,
+    /// Beats per bar (from the downbeats, else 4).
+    pub per_bar: u32,
+    /// The beat a bar starts on (the first downbeat's index).
+    pub bar_offset: f64,
+}
+
+impl BeatGrid {
+    pub fn new(beats: &[f64], downbeats: &[f64], tempo: Option<f64>) -> Self {
+        let mut times: Vec<f64> = beats.iter().copied().filter(|t| t.is_finite()).collect();
+        times.sort_by(|a, b| a.total_cmp(b));
+        times.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        let mut gaps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0.05).collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let period = gaps.get(gaps.len() / 2).copied().or_else(|| tempo.map(|t| 60.0 / t.max(1.0))).unwrap_or(0.5);
+        if times.is_empty() {
+            times.push(0.0);
+        }
+        // beats per bar: beats between consecutive downbeats, most common
+        let index_of = |t: f64| times.iter().position(|b| (b - t).abs() < period * 0.3);
+        let idx: Vec<usize> = downbeats.iter().filter_map(|&d| index_of(d)).collect();
+        let mut counts: Vec<u32> = idx.windows(2).map(|w| (w[1] - w[0]) as u32).filter(|c| (2..=12).contains(c)).collect();
+        counts.sort();
+        let per_bar = counts.get(counts.len() / 2).copied().unwrap_or(4);
+        let bar_offset = idx.first().map(|&i| (i as u32 % per_bar) as f64).unwrap_or(0.0);
+        BeatGrid { times, period, per_bar, bar_offset }
+    }
+
+    /// From a project's analysis (a plain 120 bpm grid without one).
+    pub fn of(p: &Project) -> Self {
+        let a = p.analysis.clone().unwrap_or_default();
+        Self::new(&a.beats.unwrap_or_default(), &a.downbeats.unwrap_or_default(), a.tempo.or(Some(120.0)))
+    }
+
+    pub fn seconds_per_beat(&self) -> f64 {
+        self.period
+    }
+
+    pub fn time_of(&self, beat: f64) -> f64 {
+        let n = self.times.len();
+        if beat <= 0.0 {
+            return self.times[0] + beat * self.period;
+        }
+        let i = beat.floor() as usize;
+        if i + 1 < n {
+            let f = beat - i as f64;
+            self.times[i] + (self.times[i + 1] - self.times[i]) * f
+        } else {
+            self.times[n - 1] + (beat - (n - 1) as f64) * self.period
+        }
+    }
+
+    pub fn beat_at(&self, t: f64) -> f64 {
+        let n = self.times.len();
+        if t <= self.times[0] {
+            return (t - self.times[0]) / self.period;
+        }
+        if t >= self.times[n - 1] {
+            return (n - 1) as f64 + (t - self.times[n - 1]) / self.period;
+        }
+        let i = self.times.partition_point(|b| *b <= t) - 1;
+        i as f64 + (t - self.times[i]) / (self.times[i + 1] - self.times[i])
+    }
+
+    /// Snap a beat position to a grid of `div` steps per beat (4 = 1/16 notes).
+    pub fn snap(beat: f64, div: f64) -> f64 {
+        (beat * div).round() / div
+    }
 }
 
 /// An effect: a Splash audio shader (`effect(l, r)`) in the bundle's `fx/`
@@ -362,6 +488,8 @@ impl Project {
                 mute: None,
                 solo: None,
                 fx: None,
+                notes: None,
+                instrument: None,
             }],
             sample_rate: Some(sample_rate),
             sections: Some(Vec::new()),
@@ -389,7 +517,7 @@ impl Project {
                 continue;
             }
             let name = STEMS.iter().find(|(s, _)| s == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.clone());
-            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None, fx: None });
+            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None });
             added.push(self.tracks.len() - 1);
         }
         if !added.is_empty() {
@@ -535,8 +663,8 @@ mod tests {
             name: "t".into(),
             duration: 2.0,
             tracks: vec![
-                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None, fx: None },
-                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None, fx: None },
+                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None },
+                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None, fx: None, notes: None, instrument: None },
             ],
             sample_rate: Some(48000),
             sections: Some(vec![Section { start: 0.0, end: 2.0, label: "verse".into() }]),
@@ -565,6 +693,36 @@ mod tests {
         assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace(Some("bass".into())));
         assert_eq!(lane_intent("warm rhodes instead", "other"), LaneIntent::Replace(Some("keyboard".into())));
         assert_eq!(lane_intent("make it nicer", "other"), LaneIntent::Replace(None));
+    }
+
+    #[test]
+    fn the_beat_grid_follows_played_beats() {
+        // uneven beats (a live band), downbeats every 4
+        let beats = [1.0, 1.5, 2.02, 2.5, 3.0, 3.48, 4.0, 4.5];
+        let g = BeatGrid::new(&beats, &[1.0, 3.0], None);
+        assert_eq!(g.per_bar, 4);
+        assert!((g.time_of(2.0) - 2.02).abs() < 1e-9, "on a detected beat");
+        assert!((g.time_of(2.5) - 2.26).abs() < 1e-9, "between beats: interpolated");
+        assert!((g.time_of(9.0) - 5.5).abs() < 1e-9, "past the end: median beat length");
+        assert!((g.time_of(-1.0) - 0.5).abs() < 1e-9, "before the first beat");
+        for b in [-1.5, 0.0, 0.3, 2.5, 6.9, 11.25] {
+            assert!((g.beat_at(g.time_of(b)) - b).abs() < 1e-9, "round trip at {b}");
+        }
+        assert_eq!(BeatGrid::snap(2.13, 4.0), 2.25);
+        // no analysis: a plain grid
+        let plain = BeatGrid::new(&[], &[], Some(120.0));
+        assert!((plain.time_of(8.0) - 4.0).abs() < 1e-9 && plain.per_bar == 4);
+    }
+
+    #[test]
+    fn midi_parts_are_read_from_describe() {
+        assert_eq!(midi_part("add a funky bassline"), Some("bass"));
+        assert_eq!(midi_part("add a four on the floor drum beat"), Some("drums"));
+        assert_eq!(midi_part("write warm pad chords under the chorus"), Some("keys"));
+        assert_eq!(midi_part("add a catchy melody"), Some("lead"));
+        assert_eq!(midi_part("make a midi part for the bridge"), Some("lead"));
+        assert_eq!(midi_part("1960s Beatles beat pop, warm tape"), None, "a style is a cover");
+        assert_eq!(midi_part("tape saturation on the whole mix"), None);
     }
 
     #[test]

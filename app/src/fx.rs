@@ -187,6 +187,8 @@ pub const LANE_FRAMES: usize = 1 << 14;
 pub struct FxRack {
     pub lanes: Vec<Vec<FxUnit>>,
     pub master: Vec<FxUnit>,
+    /// MIDI lanes' instruments and notes.
+    pub midi: Vec<crate::synth::MidiLane>,
     pub(crate) lane_l: Vec<f32>,
     pub(crate) lane_r: Vec<f32>,
     tmp_l: Vec<f32>,
@@ -196,11 +198,29 @@ pub struct FxRack {
 impl FxRack {
     pub fn new(lanes: Vec<Vec<FxUnit>>, master: Vec<FxUnit>) -> Self {
         let tmp = aot::MAX_FRAMES as usize;
-        FxRack { lanes, master, lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
+        FxRack { lanes, master, midi: Vec::new(), lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
     }
 
     pub fn empty() -> Self {
         Self::new(Vec::new(), Vec::new())
+    }
+
+    pub fn has_midi(&self, lane: usize) -> bool {
+        self.midi.iter().any(|m| m.track == lane)
+    }
+
+    /// Render MIDI lane lane over [start, start + n) into the lane buffer.
+    pub(crate) fn render_midi(&mut self, lane: usize, start: u64, n: usize) {
+        if let Some(m) = self.midi.iter_mut().find(|m| m.track == lane) {
+            m.render(start, &mut self.lane_l[..n], &mut self.lane_r[..n]);
+        }
+    }
+
+    /// Playback jumped (resumed, seeked): MIDI lanes release what sounds.
+    pub fn midi_jumped(&mut self) {
+        for m in &mut self.midi {
+            m.jumped();
+        }
     }
 
     pub fn lane_has_fx(&self, lane: usize) -> bool {
@@ -264,6 +284,15 @@ pub fn compile_fx(dir: &Path, fx: &Fx) -> Result<aot::AudioShaderRef, String> {
     let path = dir.join(&fx.file);
     let code = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     compile_source(&code)
+}
+
+/// Compile an instrument (oice()) for a MIDI lane.
+pub fn compile_instrument(code: &str) -> Result<aot::AudioShaderRef, String> {
+    let shader = aot::compile(code).map_err(|errors| errors.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join("; "))?;
+    if shader.kind() != aot::Kind::Instrument {
+        return Err("this shader is an effect (effect(l, r)); a MIDI lane plays an instrument with voice()".into());
+    }
+    Ok(shader)
 }
 
 pub fn compile_source(code: &str) -> Result<aot::AudioShaderRef, String> {

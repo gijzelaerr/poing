@@ -33,6 +33,43 @@ fn main() {
         let shown = plugin.format_parameter(p.id, p.value).unwrap_or_default();
         println!("  {:>10}  {:<28} {:.3}  ({shown})", p.id, p.name, p.value);
     }
+    if std::env::args().any(|a| a == "--instrument") {
+        // An instrument, as Poing will run it: the Plugin itself moved to another
+        // thread, a note sent at a sample offset, processed, released.
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&plugin);
+        println!("buses: {} in, {} out; category {}", info.audio_inputs, info.audio_outputs, info.category);
+        use vst3_host::audio::{BusDirection, MediaType};
+        println!("event input active: {:?}", plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true));
+        plugin.start_processing().expect("start");
+        let worker = std::thread::spawn(move || {
+            use vst3_host::midi::{MidiChannel, MidiEvent};
+            let ins = info.audio_inputs.max(0) as usize * 2;
+            let mut buffers = AudioBuffers::new(ins.min(2), 2, 1024, 48_000.0);
+            let mut level = |plugin: &mut vst3_host::Plugin, blocks: usize| {
+                let mut peak = 0.0f32;
+                for _ in 0..blocks {
+                    plugin.process_audio(&mut buffers).expect("process");
+                    peak = buffers.outputs.iter().flatten().fold(peak, |p, x| p.max(x.abs()));
+                }
+                peak
+            };
+            let mut plugin = plugin;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = plugin.set_playing(true);
+            let before = level(&mut plugin, 100);
+            plugin.send_midi_event_at(MidiEvent::NoteOn { channel: MidiChannel::Ch1, note: 57, velocity: 100 }, 300).expect("note on");
+            let during = level(&mut plugin, 150);
+            plugin.send_midi_event_at(MidiEvent::NoteOff { channel: MidiChannel::Ch1, note: 57, velocity: 0 }, 0).expect("note off");
+            let release = level(&mut plugin, 10);
+            let after = level(&mut plugin, 94);
+            println!("peak before {before:.4}, holding A3 {during:.4}, release {release:.4}, 2 s later {after:.4}");
+            plugin
+        });
+        let mut plugin = worker.join().expect("worker panicked");
+        plugin.stop_processing().ok();
+        return;
+    }
     if std::env::args().any(|a| a == "--thread") {
         // As Poing runs it: a runner made here, processed on another thread.
         let (mut runner, mut control) = vst3_host::realtime::RealtimePluginRunner::new(plugin, 512);

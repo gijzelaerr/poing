@@ -110,6 +110,10 @@ enum Drag {
     MoveRegion { region: usize, grab: f64 },
     ResizeRegion { region: usize, left: bool },
     SectionEdge { index: usize },
+    /// Moving a note: where in it it was grabbed (beats).
+    NoteMove { lane: usize, idx: usize, grab: f64 },
+    /// Changing a note's length by its right edge.
+    NoteSize { lane: usize, idx: usize },
     /// Dragging a lane's dB value sideways sets its level.
     Gain { lane: usize, x0: f64, g0: f64 },
 }
@@ -146,6 +150,12 @@ pub struct DawTimeline {
     /// Take chips as drawn: (rect, take id; None is the original).
     #[rust]
     chips: Vec<(Rect, Option<String>)>,
+    /// Where each lane starts (and the last one ends): lanes differ in height.
+    #[rust]
+    tops: Vec<f64>,
+    /// MIDI lanes' pitch ranges as drawn: (lane, lowest, highest).
+    #[rust]
+    midi_view: Vec<(usize, u8, u8)>,
     /// Effect chips as drawn: (rect, lane or master, index in its chain).
     #[rust]
     fx_chips: Vec<(Rect, Option<usize>, usize)>,
@@ -238,14 +248,20 @@ impl DawTimeline {
         (b > a).then_some((a, b - a))
     }
     fn lane_y(&self, i: usize) -> f64 {
-        self.geo.lanes_y + i as f64 * self.geo.lane_h
+        self.tops.get(i).copied().unwrap_or(self.geo.lanes_y + i as f64 * self.geo.lane_h)
+    }
+    /// Height of lane i (an open MIDI lane is taller: its piano roll).
+    fn lane_hh(&self, i: usize) -> f64 {
+        match (self.tops.get(i), self.tops.get(i + 1)) {
+            (Some(a), Some(b)) => b - a,
+            _ => self.geo.lane_h,
+        }
     }
     fn lane_at(&self, y: f64) -> Option<usize> {
         if y < self.geo.lanes_y {
             return None;
         }
-        let i = ((y - self.geo.lanes_y) / self.geo.lane_h) as usize;
-        (i < self.geo.n).then_some(i)
+        (0..self.geo.n).find(|&i| y >= self.lane_y(i) && y < self.lane_y(i) + self.lane_hh(i))
     }
     fn in_ruler(&self, y: f64) -> bool {
         y >= self.geo.rect.pos.y && y < self.geo.sect_y
@@ -385,6 +401,106 @@ impl DawTimeline {
         }
     }
 
+    /// A MIDI lane's notes on pitch rows; open (tall) it is a piano roll with
+    /// row shading, C labels and beat lines.
+    fn draw_notes(&mut self, cx: &mut Cx2d, st: &EditorState, lane: usize, ly: f64, lh: f64, col: Vec4f) {
+        let notes = st.project.tracks[lane].notes.clone().unwrap_or_default();
+        let grid = poing_model::BeatGrid::of(&st.project);
+        let open = lh > 200.0;
+        let (mut lo, mut hi) = notes.iter().fold((127u8, 0u8), |(a, b), n| (a.min(n.pitch), b.max(n.pitch)));
+        if notes.is_empty() {
+            (lo, hi) = (48, 72);
+        }
+        let want = if open { 24 } else { 12 };
+        let span = (hi as i32 - lo as i32 + 4).max(want);
+        let mid = (lo as i32 + hi as i32) / 2;
+        let lo = (mid - span / 2).clamp(0, 127 - span) as u8;
+        let hi = (lo as i32 + span).min(127) as u8;
+        self.midi_view.retain(|(l, _, _)| *l != lane);
+        self.midi_view.push((lane, lo, hi));
+        let (x0, w) = (self.geo.x0, self.geo.w);
+        let top = ly + 4.0;
+        let rh = (lh - 8.0) / (hi - lo + 1) as f64;
+        if open {
+            for p in lo..=hi {
+                let y = top + (hi - p) as f64 * rh;
+                if [1, 3, 6, 8, 10].contains(&(p % 12)) {
+                    self.rect(cx, x0, y, w, rh, rgba(0x000000, 0.18));
+                }
+                if p % 12 == 0 && rh >= 7.0 {
+                    self.rect(cx, x0, y + rh - 1.0, w, 1.0, rgba(HAIRLINE, 1.0));
+                    self.text(cx, x0 + 3.0, y + rh - 12.0, rgba(TEXT_2, 0.8), &format!("C{}", p as i32 / 12 - 1));
+                }
+            }
+            // beat lines, bars stronger
+            let (b0, b1) = (grid.beat_at(st.scroll_t).floor() as i64, grid.beat_at(st.scroll_t + w / st.pps).ceil() as i64);
+            if (b1 - b0) as f64 * 4.0 < w {
+                for b in b0..=b1 {
+                    let x = self.x_of(st, grid.time_of(b as f64));
+                    if x >= x0 && x <= x0 + w {
+                        let bar = (b as f64 - grid.bar_offset).rem_euclid(grid.per_bar as f64) == 0.0;
+                        self.rect(cx, x, top, 1.0, lh - 8.0, rgba(if bar { 0x3a3f49 } else { 0x23262d }, 1.0));
+                    }
+                }
+            }
+        }
+        let sel = st.note_sel.filter(|(l, _)| *l == lane).map(|(_, i)| i);
+        for (k, n) in notes.iter().enumerate() {
+            let (a, b) = (self.x_of(st, grid.time_of(n.start)), self.x_of(st, grid.time_of(n.start + n.len)));
+            if b < x0 || a > x0 + w || n.pitch < lo || n.pitch > hi {
+                continue;
+            }
+            let (a, b) = (a.max(x0), b.min(x0 + w));
+            let y = top + (hi - n.pitch) as f64 * rh;
+            let r = Rect { pos: dvec2(a, y + 0.5), size: dvec2((b - a - 1.0).max(2.0), (rh - 1.0).max(2.0)) };
+            let shown = vec4(col.x, col.y, col.z, col.w * (0.55 + 0.45 * n.vel as f32));
+            if sel == Some(k) {
+                self.shape_bordered(cx, r, 2.0, shown, shade(shown, 0.85), rgba(0xffffff, 1.0), 1.5);
+            } else {
+                self.shape(cx, r, 2.0, shown, shade(shown, 0.85));
+            }
+        }
+    }
+
+    /// The pitch row under y in MIDI lane lane.
+    fn pitch_at(&self, lane: usize, y: f64) -> u8 {
+        let Some(&(_, lo, hi)) = self.midi_view.iter().find(|(l, _, _)| *l == lane) else { return 60 };
+        let (top, lh) = (self.lane_y(lane) + 4.0, self.lane_hh(lane) - LANE_GAP - 8.0);
+        let rh = lh / (hi - lo + 1) as f64;
+        let row = ((y - top) / rh).floor().clamp(0.0, (hi - lo) as f64) as u8;
+        hi - row
+    }
+
+    /// A press on a MIDI lane: grab a note (its body moves it, its right edge
+    /// sizes it) or draw a new one on the 1/16 grid.
+    fn note_down(&mut self, st: &mut EditorState, lane: usize, x: f64, y: f64) {
+        let grid = poing_model::BeatGrid::of(&st.project);
+        let beat = grid.beat_at(self.t_of(st, x));
+        let pitch = self.pitch_at(lane, y);
+        let notes = st.project.tracks[lane].notes.clone().unwrap_or_default();
+        let hit = notes.iter().enumerate().rev().find(|(_, n)| {
+            let (a, b) = (self.x_of(st, grid.time_of(n.start)), self.x_of(st, grid.time_of(n.start + n.len)));
+            n.pitch == pitch && x >= a - 2.0 && x <= b + 2.0
+        });
+        st.checkpoint();
+        st.select(Selection::Track(lane));
+        match hit {
+            Some((idx, n)) => {
+                let right = self.x_of(st, grid.time_of(n.start + n.len));
+                st.note_sel = Some((lane, idx));
+                self.drag = if x > right - EDGE_PX { Drag::NoteSize { lane, idx } } else { Drag::NoteMove { lane, idx, grab: beat - n.start } };
+            }
+            None => {
+                let n = poing_model::Note { start: ((beat * 4.0).floor() / 4.0).max(0.0), len: st.note_len, pitch, vel: 0.8 };
+                let notes = st.project.tracks[lane].notes.get_or_insert_with(Vec::new);
+                notes.push(n);
+                let idx = notes.len() - 1;
+                st.note_sel = Some((lane, idx));
+                self.drag = Drag::NoteSize { lane, idx };
+            }
+        }
+    }
+
     /// A row of effect chips from (x, y); the chain's own "+" is not drawn
     /// (effects are added by Describe).
     fn fx_chips_row(&mut self, cx: &mut Cx2d, st: &EditorState, lane: Option<usize>, x: f64, y: f64, max_x: f64) {
@@ -437,7 +553,24 @@ impl DawTimeline {
                 .collect()
         };
         let avail = rect.size.y - (lanes_y - rect.pos.y) - MASTER_H - GAP;
-        let lane_h = (avail / (n + layers.len()).max(1) as f64).clamp(44.0, 150.0);
+        let count = (n + layers.len()).max(1) as f64;
+        // A selected MIDI lane opens into a piano roll; the others share the rest.
+        let open = match st.sel {
+            Selection::Track(i) if i < n && st.project.tracks[i].is_midi() => Some(i),
+            _ => None,
+        };
+        let open_h = (avail * 0.55).clamp(220.0, 420.0);
+        let lane_h = match open {
+            Some(_) if count > 1.0 => ((avail - open_h) / (count - 1.0)).clamp(36.0, 150.0),
+            _ => (avail / count).clamp(44.0, 150.0),
+        };
+        self.tops.clear();
+        let mut y = lanes_y;
+        for i in 0..(n + layers.len()) {
+            self.tops.push(y);
+            y += if open == Some(i) { open_h } else { lane_h };
+        }
+        self.tops.push(y);
         let master_y = rect.pos.y + rect.size.y - MASTER_H;
         self.geo = Geo {
             rect,
@@ -609,7 +742,7 @@ impl DawTimeline {
             let tr = st.project.tracks[i].clone();
             let col = rgba(track_color(&tr.id, &tr.name, i), 1.0);
             let audible = gains[i] > 0.0;
-            let lh = lane_h - LANE_GAP;
+            let lh = self.lane_hh(i) - LANE_GAP;
             let selected = st.sel == Selection::Track(i);
             self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(rect.size.x - 12.0, lh) }, 8.0, rgba(CARD, 1.0), rgba(0x14161a, 1.0));
             let head = Rect { pos: dvec2(left + 6.0, ly), size: dvec2(HEADER_W - 12.0, lh) };
@@ -636,7 +769,11 @@ impl DawTimeline {
             if lh >= 66.0 {
                 self.fx_chips_row(cx, st, Some(i), left + 16.0, ly + lh - 20.0, left + HEADER_W - 10.0);
             }
-            self.wave(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.25) });
+            if tr.is_midi() {
+                self.draw_notes(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.3) });
+            } else {
+                self.wave(cx, st, i, ly, lh, if audible { col } else { vec4(col.x, col.y, col.z, 0.25) });
+            }
             // A lane take that is on: its own audio over its range, on the lane's scale.
             let lane_peak = st.stems.get(i).map_or(1.0, |s| s.peak_abs);
             let takes_here: Vec<(usize, f64, f64)> = st
@@ -658,7 +795,7 @@ impl DawTimeline {
         // layers: one lane each, at their blend
         for (j, (stem, t)) in layers.iter().enumerate() {
             let ly = self.lane_y(n + j);
-            let lh = lane_h - LANE_GAP;
+            let lh = self.lane_hh(n + j) - LANE_GAP;
             self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(rect.size.x - 12.0, lh) }, 8.0, rgba(0x14202d, 1.0), rgba(0x121a24, 1.0));
             self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(HEADER_W - 12.0, lh) }, 8.0, rgba(0x18263a, 1.0), rgba(0x15202f, 1.0));
             let what = t.track.as_deref().unwrap_or("layer");
@@ -670,7 +807,7 @@ impl DawTimeline {
 
         // lyrics along the bottom of the vocals lane
         if let Some(v) = st.project.track_index("vocals").filter(|&v| song_take.is_none() && v < n) {
-            let y = self.lane_y(v) + lane_h - LANE_GAP - 17.0;
+            let y = self.lane_y(v) + self.lane_hh(v) - LANE_GAP - 17.0;
             let mut right = f64::MIN;
             for l in &lyrics {
                 let x = self.x_of(st, l.start).max(x0);
@@ -693,7 +830,7 @@ impl DawTimeline {
             let ly = self.lane_y(lane);
             if let Some((x, rw)) = self.span(st, r.start, r.end) {
                 let c = rgba(region_color(&r.kind), 1.0);
-                let body = Rect { pos: dvec2(x, ly + 3.0), size: dvec2(rw, lane_h - LANE_GAP - 6.0) };
+                let body = Rect { pos: dvec2(x, ly + 3.0), size: dvec2(rw, self.lane_hh(lane) - LANE_GAP - 6.0) };
                 let sel = st.sel == Selection::Region(ri);
                 let border = if sel { rgba(0xffffff, 0.95) } else { vec4(c.x, c.y, c.z, 0.7) };
                 self.shape_bordered(cx, body, 6.0, vec4(c.x, c.y, c.z, 0.16), vec4(c.x, c.y, c.z, 0.10), border, if sel { 1.5 } else { 1.0 });
@@ -717,8 +854,8 @@ impl DawTimeline {
             .collect();
         for t in replacing.iter().filter(|_| n > 0) {
             let (y, h) = match t.track.as_deref().and_then(|id| st.project.track_index(id)).filter(|_| t.scope == "lane") {
-                Some(lane) => (self.lane_y(lane), lane_h - LANE_GAP),
-                None => (lanes_y, lane_h * n as f64 - LANE_GAP),
+                Some(lane) => (self.lane_y(lane), self.lane_hh(lane) - LANE_GAP),
+                None => (lanes_y, self.lane_y(n) - lanes_y - LANE_GAP),
             };
             if let Some((x, tw)) = self.span(st, t.start, t.end) {
                 let r = Rect { pos: dvec2(x, y), size: dvec2(tw, h) };
@@ -840,6 +977,8 @@ impl Widget for DawTimeline {
                         st.seek(self.t_of(st, x));
                         self.drag = Drag::Seek;
                     }
+                } else if let Some(lane) = self.lane_at(y).filter(|&l| in_wave && st.project.tracks[l].is_midi()) {
+                    self.note_down(st, lane, x, y);
                 } else if let Some(lane) = self.lane_at(y) {
                     if !in_wave {
                         if self.gain_box(lane).contains(fe.abs) {
@@ -925,6 +1064,25 @@ impl Widget for DawTimeline {
                         st.push_mix();
                         st.sel_changed = true;
                     }
+                    Drag::NoteMove { lane, idx, grab } => {
+                        let grid = poing_model::BeatGrid::of(&st.project);
+                        let beat = grid.beat_at(t);
+                        let pitch = self.pitch_at(lane, fe.abs.y);
+                        if let Some(n) = st.project.tracks[lane].notes.as_mut().and_then(|v| v.get_mut(idx)) {
+                            n.start = poing_model::BeatGrid::snap(beat - grab, 4.0).max(0.0);
+                            n.pitch = pitch;
+                        }
+                        st.dirty = true;
+                    }
+                    Drag::NoteSize { lane, idx } => {
+                        let grid = poing_model::BeatGrid::of(&st.project);
+                        let beat = grid.beat_at(t);
+                        if let Some(n) = st.project.tracks[lane].notes.as_mut().and_then(|v| v.get_mut(idx)) {
+                            n.len = (poing_model::BeatGrid::snap(beat, 4.0) - n.start).max(0.25);
+                            st.note_len = n.len;
+                        }
+                        st.dirty = true;
+                    }
                     Drag::SectionEdge { index } => {
                         let secs = st.project.sections_mut();
                         let t = t.clamp(secs[index - 1].start + 0.5, secs[index].end - 0.5);
@@ -944,6 +1102,11 @@ impl Widget for DawTimeline {
                         st.select(Selection::Track(track));
                     }
                     Drag::NewRegion { .. } => st.sel_changed = true,
+                    // a note edit is heard from the next rack (built once, on release)
+                    Drag::NoteMove { lane, .. } | Drag::NoteSize { lane, .. } => {
+                        let notes = st.project.tracks[lane].notes.clone().unwrap_or_default();
+                        st.set_notes(lane, notes);
+                    }
                     _ => {}
                 }
                 self.drag = Drag::None;

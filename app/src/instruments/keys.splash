@@ -1,0 +1,37 @@
+// Poing keys: two slightly detuned saws per side, a soft low-pass that opens
+// with velocity, a gentle swell: chords and pads.
+let brightness = param(2400, 300, 12000)
+let attack = param(0.02, 0.001, 2)
+let release = param(0.6, 0.02, 4)
+let detune = param(0.12, 0, 0.5)
+
+var p1 = 0.0
+var p2 = 0.0
+var p3 = 0.0
+var p4 = 0.0
+var fl = Svf{}
+var fr = Svf{}
+var env = Adsr{}
+
+fn block() {
+    let fc = clamp(brightness * (0.5 + velocity), 80.0, sample_rate * 0.45)
+    svf_set(fl, fc, 0.7)
+    svf_set(fr, fc, 0.7)
+}
+
+fn voice() {
+    let dt = freq / sample_rate
+    let cents = detune * 0.01
+    p1 = advance(p1, dt * (1.0 + cents))
+    p2 = advance(p2, dt * (1.0 - cents))
+    p3 = advance(p3, dt * (1.0 + cents * 0.6))
+    p4 = advance(p4, dt * (1.0 - cents * 0.4))
+    let l = saw_blep(p1, dt) + saw_blep(p3, dt)
+    let r = saw_blep(p2, dt) + saw_blep(p4, dt)
+    let amp = adsr(env, attack, 0.8, 0.7, release)
+    if gate == 0.0 && amp < 0.0001 {
+        stop()
+    }
+    let g = amp * (0.3 + 0.7 * velocity) * 0.12
+    vec2(svf_lp(fl, l) * g, svf_lp(fr, r) * g)
+}

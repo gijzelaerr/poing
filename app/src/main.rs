@@ -11,6 +11,8 @@ mod audio;
 mod fx;
 mod fx_writer;
 mod plugins;
+mod synth;
+mod midi_writer;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
@@ -439,6 +441,10 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
             return result;
         }
     }
+    // A MIDI part ("add a funky bassline"), over the selected section or the song
+    if let (Some(role), Selection::None | Selection::Section(_)) = (model::midi_part(text), st.sel) {
+        return write_midi(st, jobs, bundle, role, text);
+    }
     // An effect on the whole mix ("... on the master")
     if is_master_effect_text(text) && !matches!(st.sel, Selection::Track(_) | Selection::Region(_)) {
         return write_effect(st, jobs, bundle, None, text);
@@ -554,6 +560,26 @@ fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Op
         }
         Err(e) => format!("{name} could not be added: {e}"),
     })
+}
+
+/// Claude writes a MIDI part for the selected section (or the whole song).
+fn write_midi(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, role: &str, text: &str) -> String {
+    let bars = midi_writer::Bars::of(&st.project);
+    let grid = model::BeatGrid::of(&st.project);
+    let (range, place) = match st.sel {
+        Selection::Section(i) => {
+            let s = st.project.sections()[i].clone();
+            ((grid.beat_at(s.start).round(), grid.beat_at(s.end).round()), format!("the {}", s.label))
+        }
+        _ => ((bars.first_beat, grid.beat_at(st.project.duration).floor()), "the whole song".to_string()),
+    };
+    let sheet = midi_writer::song_sheet(&st.project, bars);
+    let job = Job::WriteMidi { bundle, request: text.to_string(), role: role.to_string(), sheet, bars, range };
+    if !jobs.submit(job) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some(("Part".into(), 0.0));
+    format!("Claude is writing a {role} part for {place} from the song's key, chords and sections (under a minute)...")
 }
 
 /// Claude writes an effect for a lane (or the master, `None`) from `text`.
@@ -792,6 +818,11 @@ impl App {
             project.takes_mut().retain(|t| dir.join(&t.file).exists());
             let mut stems: Vec<Stem> = Vec::new();
             for i in 0..project.tracks.len() {
+                // a MIDI lane has no audio of its own: a silent placeholder
+                if project.tracks[i].is_midi() {
+                    stems.push(Stem::new(Vec::new(), Vec::new()));
+                    continue;
+                }
                 stems.push(audio::load_stem(&project.track_path(&path, i), project.sr())?);
             }
             for t in project.takes() {
@@ -989,10 +1020,22 @@ impl App {
                 }
                 JobUpdate::Progress { bundle, message, progress } => {
                     let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
-                    let what = if message.starts_with("Take") || message.starts_with("Effect") { "" } else { "Analysing  ·  " };
+                    let what = if message.starts_with("Take") || message.starts_with("Effect") || message.starts_with("Part") { "" } else { "Analysing  ·  " };
                     let line = format!("{what}{message}  {:.0}%", progress * 100.0);
                     st.analysing = Some((message, progress));
                     line
+                }
+                JobUpdate::MidiReady { bundle, name, role, notes, request, note } => {
+                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    st.analysing = None;
+                    let code = synth::BUILTIN.iter().find(|(r, _, _)| *r == role).map(|(_, _, c)| *c).unwrap_or(synth::BUILTIN[2].2);
+                    match st.add_midi_track(&name, code, notes, Some(request)) {
+                        Ok(lane) => {
+                            st.select(Selection::Track(lane));
+                            format!("{name} is a new MIDI lane ({note}), played by Poing's {role}. Click a note to move it, drag its end to lengthen, Delete removes it.")
+                        }
+                        Err(e) => format!("{name} could not be added: {e}"),
+                    }
                 }
                 JobUpdate::FxReady { bundle, lane, name, code, request, note } => {
                     let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };

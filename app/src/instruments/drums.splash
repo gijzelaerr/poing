@@ -1,0 +1,56 @@
+// Poing drums (General MIDI notes): 35/36 kick, 38/40 snare, 39 clap,
+// 42/44 closed hat, 46 open hat, 49/57 crash, 41-50 toms. One shot each.
+let tone = param(1.0, 0.5, 2)
+let decay_scale = param(1.0, 0.3, 3)
+
+var t = 0.0
+var ph = 0.0
+var level = 0.0
+var hp = Svf{}
+var bp = Svf{}
+var dc = DcBlock{}
+
+fn block() {
+    svf_set(hp, 7000.0 * tone, 0.8)
+    svf_set(bp, 1800.0 * tone, 1.2)
+}
+
+fn voice() {
+    if trigger {
+        t = 0.0
+        ph = 0.0
+    }
+    t = t + 1.0 / sample_rate
+    let n = note
+    let noise = rand()
+    let y = if n < 37.0 {
+        // kick: a sine falling from ~150 Hz to 50 Hz, with a click
+        let f0 = 50.0 + 100.0 * exp(-t * 30.0)
+        ph = advance(ph, f0 / sample_rate)
+        sin(TAU * ph) * exp(-t * 7.0 / decay_scale) + noise * exp(-t * 400.0) * 0.2
+    } elif n == 39.0 {
+        // clap: bursts of band-passed noise
+        let bursts = if t < 0.03 { 1.0 - fract(t * 100.0) } else { exp(-(t - 0.03) * 25.0 / decay_scale) }
+        svf_bp(bp, noise) * bursts * 1.8
+    } elif n < 41.0 {
+        // snare: a tone and noise
+        ph = advance(ph, 190.0 * tone / sample_rate)
+        sin(TAU * ph) * exp(-t * 25.0) * 0.5 + svf_hp(hp, noise) * exp(-t * 14.0 / decay_scale) * 0.6
+    } elif n == 42.0 || n == 44.0 {
+        svf_hp(hp, noise) * exp(-t * 60.0 / decay_scale) * 0.35
+    } elif n == 46.0 {
+        svf_hp(hp, noise) * exp(-t * 9.0 / decay_scale) * 0.3
+    } elif n == 49.0 || n == 57.0 || n == 52.0 {
+        svf_hp(hp, noise) * exp(-t * 2.5 / decay_scale) * 0.3
+    } else {
+        // toms: a falling tone pitched by the note
+        let f0 = 70.0 + (n - 41.0) * 12.0 + 40.0 * exp(-t * 20.0)
+        ph = advance(ph, f0 / sample_rate)
+        sin(TAU * ph) * exp(-t * 9.0 / decay_scale) * 0.8
+    }
+    level = abs(y)
+    if t > 0.05 && t * 3.0 > decay_scale * 8.0 {
+        stop()
+    }
+    dc_block(dc, y) * (0.35 + 0.65 * velocity) * 0.6
+}

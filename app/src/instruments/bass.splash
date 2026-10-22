@@ -1,0 +1,35 @@
+// Poing bass: a band-limited saw and a little sub, through a low-pass with
+// a short filter envelope (plucky at the start of each note).
+let cutoff = param(500, 60, 6000)
+let res = param(0.35, 0, 0.95)
+let env_amt = param(1800, 0, 8000)
+let decay = param(0.22, 0.02, 2)
+let sub = param(0.5, 0, 1)
+
+var phase = 0.0
+var sub_phase = 0.0
+var f = Svf{}
+var env = Adsr{}
+var fenv = 0.0
+var fall = 0.0
+
+fn block() {
+    svf_set(f, clamp(cutoff + env_amt * fenv, 30.0, sample_rate * 0.45), 0.5 + res * 4.0)
+    fall = exp(-1.0 / (decay * sample_rate))
+}
+
+fn voice() {
+    if trigger {
+        fenv = 1.0
+    }
+    let dt = freq / sample_rate
+    phase = advance(phase, dt)
+    sub_phase = advance(sub_phase, dt * 0.5)
+    let osc = saw_blep(phase, dt) * 0.7 + sin(TAU * sub_phase) * sub
+    fenv = fenv * fall
+    let amp = adsr(env, 0.003, 0.3, 0.8, 0.08)
+    if gate == 0.0 && amp < 0.0001 {
+        stop()
+    }
+    svf_lp(f, osc) * amp * (0.35 + 0.65 * velocity) * 0.45
+}
