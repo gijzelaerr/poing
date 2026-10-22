@@ -10,3 +10,4 @@ poing-model.workspace = true
 makepad-widgets.workspace = true
 makepad-audio-decode.workspace = true
 makepad-micro-serde.workspace = true
+makepad-script-audio-aot.workspace = true

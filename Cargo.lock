@@ -448,12 +448,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-script-audio-aot"
+version = "1.0.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-relax-api",
+ "makepad-script-compute",
+]
+
+[[package]]
 name = "makepad-script-census"
 version = "1.0.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
 dependencies = [
  "makepad-relax-api",
  "makepad-script",
+]
+
+[[package]]
+name = "makepad-script-compute"
+version = "1.0.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-relax-api",
+ "relax-backend",
+ "relax-session",
 ]
 
 [[package]]
@@ -765,6 +784,7 @@ version = "0.1.0"
 dependencies = [
  "makepad-audio-decode",
  "makepad-micro-serde",
+ "makepad-script-audio-aot",
  "makepad-widgets",
  "poing-model",
 ]
@@ -785,6 +805,19 @@ dependencies = [
  "memchr",
  "unicase",
 ]
+
+[[package]]
+name = "relax-backend"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "relax-session",
+]
+
+[[package]]
+name = "relax-session"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
 
 [[package]]
 name = "rustybuzz"
