@@ -2,6 +2,7 @@
 //! mixer (shared by live playback and the offline render) and the job worker.
 use makepad_micro_serde::*;
 
+use crate::fx::{FxRack, LANE_FRAMES};
 use crate::model::{Project, Take};
 use makepad_widgets::*;
 use std::path::{Path, PathBuf};
@@ -266,14 +267,55 @@ impl MixTake {
     }
 }
 
-/// Mix frames [start, start + out_l.len()) of all stems into out_l / out_r
-/// (overwrites). Resampling to the device rate is the caller's business.
-pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out_l: &mut [f32], out_r: &mut [f32]) {
-    out_l.iter_mut().for_each(|x| *x = 0.0);
-    out_r.iter_mut().for_each(|x| *x = 0.0);
+/// Gain of take `k` at t, following the lane it belongs to.
+#[inline]
+fn take_gain(mix: &MixParams, k: &MixTake, t: f64) -> f32 {
+    match k.kind {
+        TakeKind::Section => k.weight(t),
+        // A lane take or a lane's layer follows its lane's level, mute and solo.
+        TakeKind::Lane(lane) | TakeKind::Layer(Some(lane)) => k.blend * k.weight(t) * mix.gain_at(lane, t),
+        TakeKind::Layer(None) => k.blend * k.weight(t),
+        TakeKind::Song => 1.0,
+    }
+}
+
+/// The lane a take plays on, if it belongs to one.
+fn take_lane(k: &MixTake) -> Option<usize> {
+    match k.kind {
+        TakeKind::Lane(lane) | TakeKind::Layer(Some(lane)) => Some(lane),
+        _ => None,
+    }
+}
+
+/// Mix frames [start, start + out_l.len()) into out_l / out_r (overwrites):
+/// each lane with its lane takes and layers, through the lane's effects, then
+/// the master effects. Section takes join after the lane effects (they stand
+/// in for the whole mix). Resampling to the device rate is the caller's business.
+pub fn mix_into(
+    stems: &[Arc<Stem>],
+    mix: &MixParams,
+    sr: u32,
+    start: usize,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+    mut rack: Option<&mut FxRack>,
+) {
+    let n = out_l.len().min(out_r.len());
+    if n > LANE_FRAMES && rack.is_some() {
+        // in blocks the lane buffers hold
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(LANE_FRAMES);
+            mix_into(stems, mix, sr, start + done, &mut out_l[done..done + k], &mut out_r[done..done + k], rack.as_deref_mut());
+            done += k;
+        }
+        return;
+    }
+    out_l[..n].fill(0.0);
+    out_r[..n].fill(0.0);
     let inv_sr = 1.0 / sr as f64;
     let t0 = start as f64 * inv_sr;
-    let t1 = (start + out_l.len()) as f64 * inv_sr;
+    let t1 = (start + n) as f64 * inv_sr;
     let add = |out_l: &mut [f32], out_r: &mut [f32], s: &Stem, offset: usize, gain: &dyn Fn(f64) -> f32| {
         for i in 0..out_l.len() {
             let f = start + i;
@@ -285,10 +327,14 @@ pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out
             out_r[i] += s.r[f - offset] * g;
         }
     };
-    // A song take is the whole song: only it plays.
+    let offset_of = |k: &MixTake| (k.start.max(0.0) * sr as f64) as usize;
+    // A song take is the whole song: only it plays (through the master).
     if let Some(k) = mix.song_take() {
         if let Some(s) = stems.get(k.stem) {
-            add(out_l, out_r, s, 0, &|_| 1.0);
+            add(&mut out_l[..n], &mut out_r[..n], s, 0, &|_| 1.0);
+        }
+        if let Some(rack) = rack {
+            rack.process_master(&mut out_l[..n], &mut out_r[..n]);
         }
         return;
     }
@@ -299,24 +345,40 @@ pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out
         }
         let varies = mix.regions.iter().any(|r| r.track == ti)
             || mix.takes.iter().flatten().any(|k| matches!(k.kind, TakeKind::Section) || k.kind == TakeKind::Lane(ti));
-        if varies {
-            add(out_l, out_r, s, 0, &|t| mix.lane_gain_at(ti, t));
-        } else {
-            let flat = mix.gains[ti];
-            add(out_l, out_r, s, 0, &|_| flat);
+        let flat = mix.gains[ti];
+        let lane_gain = |t: f64| if varies { mix.lane_gain_at(ti, t) } else { flat };
+        match rack.as_deref_mut().filter(|r| r.lane_has_fx(ti)) {
+            Some(rk) => {
+                // The lane and its takes, through the lane's effects.
+                let (ll, lr) = (&mut rk.lane_l[..n], &mut rk.lane_r[..n]);
+                ll.fill(0.0);
+                lr.fill(0.0);
+                add(ll, lr, s, 0, &lane_gain);
+                for k in mix.takes.iter().flatten().filter(|k| take_lane(k) == Some(ti) && k.touches(t0, t1)) {
+                    if let Some(ts) = stems.get(k.stem) {
+                        add(ll, lr, ts, offset_of(k), &|t| take_gain(mix, k, t));
+                    }
+                }
+                rk.process_lane(ti, n);
+                for i in 0..n {
+                    out_l[i] += rk.lane_l[i];
+                    out_r[i] += rk.lane_r[i];
+                }
+            }
+            None => add(&mut out_l[..n], &mut out_r[..n], s, 0, &lane_gain),
         }
     }
-    for k in mix.takes.iter().flatten().filter(|k| k.touches(t0, t1)) {
-        let Some(s) = stems.get(k.stem) else { continue };
-        let offset = (k.start.max(0.0) * sr as f64) as usize;
-        match k.kind {
-            TakeKind::Section => add(out_l, out_r, s, offset, &|t| k.weight(t)),
-            // A lane take follows its lane's level, mute and solo.
-            TakeKind::Lane(lane) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t) * mix.gain_at(lane, t)),
-            TakeKind::Layer(None) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t)),
-            TakeKind::Layer(Some(lane)) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t) * mix.gain_at(lane, t)),
-            TakeKind::Song => {}
+    let routed = |k: &MixTake| take_lane(k).is_some_and(|lane| rack.as_ref().is_some_and(|r| r.lane_has_fx(lane)));
+    for k in mix.takes.iter().flatten().filter(|k| k.touches(t0, t1) && !routed(k)) {
+        if k.kind == TakeKind::Song {
+            continue;
         }
+        if let Some(s) = stems.get(k.stem) {
+            add(&mut out_l[..n], &mut out_r[..n], s, offset_of(k), &|t| take_gain(mix, k, t));
+        }
+    }
+    if let Some(rack) = rack {
+        rack.process_master(&mut out_l[..n], &mut out_r[..n]);
     }
 }
 /// State shared with the audio callback: transport flags and the published mix.
@@ -331,6 +393,10 @@ pub struct Shared {
     pub stems: Mutex<Stems>,
     pub stems_gen: AtomicU64,
     pub stems_seen: AtomicU64,
+    /// A new effects rack for the callback to adopt.
+    pub fx_in: Mutex<Option<Box<FxRack>>>,
+    /// The rack it replaced, for the UI to drop.
+    pub fx_out: Mutex<Option<Box<FxRack>>>,
 }
 
 impl Shared {
@@ -342,6 +408,8 @@ impl Shared {
             stems: Mutex::new(stems),
             stems_gen: AtomicU64::new(0),
             stems_seen: AtomicU64::new(0),
+            fx_in: Mutex::new(None),
+            fx_out: Mutex::new(None),
         }
     }
     pub fn pos(&self) -> usize {
@@ -367,8 +435,20 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut stems: Stems = shared.stems.lock().map(|s| s.clone()).unwrap_or_default();
     let mut stems_gen = shared.stems_gen.load(Ordering::Acquire);
     let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
+    let mut rack = Box::new(FxRack::empty());
     cx.audio_output(0, move |info, out| {
         out.zero();
+        // A new effects rack: adopt the old one's state, hand the old one back
+        // to the UI to drop (only when the return slot is free: no allocation,
+        // no drop here).
+        if let Ok(mut back) = shared.fx_out.try_lock() {
+            if back.is_none() {
+                if let Some(mut new) = shared.fx_in.try_lock().ok().and_then(|mut s| s.take()) {
+                    new.adopt(&rack);
+                    *back = Some(std::mem::replace(&mut rack, new));
+                }
+            }
+        }
         if let Ok(m) = shared.mix.try_lock() {
             if m.version != cache.version || cache.gains.len() != m.gains.len() {
                 cache.clone_from(&m);
@@ -405,7 +485,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         let n_src = ((dev_frames as f64 * ratio).ceil() as usize).min(total - start);
         l.resize(n_src, 0.0);
         r.resize(n_src, 0.0);
-        mix_into(&stems, &cache, sr, start, &mut l, &mut r);
+        mix_into(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack));
         if !muted {
             let chans = out.channel_count();
             for i in 0..dev_frames {
@@ -428,7 +508,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
 // ---------------------------------------------------------------- jobs worker
 
 pub enum Job {
-    Render { stems: Stems, mix: MixParams, sr: u32, out_dir: PathBuf, name: String },
+    Render { stems: Stems, mix: MixParams, rack: Box<FxRack>, sr: u32, out_dir: PathBuf, name: String },
     /// Understand a song: run the analysis sidecar on `audio`, writing into the
     /// `bundle`, then decode the new stems at `sr`.
     Analyze { audio: PathBuf, bundle: PathBuf, sr: u32 },
@@ -498,7 +578,7 @@ impl Jobs {
             .spawn_worker(ThreadOptions { name: Some("poing-jobs".into()), ..Default::default() }, move || {
                 while let Ok(job) = job_rx.recv() {
                     match job {
-                        Job::Render { stems, mix, sr, out_dir, name } => render(&stems, &mix, sr, &out_dir, &name, &up_tx),
+                        Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, &up_tx),
                         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
                         Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, &up_tx),
                         Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, &up_tx),
@@ -560,11 +640,16 @@ pub fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::
 
 /// Full mix -> 24-bit WAV, then (when ffmpeg exists) two-pass loudnorm to
 /// -14 LUFS / -1 dBTP as a 320k MP3.
-pub fn render(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, out_dir: &Path, name: &str, tx: &Sender<JobUpdate>) {
+pub fn render(stems: &[Arc<Stem>], mix: &MixParams, mut rack: Box<FxRack>, sr: u32, out_dir: &Path, name: &str, tx: &Sender<JobUpdate>) {
     send(tx, JobUpdate::Status("Rendering mix...".into()));
-    let frames = stems.iter().map(|s| s.l.len()).max().unwrap_or(0);
+    // The song as it plays: its lanes, or the song take being heard.
+    let lanes = stems.iter().take(mix.gains.len()).map(|s| s.l.len()).max().unwrap_or(0);
+    let frames = match mix.song_take() {
+        Some(k) => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
+        None => lanes,
+    };
     let (mut l, mut r) = (vec![0f32; frames], vec![0f32; frames]);
-    mix_into(stems, mix, sr, 0, &mut l, &mut r);
+    mix_into(stems, mix, sr, 0, &mut l, &mut r, Some(&mut rack));
     let peak = l.iter().chain(r.iter()).fold(0f32, |a, x| a.max(x.abs()));
     let norm = if peak > 0.99 { 0.99 / peak } else { 1.0 };
     let _ = std::fs::create_dir_all(out_dir);
@@ -1131,7 +1216,7 @@ mod tests {
         let stems = vec![constant(0.25, 1000), constant(1.0, 1500)];
         let mix = with_takes(&[MixTake { stem: 1, start: 0.0, end: 1.5, ..Default::default() }]);
         let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
-        mix_into(&stems, &mix, 1000, 1200, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 1200, &mut l, &mut r, None);
         assert!(l.iter().chain(&r).all(|&x| x == 1.0), "past the lanes' end the take still plays alone");
     }
 
@@ -1142,14 +1227,14 @@ mod tests {
         let section = MixTake { stem: 1, start: 1.0, end: 3.0, kind: TakeKind::Section, blend: 1.0, fade_in: true, fade_out: true };
         let mix = with_takes(&[section]);
         let (mut l, mut r) = (vec![0.0; 4000], vec![0.0; 4000]);
-        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         assert_eq!(l[500], 0.25, "before the take: lanes");
         assert_eq!(l[2000], 1.0, "inside: the take alone");
         assert_eq!(l[3500], 0.25, "after: lanes again");
         assert!((l[1250] - 0.625).abs() < 1e-6, "halfway up the ramp: an even blend");
         // a block that starts inside the take plays it from the right offset
         let (mut l2, mut r2) = (vec![0.0; 10], vec![0.0; 10]);
-        mix_into(&stems, &mix, 1000, 2000, &mut l2, &mut r2);
+        mix_into(&stems, &mix, 1000, 2000, &mut l2, &mut r2, None);
         assert_eq!(l2[0], 1.0);
     }
 
@@ -1170,7 +1255,7 @@ mod tests {
         let lane = MixTake { stem: 1, start: 0.0, end: 1.0, kind: TakeKind::Lane(0), blend: 0.65, ..Default::default() };
         let mix = with_takes(&[lane]);
         let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
-        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         assert!((l[50] - (0.6 + 0.35 * 0.4)).abs() < 1e-6, "{}", l[50]);
     }
 
@@ -1183,18 +1268,38 @@ mod tests {
         ]);
         mix.gains = vec![1.0, 1.0];
         let (mut l, mut r) = (vec![0.0; 10], vec![0.0; 10]);
-        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         // lane 0 replaced by 0.2, lane 1 kept at 0.25, layer adds 0.05
         assert!((l[5] - 0.5).abs() < 1e-6, "{}", l[5]);
         // muting lane 0 mutes its lane take too
         mix.gains[0] = 0.0;
-        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         assert!((l[5] - 0.3).abs() < 1e-6, "{}", l[5]);
         // and a layer follows the lane it was added to (solo another lane: it goes quiet)
         mix.gains = vec![1.0, 0.0];
-        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
         assert!((l[5] - 0.2).abs() < 1e-6, "{}", l[5]);
         assert_eq!(MAX_ACTIVE_TAKES, mix.takes.len());
+    }
+
+    #[test]
+    fn a_lane_effect_also_processes_that_lane_s_takes() {
+        use crate::fx::{compile_source, FxControls, FxRack, FxUnit};
+        let code = "let gain = param(0.5, 0, 1)\nfn effect(l, r) { vec2(l * gain, r * gain) }\n";
+        let shader = compile_source(code).unwrap();
+        let fx = poing_model::Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None };
+        let unit = FxUnit::new("fx1", shader.clone(), FxControls::new(&shader, &fx, None), 1000);
+        let mut rack = FxRack::new(vec![vec![unit], Vec::new()], Vec::new());
+        // lane 0 (1.0) has the effect and a layer (1.0); lane 1 (0.25) has none
+        let stems = vec![constant(1.0, 1000), constant(0.25, 1000), constant(1.0, 1000)];
+        let mut mix = with_takes(&[MixTake { stem: 2, start: 0.0, end: 1.0, kind: TakeKind::Layer(Some(0)), blend: 1.0, ..Default::default() }]);
+        mix.gains = vec![1.0, 1.0];
+        let (mut l, mut r) = (vec![0.0; 300], vec![0.0; 300]);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, Some(&mut rack));
+        assert!((l[200] - (2.0 * 0.5 + 0.25)).abs() < 1e-3, "{}", l[200]);
+        // without a rack the same mix is the plain sum
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
+        assert!((l[200] - 2.25).abs() < 1e-6, "{}", l[200]);
     }
 
     #[test]

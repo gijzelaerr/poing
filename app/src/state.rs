@@ -2,8 +2,12 @@
 //! widget through Scope data.
 
 use crate::audio::{self, MixParams, Shared, Stem, Stems, TakeKind};
-use crate::model::{default_gain_for, Analysis, Project, Region, Take, Track};
+use crate::fx::{self, FxControls, FxRack};
+use crate::model::{default_gain_for, Analysis, Fx, Project, Region, Take, Track};
+use makepad_script_audio_aot::AudioShaderRef;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Instant, SystemTime};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -38,6 +42,15 @@ pub struct EditorState {
     pub dirty: bool,
     mix_version: u64,
     next_region: u64,
+    /// Compiled effect shaders by effect id.
+    fx_shaders: HashMap<String, AudioShaderRef>,
+    /// The file time each effect was last compiled from (good build or not).
+    fx_mtimes: HashMap<String, Option<SystemTime>>,
+    /// Knob and bypass controls by effect id, shared with the audio thread.
+    pub fx_controls: HashMap<String, Arc<FxControls>>,
+    /// Effects that do not compile right now, with why.
+    pub fx_errors: HashMap<String, String>,
+    fx_polled: Instant,
 }
 
 impl EditorState {
@@ -86,7 +99,169 @@ impl EditorState {
             dirty: false,
             mix_version,
             next_region,
+            fx_shaders: HashMap::new(),
+            fx_mtimes: HashMap::new(),
+            fx_controls: HashMap::new(),
+            fx_errors: HashMap::new(),
+            fx_polled: Instant::now(),
         }
+        .with_fx()
+    }
+
+    fn with_fx(mut self) -> Self {
+        let ids: Vec<String> = self.all_fx().iter().map(|f| f.id.clone()).collect();
+        for id in ids {
+            self.compile_fx(&id);
+        }
+        self.publish_fx();
+        self
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    }
+
+    /// Every effect, lanes first then the master.
+    pub fn all_fx(&self) -> Vec<Fx> {
+        let lanes = (0..self.project.tracks.len()).flat_map(|i| self.project.chain(Some(i)).to_vec());
+        lanes.chain(self.project.chain(None).to_vec()).collect()
+    }
+
+    pub fn fx(&self, id: &str) -> Option<&Fx> {
+        let (lane, i) = self.project.find_fx(id)?;
+        self.project.chain(lane).get(i)
+    }
+
+    /// (Re)compile effect `id` from its file. Knobs it still has keep their
+    /// values; it plays from the next rack.
+    fn compile_fx(&mut self, id: &str) -> bool {
+        let Some(fx) = self.fx(id).cloned() else { return false };
+        let file = self.dir().join(&fx.file);
+        let mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        self.fx_mtimes.insert(id.to_string(), mtime);
+        match fx::compile_fx(&self.dir(), &fx) {
+            Ok(shader) => {
+                let bpm = self.project.analysis.as_ref().and_then(|a| a.tempo);
+                self.fx_controls.insert(id.to_string(), FxControls::new(&shader, &fx, bpm));
+                self.fx_shaders.insert(id.to_string(), shader);
+                self.fx_errors.remove(id);
+                true
+            }
+            Err(e) => {
+                // the last good build, if any, keeps playing
+                self.fx_errors.insert(id.to_string(), e);
+                false
+            }
+        }
+    }
+
+    /// A rack for the song as it is now (fresh effect state).
+    pub fn make_rack(&self) -> FxRack {
+        fx::build_rack(&self.project, &|id| self.fx_shaders.get(id).cloned(), &|id| self.fx_controls.get(id).cloned())
+    }
+
+    /// Hand the audio thread a rack for the current effects (it carries
+    /// over the state of every effect it keeps).
+    pub fn publish_fx(&mut self) {
+        let rack = Box::new(self.make_rack());
+        if let Ok(mut slot) = self.shared.fx_in.lock() {
+            *slot = Some(rack);
+        }
+    }
+
+    /// Add an effect written as `code` to a lane (or the master).
+    pub fn add_fx(&mut self, lane: Option<usize>, name: &str, code: &str, prompt: Option<String>) -> Result<String, String> {
+        fx::compile_source(code)?;
+        let id = self.project.next_fx();
+        let file = format!("fx/{id}.splash");
+        let dir = self.dir();
+        std::fs::create_dir_all(dir.join("fx")).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
+        let fx = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt };
+        self.project.chain_mut(lane).push(fx);
+        self.compile_fx(&id);
+        self.publish_fx();
+        self.sel_changed = true;
+        self.save()?;
+        Ok(id)
+    }
+
+    pub fn remove_fx(&mut self, id: &str) -> Result<(), String> {
+        let Some((lane, i)) = self.project.find_fx(id) else { return Ok(()) };
+        self.project.chain_mut(lane).remove(i);
+        self.fx_shaders.remove(id);
+        self.fx_mtimes.remove(id);
+        self.fx_controls.remove(id);
+        self.fx_errors.remove(id);
+        self.publish_fx();
+        self.sel_changed = true;
+        self.save()
+    }
+
+    /// Turn a knob: heard at once, remembered in the project.
+    pub fn set_fx_param(&mut self, id: &str, index: usize, value: f64) {
+        let Some(shader) = self.fx_shaders.get(id) else { return };
+        let Some(name) = shader.params().get(index).map(|p| p.name.clone()) else { return };
+        if let Some(c) = self.fx_controls.get(id) {
+            c.set(index, value as f32);
+        }
+        if let Some((lane, i)) = self.project.find_fx(id) {
+            self.project.chain_mut(lane)[i].set_param(&name, value);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_fx_bypass(&mut self, id: &str, bypass: bool) {
+        if let Some(c) = self.fx_controls.get(id) {
+            c.bypass.store(bypass, Ordering::Relaxed);
+        }
+        if let Some((lane, i)) = self.project.find_fx(id) {
+            self.project.chain_mut(lane)[i].bypass = Some(bypass);
+            self.dirty = true;
+        }
+    }
+
+    /// The knobs of effect `id`: (name, value, min, max).
+    pub fn fx_knobs(&self, id: &str) -> Vec<(String, f64, f64, f64)> {
+        let (Some(shader), Some(fx)) = (self.fx_shaders.get(id), self.fx(id)) else { return Vec::new() };
+        shader
+            .params()
+            .iter()
+            .filter(|p| p.name != "bpm")
+            .map(|p| (p.name.clone(), fx.param(&p.name).unwrap_or(p.default as f64), p.min as f64, p.max as f64))
+            .collect()
+    }
+
+    /// Live coding: recompile effects whose file changed (at most once a
+    /// second). Returns what happened, for the status line.
+    pub fn reload_changed_fx(&mut self) -> Option<String> {
+        if self.fx_polled.elapsed().as_secs_f64() < 1.0 {
+            return None;
+        }
+        self.fx_polled = Instant::now();
+        let dir = self.dir();
+        let changed: Vec<Fx> = self
+            .all_fx()
+            .into_iter()
+            .filter(|f| {
+                let mtime = std::fs::metadata(dir.join(&f.file)).and_then(|m| m.modified()).ok();
+                self.fx_mtimes.get(&f.id) != Some(&mtime)
+            })
+            .collect();
+        if changed.is_empty() {
+            return None;
+        }
+        let mut notes = Vec::new();
+        for f in &changed {
+            if self.compile_fx(&f.id) {
+                notes.push(format!("{} recompiled", f.name));
+            } else {
+                notes.push(format!("{}: {}", f.name, self.fx_errors.get(&f.id).cloned().unwrap_or_default()));
+            }
+        }
+        self.publish_fx();
+        self.sel_changed = true;
+        Some(notes.join("  ·  "))
     }
 
     /// This song's stem sets the audio thread may still hold: its current one
@@ -142,6 +317,10 @@ impl EditorState {
 
     /// Drop retired stem sets once the audio thread runs on the current one.
     pub fn collect_retired(&mut self) {
+        // a rack the audio thread replaced is dropped here, not there
+        if let Ok(mut back) = self.shared.fx_out.try_lock() {
+            back.take();
+        }
         if !self.retired.is_empty()
             && self.shared.stems_seen.load(Ordering::Acquire) == self.shared.stems_gen.load(Ordering::Acquire)
         {
@@ -222,6 +401,7 @@ impl EditorState {
                     gain_db: None,
                     mute: None,
                     solo: None,
+                    fx: None,
                 });
                 lanes.push(Arc::new(placed));
                 format!("Take {n} is now a lane of its own")

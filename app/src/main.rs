@@ -8,6 +8,7 @@
 pub use makepad_widgets;
 
 mod audio;
+mod fx;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
@@ -688,7 +689,14 @@ impl MatchEvent for App {
         }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
             let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
-            let job = Job::Render { stems: st.stems.clone(), mix: st.mix_snapshot(), sr: st.sr(), out_dir, name: st.project.name.clone() };
+            let job = Job::Render {
+                stems: st.stems.clone(),
+                mix: st.mix_snapshot(),
+                rack: Box::new(st.make_rack()),
+                sr: st.sr(),
+                out_dir,
+                name: st.project.name.clone(),
+            };
             let queued = self.jobs.as_ref().map(|j| j.submit(job)).unwrap_or(false);
             status = Some(if queued { "Rendering...".into() } else { "Render worker is not running".into() });
         }
@@ -810,6 +818,9 @@ impl AppMain for App {
         match &mut self.state {
             Some(st) => {
                 st.collect_retired();
+                if let Some(note) = st.reload_changed_fx() {
+                    self.ui.label(cx, ids!(status_label)).set_text(cx, &note);
+                }
                 self.ui.handle_event(cx, event, &mut Scope::with_data(st))
             }
             None => self.ui.handle_event(cx, event, &mut Scope::empty()),

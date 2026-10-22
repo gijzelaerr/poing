@@ -21,6 +21,10 @@ pub struct Project {
     pub takes: Option<Vec<Take>>,
     /// Takes ever started, deleted ones included, so ids and seeds never repeat.
     pub takes_made: Option<u64>,
+    /// Effects on the whole mix, after the lanes.
+    pub master_fx: Option<Vec<Fx>>,
+    /// Effects ever made, so their ids and files never repeat.
+    pub fx_made: Option<u64>,
 }
 
 /// One generated version of part of the song, played over [start, end]:
@@ -179,6 +183,46 @@ pub struct Track {
     pub gain_db: Option<f64>,
     pub mute: Option<bool>,
     pub solo: Option<bool>,
+    /// Effects on this lane, in order (Splash audio shaders).
+    pub fx: Option<Vec<Fx>>,
+}
+
+/// An effect: a Splash audio shader (`effect(l, r)`) in the bundle's `fx/`
+/// folder, its knob settings and whether it is bypassed. Editing the file
+/// recompiles it live.
+#[derive(SerJson, DeJson, Clone, Debug)]
+pub struct Fx {
+    pub id: String,
+    pub name: String,
+    /// Shader source, relative to the project.
+    pub file: String,
+    /// Knob values by param name; params not listed play at their default.
+    pub params: Option<Vec<FxParam>>,
+    pub bypass: Option<bool>,
+    /// The Describe it was written from.
+    pub prompt: Option<String>,
+}
+
+#[derive(SerJson, DeJson, Clone, Debug)]
+pub struct FxParam {
+    pub name: String,
+    pub value: f64,
+}
+
+impl Fx {
+    pub fn bypassed(&self) -> bool {
+        self.bypass.unwrap_or(false)
+    }
+    pub fn param(&self, name: &str) -> Option<f64> {
+        self.params.as_ref()?.iter().find(|p| p.name == name).map(|p| p.value)
+    }
+    pub fn set_param(&mut self, name: &str, value: f64) {
+        let params = self.params.get_or_insert_with(Vec::new);
+        match params.iter_mut().find(|p| p.name == name) {
+            Some(p) => p.value = value,
+            None => params.push(FxParam { name: name.into(), value }),
+        }
+    }
 }
 
 #[derive(SerJson, DeJson, Clone, Debug)]
@@ -255,6 +299,7 @@ impl Project {
                 gain_db: None,
                 mute: None,
                 solo: None,
+                fx: None,
             }],
             sample_rate: Some(sample_rate),
             sections: Some(Vec::new()),
@@ -263,6 +308,8 @@ impl Project {
             analysis: None,
             takes: Some(Vec::new()),
             takes_made: None,
+            master_fx: None,
+            fx_made: None,
         }
     }
 
@@ -280,7 +327,7 @@ impl Project {
                 continue;
             }
             let name = STEMS.iter().find(|(s, _)| s == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.clone());
-            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None });
+            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None, fx: None });
             added.push(self.tracks.len() - 1);
         }
         if !added.is_empty() {
@@ -349,6 +396,32 @@ impl Project {
         (format!("t{}", n + 1), seed)
     }
 
+    /// A new effect id ("fx1", "fx2", ...): counts up past deleted effects.
+    pub fn next_fx(&mut self) -> String {
+        let n = self.fx_made.unwrap_or(0) + 1;
+        self.fx_made = Some(n);
+        format!("fx{n}")
+    }
+
+    /// The effect chain of lane `lane`, or the master's (`None`).
+    pub fn chain(&self, lane: Option<usize>) -> &[Fx] {
+        match lane {
+            Some(i) => self.tracks.get(i).and_then(|t| t.fx.as_deref()).unwrap_or(&[]),
+            None => self.master_fx.as_deref().unwrap_or(&[]),
+        }
+    }
+    pub fn chain_mut(&mut self, lane: Option<usize>) -> &mut Vec<Fx> {
+        match lane {
+            Some(i) => self.tracks[i].fx.get_or_insert_with(Vec::new),
+            None => self.master_fx.get_or_insert_with(Vec::new),
+        }
+    }
+    /// Where effect `id` sits: (lane or master, index in its chain).
+    pub fn find_fx(&self, id: &str) -> Option<(Option<usize>, usize)> {
+        let lanes = (0..self.tracks.len()).map(Some).chain(std::iter::once(None));
+        lanes.into_iter().find_map(|lane| self.chain(lane).iter().position(|f| f.id == id).map(|i| (lane, i)))
+    }
+
     /// Lyrics tagged by section, the way YuE2 wants them: `[Verse]` then its
     /// lines, a blank line between sections. A line belongs to the section its
     /// middle falls in; sections without words keep their tag.
@@ -400,8 +473,8 @@ mod tests {
             name: "t".into(),
             duration: 2.0,
             tracks: vec![
-                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None },
-                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None },
+                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None, fx: None },
+                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None, fx: None },
             ],
             sample_rate: Some(48000),
             sections: Some(vec![Section { start: 0.0, end: 2.0, label: "verse".into() }]),
@@ -410,6 +483,8 @@ mod tests {
             analysis: None,
             takes: None,
             takes_made: None,
+            master_fx: None,
+            fx_made: None,
         }
     }
 
