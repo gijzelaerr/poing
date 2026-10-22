@@ -119,6 +119,20 @@ pub fn parse_answer(text: &str, bars: Bars) -> Result<(String, Vec<Note>), Strin
     Ok((name, notes))
 }
 
+/// Trim a part to beats `range`: a note that runs over the end is shortened,
+/// one starting up to a sixteenth outside is pulled in (no need to ask again).
+pub fn fit(notes: &mut Vec<Note>, range: (f64, f64)) {
+    for n in notes.iter_mut() {
+        if n.start < range.0 && n.start >= range.0 - 0.25 {
+            n.start = range.0;
+        }
+        if n.start < range.1 && n.start + n.len > range.1 {
+            n.len = range.1 - n.start;
+        }
+    }
+    notes.retain(|n| n.start >= range.0 - 0.01 && n.start < range.1);
+}
+
 /// What is wrong with a part, in words Claude can act on (empty: good).
 pub fn problems(notes: &[Note], role: &str, range: (f64, f64)) -> Vec<String> {
     let mut out = Vec::new();
@@ -167,7 +181,8 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
         let answer = crate::fx_writer::ask(&system_file, &prompt, work)?;
         let _ = std::fs::write(work.join(format!("answer-{round}.md")), &answer);
         match parse_answer(&answer, bars) {
-            Ok((name, notes)) => {
+            Ok((name, mut notes)) => {
+                fit(&mut notes, range);
                 let found = problems(&notes, role, range);
                 let w = Written { name, notes, problems: found, rounds: round };
                 if w.problems.is_empty() {
@@ -207,5 +222,14 @@ mod tests {
         assert!(problems(&[n(40)], "bass", (0.0, 8.0)).is_empty());
         assert!(!problems(&[n(100)], "bass", (0.0, 8.0)).is_empty(), "out of range");
         assert!(!problems(&[], "bass", (0.0, 8.0)).is_empty(), "empty");
+    }
+
+    #[test]
+    fn a_part_is_trimmed_to_its_bars() {
+        let n = |start, len| Note { start, len, pitch: 40, vel: 0.8 };
+        let mut notes = vec![n(-0.25, 1.0), n(2.0, 1.0), n(7.5, 2.0), n(8.0, 1.0)];
+        fit(&mut notes, (0.0, 8.0));
+        assert_eq!(notes, vec![n(0.0, 1.0), n(2.0, 1.0), n(7.5, 0.5)]);
+        assert!(problems(&notes, "bass", (0.0, 8.0)).is_empty());
     }
 }

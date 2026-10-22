@@ -261,13 +261,15 @@ impl EditorState {
         std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
         let instrument = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None };
         let tracks = self.project.tracks.len();
+        // heard at once: with other lanes soloed, the new one joins them
+        let solo = self.project.tracks.iter().any(|t| t.solo == Some(true)).then_some(true);
         self.project.tracks.push(Track {
             id,
             name: name.to_string(),
             file: String::new(),
             gain_db: None,
             mute: None,
-            solo: None,
+            solo,
             fx: None,
             notes: Some(notes),
             instrument: Some(instrument),
@@ -989,6 +991,11 @@ impl EditorState {
     /// Step back one edit (or forward again with `redo`).
     pub fn undo(&mut self, redo: bool) -> Option<String> {
         let (project, stems) = if redo { self.redo.pop()? } else { self.undo.pop()? };
+        // a selected lane stays selected (a note edit undone keeps its piano roll open)
+        let lane = match self.sel {
+            Selection::Track(i) => self.project.tracks.get(i).map(|t| t.id.clone()),
+            _ => None,
+        };
         let now = (std::mem::replace(&mut self.project, project), self.stems.clone());
         if redo {
             self.undo.push(now);
@@ -1010,7 +1017,9 @@ impl EditorState {
         self.compile_instruments();
         self.publish_fx();
         self.push_mix();
-        self.select(Selection::None);
+        let keep = lane.and_then(|id| self.project.track_index(&id));
+        self.note_sel = None;
+        self.select(keep.map_or(Selection::None, Selection::Track));
         let _ = self.save();
         Some(if redo { "Redone".into() } else { "Undone  ·  Ctrl+Shift+Z to redo".into() })
     }

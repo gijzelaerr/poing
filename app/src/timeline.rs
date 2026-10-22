@@ -452,7 +452,9 @@ impl DawTimeline {
             }
             let (a, b) = (a.max(x0), b.min(x0 + w));
             let y = top + (hi - n.pitch) as f64 * rh;
-            let r = Rect { pos: dvec2(a, y + 0.5), size: dvec2((b - a - 1.0).max(2.0), (rh - 1.0).max(2.0)) };
+            // closed, rows are thin: notes keep 3 px so the part reads at a glance
+            let h = (rh - 1.0).max(if open { 2.0 } else { 3.0 });
+            let r = Rect { pos: dvec2(a, y + rh * 0.5 - h * 0.5), size: dvec2((b - a - 1.0).max(2.0), h) };
             let shown = vec4(col.x, col.y, col.z, col.w * (0.55 + 0.45 * n.vel as f32));
             if sel == Some(k) {
                 self.shape_bordered(cx, r, 2.0, shown, shade(shown, 0.85), rgba(0xffffff, 1.0), 1.5);

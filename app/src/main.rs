@@ -913,7 +913,11 @@ impl App {
             }
             Selection::Track(i) if i < st.project.tracks.len() => {
                 let t = st.project.tracks[i].clone();
-                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Track: {}   ({})", t.name, t.file));
+                let what = match &t.notes {
+                    Some(n) => format!("MIDI, {} notes", n.len()),
+                    None => t.file.clone(),
+                };
+                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Track: {}   ({what})", t.name));
                 ui.slider(cx, ids!(track_gain)).set_value(cx, t.gain());
                 ui.check_box(cx, ids!(mute_cb)).set_active(cx, t.muted(), Animate::No);
                 ui.check_box(cx, ids!(solo_cb)).set_active(cx, t.soloed(), Animate::No);
