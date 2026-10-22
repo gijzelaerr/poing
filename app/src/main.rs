@@ -12,10 +12,10 @@ pub(crate) use poing_model as model;
 mod state;
 mod timeline;
 
-use audio::{Job, JobUpdate, Jobs, RepaintJob, Stem, Yue2Fixture};
+use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
-use model::{default_gain_for, Analysis, Project, Take, REGION_KINDS};
+use model::{default_gain_for, demucs_stem_for, lane_intent, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
 use timeline::kind_index;
@@ -83,6 +83,7 @@ script_mod! {
                         take_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
+                            take_blend := Slider{width: 300 text: "Blend %" min: 0.0 max: 100.0 step: 1.0 precision: 0 default: 100.0}
                             keep_btn := Button{text: "Keep as a new song"}
                             delete_take_btn := Button{text: "Delete take"}
                         }
@@ -100,6 +101,9 @@ pub struct App {
     ui: WidgetRef,
     #[rust]
     state: Option<EditorState>,
+    /// When the last status message was shown: "Unsaved changes" waits its turn.
+    #[rust]
+    status_at: Option<std::time::Instant>,
     #[rust]
     jobs: Option<Jobs>,
 }
@@ -184,6 +188,19 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     if let Selection::Section(i) = st.sel {
         return repaint_section(st, jobs, bundle, i, text, lyrics);
     }
+    // A lane, or a region on one: work on that part.
+    let lane = match st.sel {
+        Selection::Track(i) => Some((i, None)),
+        Selection::Region(r) => st
+            .project
+            .regions()
+            .get(r)
+            .and_then(|reg| st.project.track_index(&reg.track).map(|i| (i, Some((reg.start, reg.end))))),
+        _ => None,
+    };
+    if let Some((i, range)) = lane {
+        return describe_lane(st, jobs, bundle, i, range, text);
+    }
     // Key and tempo anchor the style, as in the cover that worked.
     let mut style = text.to_string();
     if let Some(a) = &st.project.analysis {
@@ -204,6 +221,8 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         engine: "yue2".into(),
         prompt: text.to_string(),
         seed,
+        track: None,
+        blend: None,
     };
     let n = take.id.trim_start_matches('t').to_string();
     let with_score = abc.is_some();
@@ -237,6 +256,8 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
         engine: "acestep".into(),
         prompt: text.to_string(),
         seed,
+        track: None,
+        blend: None,
     };
     let a = st.project.analysis.clone().unwrap_or_default();
     let job = RepaintJob {
@@ -256,6 +277,77 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
     st.analysing = Some((format!("Take {n}"), 0.0));
     let _ = st.save();
     format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", section.label, section.start, section.end)
+}
+
+/// Describe on a lane (or a region of it): less echo, or a new part added.
+fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize, range: Option<(f64, f64)>, text: &str) -> String {
+    let track = st.project.tracks[lane].clone();
+    let lane_file = st.project.track_path(&st.path, lane);
+    let (start, end) = range.unwrap_or((0.0, st.project.duration));
+    let place = range.map(|(a, b)| format!(" from {a:.0}s to {b:.0}s")).unwrap_or_default();
+    let intent = lane_intent(text, &track.id);
+    if let LaneIntent::AddWhat = intent {
+        return format!("Which instrument should Poing add? Say it, e.g. \"add warm strings\" (it can play: {}).", LEGO_TRACKS.join(", "));
+    }
+    if let LaneIntent::Replace = intent {
+        return format!(
+            "Poing can take echo out of {} (\"less echo\") or add a part (\"add ...\"); playing the lane itself again comes next.",
+            track.name
+        );
+    }
+    let (id, seed) = st.project.next_take();
+    let n = id.trim_start_matches('t').to_string();
+    let mut take = Take {
+        file: format!("takes/{id}.wav"),
+        id,
+        scope: "lane".into(),
+        start,
+        end,
+        engine: "dereverb".into(),
+        prompt: text.to_string(),
+        seed,
+        track: Some(track.id.clone()),
+        // dry + 35% of the echo: what worked for the disco v4 vocal
+        blend: Some(0.65),
+    };
+    let (job, status) = match intent {
+        LaneIntent::AddLayer(instrument) => {
+            let Some(source) = st.project.source.clone() else { return "This song has no source audio to play along to".into() };
+            take.scope = "layer".into();
+            take.engine = "lego".into();
+            take.blend = Some(1.0);
+            let a = st.project.analysis.clone().unwrap_or_default();
+            let stem = demucs_stem_for(&instrument).to_string();
+            // A part of the lane's own kind fills that lane's gaps; anything else plays as is.
+            let reference = (stem == track.id).then(|| lane_file.to_string_lossy().into_owned());
+            let fills = reference.is_some();
+            let lego = LegoJob {
+                src: bundle.join(source).to_string_lossy().into_owned(),
+                track: instrument.clone(),
+                caption: text.to_string(),
+                seed,
+                bpm: a.tempo.map(f64::round),
+                key: a.key,
+                ..Default::default()
+            };
+            let (a, b) = range.unwrap_or((0.0, 0.0));
+            let clean = LayerJob { stem, reference, start: a, end: b, ..Default::default() };
+            let how = if fills { format!(", filling the gaps in {}", track.name) } else { String::new() };
+            let status = format!("Adding a {instrument} part{place} as take {n}{how} (about a minute and a half)...");
+            (Job::Layer { bundle, take, lego, clean, sr: st.sr() }, status)
+        }
+        _ => {
+            let status =
+                format!("Taking the echo out of {}{place} as take {n} (about 2 minutes). Then set how much echo stays with Blend.", track.name);
+            (Job::Dereverb { bundle, take, lane: lane_file, sr: st.sr() }, status)
+        }
+    };
+    if !jobs.submit(job) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some((format!("Take {n}"), 0.0));
+    let _ = st.save();
+    status
 }
 
 /// The rate stems are decoded at (the open song's; all songs use 48 kHz).
@@ -398,7 +490,7 @@ impl App {
                 ui.text_input(cx, ids!(section_input)).set_text(cx, &s.label);
                 show_section = true;
             }
-            _ => match st.audition.as_deref().and_then(|id| st.project.take_index(id)).map(|i| st.project.takes()[i].clone()) {
+            _ => match st.focused_take() {
                 Some(t) => {
                     let n = t.id.trim_start_matches('t');
                     let span = if t.scope == "song" {
@@ -407,9 +499,24 @@ impl App {
                     } else {
                         format!("{:.0}s - {:.0}s", t.start, t.end)
                     };
-                    let title = format!("Take {n}  ·  {}  ·  {span}  ·  seed {}", t.prompt, t.seed);
+                    let on = match (t.scope.as_str(), t.track.as_deref()) {
+                        ("lane", Some(track)) => format!("  ·  replaces {track}"),
+                        ("layer", Some(track)) => format!("  ·  added to {track}"),
+                        _ => String::new(),
+                    };
+                    let title = format!("Take {n}  ·  {}{on}  ·  {span}  ·  seed {}", t.prompt, t.seed);
                     ui.label(cx, ids!(insp_title)).set_text(cx, &title);
-                    ui.button(cx, ids!(keep_btn)).set_visible(cx, t.scope == "song");
+                    let blends = t.scope == "lane" || t.scope == "layer";
+                    ui.slider(cx, ids!(take_blend)).set_visible(cx, blends);
+                    ui.slider(cx, ids!(take_blend)).set_value(cx, (t.blend() * 100.0).round());
+                    let keep = match t.scope.as_str() {
+                        "song" => "Keep as a new song",
+                        "layer" => "Keep as a lane",
+                        "lane" => "Keep in the lane",
+                        _ => "",
+                    };
+                    ui.button(cx, ids!(keep_btn)).set_visible(cx, !keep.is_empty());
+                    ui.button(cx, ids!(keep_btn)).set_text(cx, keep);
                     show_take = true;
                 }
                 None => ui.label(cx, ids!(insp_title)).set_text(cx, HELP),
@@ -423,8 +530,9 @@ impl App {
         ui.view(cx, ids!(inspector)).redraw(cx);
     }
 
-    fn set_status(&self, cx: &mut Cx, s: &str) {
+    fn set_status(&mut self, cx: &mut Cx, s: &str) {
         self.ui.label(cx, ids!(status_label)).set_text(cx, s);
+        self.status_at = Some(std::time::Instant::now());
     }
 
     fn drain_jobs(&mut self, cx: &mut Cx) {
@@ -555,7 +663,7 @@ impl MatchEvent for App {
             }
         }
         if ui.button(cx, ids!(delete_take_btn)).clicked(actions) {
-            if let Some(id) = st.audition.clone() {
+            if let Some(id) = st.focus.clone() {
                 status = Some(match st.delete_take(&id) {
                     Ok(()) => "Take deleted".into(),
                     Err(e) => format!("Delete failed: {e}"),
@@ -564,6 +672,9 @@ impl MatchEvent for App {
         }
         if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.analysing.is_some() {
             status = Some("A job is still running; keep the take when it is done.".into());
+        } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.focused_take().is_some_and(|t| t.scope != "song") {
+            let id = st.focus.clone().unwrap_or_default();
+            status = Some(st.keep_take(&id).unwrap_or_else(|e| format!("Keep failed: {e}")));
         } else if ui.button(cx, ids!(keep_btn)).clicked(actions) {
             match promote_take(st) {
                 Ok(project) => {
@@ -573,6 +684,12 @@ impl MatchEvent for App {
                     return;
                 }
                 Err(e) => status = Some(format!("Keep failed: {e}")),
+            }
+        }
+
+        if let Some(v) = ui.slider(cx, ids!(take_blend)).slided(actions) {
+            if let Some(id) = st.focus.clone() {
+                st.set_blend(&id, v / 100.0);
             }
         }
 
@@ -630,10 +747,12 @@ impl MatchEvent for App {
             }
         }
 
-        if st.dirty && status.is_none() {
-            status = Some("Unsaved changes".into());
+        let recent = self.status_at.is_some_and(|t| t.elapsed().as_secs_f64() < 6.0);
+        if st.dirty && status.is_none() && !recent {
+            self.ui.label(cx, ids!(status_label)).set_text(cx, "Unsaved changes");
         }
         if let Some(s) = status {
+            log!("poing: {s}");
             self.set_status(cx, &s);
         }
         ui.widget(cx, ids!(timeline)).redraw(cx);

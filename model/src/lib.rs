@@ -23,21 +23,101 @@ pub struct Project {
     pub takes_made: Option<u64>,
 }
 
-/// One generated version of the song (scope `"song"`) or of a time range
-/// (scope `"section"`, played in place of the lanes between start and end).
+/// One generated version of part of the song, played over [start, end]:
+/// - `"song"`: the whole song, instead of every lane
+/// - `"section"`: a range of the mix, instead of every lane there
+/// - `"lane"`: one lane (`track`), blended in by `blend` (1 = replaces it)
+/// - `"layer"`: a new part on top, at `blend`
 #[derive(SerJson, DeJson, Clone, Debug)]
 pub struct Take {
     pub id: String,
     pub scope: String,
     pub start: f64,
     pub end: f64,
-    /// `"yue2"` (score + lyrics cover) or `"acestep"` (repaint).
+    /// `"yue2"` (cover), `"acestep"` (repaint), `"dereverb"`, `"lego"` (a new part).
     pub engine: String,
     /// The Describe text it was made from.
     pub prompt: String,
     pub seed: u64,
     /// Audio file relative to the project.
     pub file: String,
+    /// The lane a `"lane"` or `"layer"` take belongs to.
+    pub track: Option<String>,
+    /// How much of a lane or layer take is heard, 0..1.
+    pub blend: Option<f64>,
+}
+
+impl Take {
+    /// Takes in one slot replace each other when switched on: one version of
+    /// the song, of a range, of a lane. Layers stack.
+    pub fn slot(&self) -> String {
+        match self.scope.as_str() {
+            "song" => "song".into(),
+            "section" => format!("section:{:.2}-{:.2}", self.start, self.end),
+            "lane" => format!("lane:{}", self.track.as_deref().unwrap_or("")),
+            _ => format!("layer:{}", self.id),
+        }
+    }
+    pub fn blend(&self) -> f64 {
+        self.blend.unwrap_or(1.0)
+    }
+}
+
+/// ACE-Step lego's instrument tracks.
+pub const LEGO_TRACKS: [&str; 12] =
+    ["woodwinds", "brass", "fx", "synth", "strings", "percussion", "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"];
+
+/// What Describe on a lane asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LaneIntent {
+    /// Less (or more) echo on this lane: split it into dry voice and reverb.
+    Dereverb,
+    /// A new part (an instrument lego can play) layered on top.
+    AddLayer(String),
+    /// "add ..." without an instrument Poing can tell.
+    AddWhat,
+    /// Anything else: play this lane's part again differently.
+    Replace,
+}
+
+/// Read a Describe on lane `track` (English and Dutch keywords).
+pub fn lane_intent(text: &str, track: &str) -> LaneIntent {
+    let t = text.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| t.split(|c: char| !c.is_alphanumeric()).any(|x| x == *w || x.starts_with(w)));
+    if has(&["echo", "reverb", "galm", "nagalm", "dry", "droog", "drier", "droger"]) {
+        return LaneIntent::Dereverb;
+    }
+    if has(&["add", "extra", "layer", "toevoegen", "voeg", "laag", "more", "meer"]) {
+        let synonyms: [(&str, &str); 14] = [
+            ("drum", "drums"), ("percussion", "percussion"), ("shaker", "percussion"), ("conga", "percussion"),
+            ("piano", "keyboard"), ("keys", "keyboard"), ("organ", "keyboard"), ("synth", "synth"),
+            ("string", "strings"), ("guitar", "guitar"), ("bass", "bass"), ("horn", "brass"),
+            ("choir", "backing_vocals"), ("harmon", "backing_vocals"),
+        ];
+        for track in LEGO_TRACKS {
+            if has(&[track]) {
+                return LaneIntent::AddLayer(track.into());
+            }
+        }
+        if let Some((_, track)) = synonyms.iter().find(|(w, _)| has(&[w])) {
+            return LaneIntent::AddLayer(track.to_string());
+        }
+        return match track {
+            "drums" | "bass" | "vocals" => LaneIntent::AddLayer(track.into()),
+            _ => LaneIntent::AddWhat,
+        };
+    }
+    LaneIntent::Replace
+}
+
+/// The Demucs stem that holds a lego track (htdemucs: vocals, drums, bass, other).
+pub fn demucs_stem_for(track: &str) -> &'static str {
+    match track {
+        "drums" | "percussion" => "drums",
+        "bass" => "bass",
+        "vocals" | "backing_vocals" => "vocals",
+        _ => "other",
+    }
 }
 
 /// Seeds for successive takes: fixed so a take can be made again, varied so
@@ -310,6 +390,40 @@ mod tests {
     }
 
     #[test]
+    fn describe_on_a_lane_is_read_in_english_and_dutch() {
+        assert_eq!(lane_intent("less echo on the voice", "vocals"), LaneIntent::Dereverb);
+        assert_eq!(lane_intent("minder galm", "vocals"), LaneIntent::Dereverb);
+        assert_eq!(
+            lane_intent("add tight 80s disco house drums, four-on-the-floor kick", "drums"),
+            LaneIntent::AddLayer("drums".into())
+        );
+        assert_eq!(lane_intent("voeg strijkers toe, warme strings", "other"), LaneIntent::AddLayer("strings".into()));
+        assert_eq!(lane_intent("add some piano chords", "other"), LaneIntent::AddLayer("keyboard".into()));
+        assert_eq!(lane_intent("add more groove", "drums"), LaneIntent::AddLayer("drums".into()));
+        assert_eq!(lane_intent("add more groove", "other"), LaneIntent::AddWhat);
+        assert_eq!(lane_intent("funkier, slap style", "bass"), LaneIntent::Replace);
+    }
+
+    #[test]
+    fn take_slots() {
+        let mut t = Take {
+            id: "t4".into(),
+            scope: "lane".into(),
+            start: 0.0,
+            end: 9.0,
+            engine: "dereverb".into(),
+            prompt: "less echo".into(),
+            seed: 1,
+            file: "takes/t4.wav".into(),
+            track: Some("vocals".into()),
+            blend: Some(0.65),
+        };
+        assert_eq!(t.slot(), "lane:vocals");
+        t.scope = "layer".into();
+        assert_eq!(t.slot(), "layer:t4", "layers stack: each has its own slot");
+    }
+
+    #[test]
     fn sung_lyrics_are_tagged_by_section() {
         let mut p = project(vec![]);
         *p.sections_mut() = vec![
@@ -340,6 +454,8 @@ mod tests {
             prompt: "x".into(),
             seed: 1234,
             file: "takes/t1.wav".into(),
+            track: None,
+            blend: None,
         };
         p.takes_mut().push(take);
         assert_eq!(p.next_take(), ("t2".to_string(), 1966));

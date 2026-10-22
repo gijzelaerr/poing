@@ -244,7 +244,18 @@ impl DawTimeline {
         let song_take = st.song_take().map(|(stem, t)| (stem, t.id.clone()));
         // While a song take plays it is the only lane: the stems are not what you hear.
         let n = if song_take.is_some() { 0 } else { n };
-        let lane_h = ((rect.size.y - (lanes_y - rect.pos.y)) / n.max(1) as f64).clamp(40.0, 140.0);
+        // Active layers get a lane each, under the stems.
+        let layers: Vec<(usize, poing_model::Take)> = if song_take.is_some() {
+            Vec::new()
+        } else {
+            st.active
+                .iter()
+                .filter_map(|id| st.project.take_index(id))
+                .filter(|&i| st.project.takes()[i].scope == "layer")
+                .map(|i| (st.project.tracks.len() + i, st.project.takes()[i].clone()))
+                .collect()
+        };
+        let lane_h = ((rect.size.y - (lanes_y - rect.pos.y)) / (n + layers.len()).max(1) as f64).clamp(40.0, 140.0);
         self.geo = Geo {
             rect,
             x0: rect.pos.x + HEADER_W,
@@ -337,11 +348,21 @@ impl DawTimeline {
             self.text(cx, rect.pos.x + 8.0, takes_y + 6.0, dim, "Takes");
             let mut x = x0;
             let names: Vec<(String, Option<String>)> = std::iter::once(("Original".to_string(), None))
-                .chain(st.project.takes().iter().map(|t| (format!("Take {}", t.id.trim_start_matches('t')), Some(t.id.clone()))))
+                .chain(st.project.takes().iter().map(|t| {
+                    let n = t.id.trim_start_matches('t');
+                    let label = match (t.scope.as_str(), t.track.as_deref()) {
+                        ("lane" | "layer", Some(track)) => format!("Take {n} · {track}"),
+                        _ => format!("Take {n}"),
+                    };
+                    (label, Some(t.id.clone()))
+                }))
                 .collect();
             for (label, id) in names {
                 let w = label.chars().count() as f64 * 6.5 + 18.0;
-                let on = st.audition == id;
+                let on = match &id {
+                    None => st.active.is_empty(),
+                    Some(id) => st.take_on(id),
+                };
                 self.rect(cx, x, takes_y + 3.0, w, TAKES_H - 6.0, rgba(if on { 0x4fc3f7 } else { 0x2c313b }, 1.0));
                 self.text(cx, x + 9.0, takes_y + 6.0, if on { rgba(0x111111, 1.0) } else { white }, &label);
                 self.chips.push((Rect { pos: dvec2(x, takes_y + 3.0), size: dvec2(w, TAKES_H - 6.0) }, id));
@@ -381,6 +402,19 @@ impl DawTimeline {
             self.text(cx, sb.pos.x + 8.0, sb.pos.y + 3.0, if tr.soloed() { rgba(0x111111, 1.0) } else { white }, "S");
 
             self.wave(cx, st, i, ly, lane_h, rgba(col, if audible { 0.85 } else { 0.25 }));
+        }
+
+        // layers: one lane each, at their blend
+        for (j, (stem, t)) in layers.iter().enumerate() {
+            let ly = self.lane_y(n + j);
+            self.rect(cx, rect.pos.x, ly, rect.size.x, lane_h - 1.0, rgba(0x1a1e25, 1.0));
+            self.rect(cx, rect.pos.x, ly, HEADER_W - 2.0, lane_h - 1.0, rgba(0x22262e, 1.0));
+            self.rect(cx, rect.pos.x, ly, 4.0, lane_h - 1.0, rgba(0x4fc3f7, 1.0));
+            let what = t.track.as_deref().unwrap_or("layer");
+            self.text(cx, rect.pos.x + 12.0, ly + 9.0, white, &format!("+ {what}"));
+            let level = format!("Take {}  ·  {:.0}%", t.id.trim_start_matches('t'), t.blend() * 100.0);
+            self.text(cx, rect.pos.x + 12.0, ly + 27.0, dim, &level);
+            self.wave(cx, st, *stem, ly, lane_h, rgba(0x4fc3f7, 0.85));
         }
 
         // lyrics along the bottom of the vocals lane
@@ -423,20 +457,24 @@ impl DawTimeline {
             }
         }
 
-        // a section take: its range glows over the lanes it replaces
-        let section_take = st
-            .audition
-            .as_deref()
-            .and_then(|id| st.project.take_index(id))
+        // section and lane takes glow over the lanes they replace
+        let replacing: Vec<poing_model::Take> = st
+            .active
+            .iter()
+            .filter_map(|id| st.project.take_index(id))
             .map(|i| st.project.takes()[i].clone())
-            .filter(|t| t.scope != "song");
-        if let Some(t) = section_take {
+            .filter(|t| t.scope == "section" || t.scope == "lane")
+            .collect();
+        for t in replacing.iter().filter(|_| n > 0) {
+            let (y, h) = match t.track.as_deref().and_then(|id| st.project.track_index(id)).filter(|_| t.scope == "lane") {
+                Some(lane) => (self.lane_y(lane), lane_h - 1.0),
+                None => (lanes_y, lane_h * n as f64),
+            };
             if let Some((x, tw)) = self.span(st, t.start, t.end) {
-                let h = lane_h * n as f64;
-                self.rect(cx, x, lanes_y, tw, h, rgba(0x4fc3f7, 0.10));
-                self.outline(cx, x, lanes_y, tw, h, rgba(0x4fc3f7, 0.8));
-                self.rect(cx, x, lanes_y, tw.min(70.0), 16.0, rgba(0x4fc3f7, 1.0));
-                self.text(cx, x + 5.0, lanes_y + 2.0, rgba(0x111111, 1.0), &format!("Take {}", t.id.trim_start_matches('t')));
+                self.rect(cx, x, y, tw, h, rgba(0x4fc3f7, 0.10));
+                self.outline(cx, x, y, tw, h, rgba(0x4fc3f7, 0.8));
+                self.rect(cx, x, y, tw.min(70.0), 16.0, rgba(0x4fc3f7, 1.0));
+                self.text(cx, x + 5.0, y + 2.0, rgba(0x111111, 1.0), &format!("Take {}", t.id.trim_start_matches('t')));
             }
         }
 
@@ -476,7 +514,10 @@ impl Widget for DawTimeline {
                 } else if y >= self.geo.takes_y && y < self.geo.lanes_y {
                     if let Some((_, id)) = self.chips.iter().find(|(r, _)| r.contains(fe.abs)).cloned() {
                         st.select(Selection::None);
-                        st.set_audition(id);
+                        match id {
+                            None => st.all_takes_off(),
+                            Some(id) => st.toggle_take(&id),
+                        }
                     }
                 } else if self.in_chords(y) {
                     if in_wave {

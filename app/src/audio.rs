@@ -49,7 +49,13 @@ pub fn load_stem(path: &Path, target_sr: u32) -> Result<Stem, String> {
         l = resample_linear(&l, audio.rate, target_sr);
         r = resample_linear(&r, audio.rate, target_sr);
     }
-    let peaks: Vec<(f32, f32)> = l
+    Ok(Stem::new(l, r))
+}
+
+impl Stem {
+    /// A stem from its samples, with its waveform peaks.
+    pub fn new(l: Vec<f32>, r: Vec<f32>) -> Stem {
+        let peaks: Vec<(f32, f32)> = l
         .chunks(PEAK_BLOCK)
         .zip(r.chunks(PEAK_BLOCK))
         .map(|(a, b)| {
@@ -62,8 +68,46 @@ pub fn load_stem(path: &Path, target_sr: u32) -> Result<Stem, String> {
             (mn, mx)
         })
         .collect();
-    let peak_abs = peaks.iter().fold(1e-6f32, |acc, (a, b)| acc.max(a.abs()).max(b.abs()));
-    Ok(Stem { l, r, peaks, peak_abs })
+        let peak_abs = peaks.iter().fold(1e-6f32, |acc, (a, b)| acc.max(a.abs()).max(b.abs()));
+        Stem { l, r, peaks, peak_abs }
+    }
+
+    /// Sample of the take at song frame f when the take starts at `offset`.
+    #[inline]
+    fn at(&self, f: usize, offset: usize) -> (f32, f32) {
+        match f.checked_sub(offset) {
+            Some(j) if j < self.l.len() => (self.l[j], self.r[j]),
+            _ => (0.0, 0.0),
+        }
+    }
+}
+
+/// Keep a lane take: the lane as heard with the take in at its blend, as one stem.
+pub fn bake_lane(lane: &Stem, take: &Stem, k: &MixTake, sr: u32) -> Stem {
+    let offset = (k.start.max(0.0) * sr as f64) as usize;
+    let (mut l, mut r) = (lane.l.clone(), lane.r.clone());
+    for f in 0..l.len().min(r.len()) {
+        let w = k.blend * k.weight(f as f64 / sr as f64);
+        if w > 0.0 {
+            let (tl, tr) = take.at(f, offset);
+            l[f] = l[f] * (1.0 - w) + tl * w;
+            r[f] = r[f] * (1.0 - w) + tr * w;
+        }
+    }
+    Stem::new(l, r)
+}
+
+/// Keep a layer: in place at its blend, as a lane `frames` long.
+pub fn place_layer(take: &Stem, k: &MixTake, sr: u32, frames: usize) -> Stem {
+    let offset = (k.start.max(0.0) * sr as f64) as usize;
+    let (mut l, mut r) = (vec![0.0; frames], vec![0.0; frames]);
+    for f in 0..frames {
+        let w = k.blend * k.weight(f as f64 / sr as f64);
+        let (tl, tr) = take.at(f, offset);
+        l[f] = tl * w;
+        r[f] = tr * w;
+    }
+    Stem::new(l, r)
 }
 
 fn resample_linear(x: &[f32], from: u32, to: u32) -> Vec<f32> {
@@ -89,15 +133,38 @@ pub struct MixRegion {
     pub factor: f32,
 }
 
-/// The take being auditioned: stem `stem` (after the tracks in the stem set)
-/// plays in place of the lanes over [start, end]; a song take replaces them all.
-#[derive(Clone, Copy, Default)]
+/// How a take sits in the mix (see `poing_model::Take`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TakeKind {
+    /// Instead of every lane, for the whole song.
+    #[default]
+    Song,
+    /// Instead of every lane over its range.
+    Section,
+    /// Instead of lane `track`, by `blend`.
+    Lane(usize),
+    /// On top, at `blend`, following lane `track`'s level, mute and solo
+    /// (`None`: a layer of its own).
+    Layer(Option<usize>),
+}
+
+/// A take being heard: stem `stem` (after the tracks in the stem set) starts
+/// at `start`. Ranges fade over TAKE_RAMP_S where they do not meet the song's
+/// edges.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MixTake {
     pub stem: usize,
     pub start: f64,
     pub end: f64,
-    pub song: bool,
+    pub kind: TakeKind,
+    pub blend: f32,
+    pub fade_in: bool,
+    pub fade_out: bool,
 }
+
+/// At most this many takes play at once (a fixed array: the audio thread's
+/// copy of the mix never allocates for them).
+pub const MAX_ACTIVE_TAKES: usize = 8;
 
 /// Everything the mixer needs; rebuilt from the Project whenever it changes.
 #[derive(Clone, Default)]
@@ -105,11 +172,11 @@ pub struct MixParams {
     pub version: u64,
     pub gains: Vec<f32>,
     pub regions: Vec<MixRegion>,
-    pub take: Option<MixTake>,
+    pub takes: [Option<MixTake>; MAX_ACTIVE_TAKES],
 }
 
 impl MixParams {
-    pub fn from_project(p: &Project, version: u64, audition: Option<&str>) -> Self {
+    pub fn from_project(p: &Project, version: u64, active: &[String]) -> Self {
         let regions = p
             .regions()
             .iter()
@@ -119,21 +186,34 @@ impl MixParams {
                 (factor != 1.0).then(|| MixRegion { track, start: r.start, end: r.end, factor })
             })
             .collect();
-        let take = audition.and_then(|id| p.take_index(id)).map(|i| {
+        let mut takes = [None; MAX_ACTIVE_TAKES];
+        let active = active.iter().filter_map(|id| p.take_index(id)).take(MAX_ACTIVE_TAKES);
+        for (slot, i) in takes.iter_mut().zip(active) {
             let t = &p.takes()[i];
-            MixTake { stem: p.tracks.len() + i, start: t.start, end: t.end, song: t.scope == "song" }
-        });
-        Self { version, gains: p.track_gains(), regions, take }
+            let kind = match t.scope.as_str() {
+                "song" => TakeKind::Song,
+                "section" => TakeKind::Section,
+                "lane" => match t.track.as_deref().and_then(|id| p.track_index(id)) {
+                    Some(track) => TakeKind::Lane(track),
+                    None => continue,
+                },
+                _ => TakeKind::Layer(t.track.as_deref().and_then(|id| p.track_index(id))),
+            };
+            *slot = Some(MixTake {
+                stem: p.tracks.len() + i,
+                start: t.start,
+                end: t.end,
+                kind,
+                blend: t.blend() as f32,
+                fade_in: t.start > 0.01,
+                fade_out: t.end < p.duration - 0.01,
+            });
+        }
+        Self { version, gains: p.track_gains(), regions, takes }
     }
 
-    /// How much of the take is heard at t (0 = lanes only, 1 = take only).
-    #[inline]
-    fn take_weight(&self, t: f64) -> f32 {
-        match self.take {
-            None => 0.0,
-            Some(k) if k.song => 1.0,
-            Some(k) => (((t - k.start) / TAKE_RAMP_S).clamp(0.0, 1.0) * ((k.end - t) / TAKE_RAMP_S).clamp(0.0, 1.0)) as f32,
-        }
+    fn song_take(&self) -> Option<MixTake> {
+        self.takes.iter().flatten().find(|k| k.kind == TakeKind::Song).copied()
     }
 
     /// Gain of one track at time t (seconds), with short linear ramps at region edges.
@@ -153,6 +233,37 @@ impl MixParams {
         }
         g
     }
+
+    /// Gain of lane `track` at t, under the takes that replace it there.
+    #[inline]
+    fn lane_gain_at(&self, track: usize, t: f64) -> f32 {
+        let mut g = self.gain_at(track, t);
+        for k in self.takes.iter().flatten() {
+            match k.kind {
+                TakeKind::Section => g *= 1.0 - k.weight(t),
+                TakeKind::Lane(lane) if lane == track => g *= 1.0 - k.blend * k.weight(t),
+                _ => {}
+            }
+        }
+        g
+    }
+}
+
+impl MixTake {
+    /// 0..1: how present the take's range is at t (ramps inside its edges).
+    #[inline]
+    fn weight(&self, t: f64) -> f32 {
+        if t < self.start || t > self.end {
+            return 0.0;
+        }
+        let a = if self.fade_in { ((t - self.start) / TAKE_RAMP_S).min(1.0) } else { 1.0 };
+        let b = if self.fade_out { ((self.end - t) / TAKE_RAMP_S).min(1.0) } else { 1.0 };
+        (a * b) as f32
+    }
+
+    fn touches(&self, t0: f64, t1: f64) -> bool {
+        self.end > t0 && self.start < t1
+    }
 }
 
 /// Mix frames [start, start + out_l.len()) of all stems into out_l / out_r
@@ -163,48 +274,51 @@ pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out
     let inv_sr = 1.0 / sr as f64;
     let t0 = start as f64 * inv_sr;
     let t1 = (start + out_l.len()) as f64 * inv_sr;
-    // The take's span touches this block: lanes fade out under it.
-    let take_here = mix.take.filter(|k| k.song || (k.end > t0 && k.start < t1));
-    if take_here.is_some_and(|k| k.song) {
-        // A song take is the whole song: the lanes are silent.
-    } else {
-        for (ti, s) in stems.iter().enumerate() {
-            if mix.gains.get(ti).copied().unwrap_or(0.0) == 0.0 {
-                continue;
-            }
-            let varies = take_here.is_some() || mix.regions.iter().any(|r| r.track == ti);
-            let flat = mix.gain_at(ti, t0);
-            for i in 0..out_l.len() {
-                let f = start + i;
-                if f >= s.l.len() {
-                    break;
-                }
-                let g = if varies {
-                    let t = f as f64 * inv_sr;
-                    mix.gain_at(ti, t) * (1.0 - mix.take_weight(t))
-                } else {
-                    flat
-                };
-                out_l[i] += s.l[f] * g;
-                out_r[i] += s.r[f] * g;
-            }
-        }
-    }
-    if let Some(k) = take_here {
-        let Some(s) = stems.get(k.stem) else { return };
-        let offset = (k.start.max(0.0) * sr as f64) as usize;
+    let add = |out_l: &mut [f32], out_r: &mut [f32], s: &Stem, offset: usize, gain: &dyn Fn(f64) -> f32| {
         for i in 0..out_l.len() {
             let f = start + i;
             if f < offset || f - offset >= s.l.len() {
                 continue;
             }
-            let w = mix.take_weight(f as f64 * inv_sr);
-            out_l[i] += s.l[f - offset] * w;
-            out_r[i] += s.r[f - offset] * w;
+            let g = gain(f as f64 * inv_sr);
+            out_l[i] += s.l[f - offset] * g;
+            out_r[i] += s.r[f - offset] * g;
+        }
+    };
+    // A song take is the whole song: only it plays.
+    if let Some(k) = mix.song_take() {
+        if let Some(s) = stems.get(k.stem) {
+            add(out_l, out_r, s, 0, &|_| 1.0);
+        }
+        return;
+    }
+    let tracks = mix.gains.len().min(stems.len());
+    for (ti, s) in stems[..tracks].iter().enumerate() {
+        if mix.gains[ti] == 0.0 {
+            continue;
+        }
+        let varies = mix.regions.iter().any(|r| r.track == ti)
+            || mix.takes.iter().flatten().any(|k| matches!(k.kind, TakeKind::Section) || k.kind == TakeKind::Lane(ti));
+        if varies {
+            add(out_l, out_r, s, 0, &|t| mix.lane_gain_at(ti, t));
+        } else {
+            let flat = mix.gains[ti];
+            add(out_l, out_r, s, 0, &|_| flat);
+        }
+    }
+    for k in mix.takes.iter().flatten().filter(|k| k.touches(t0, t1)) {
+        let Some(s) = stems.get(k.stem) else { continue };
+        let offset = (k.start.max(0.0) * sr as f64) as usize;
+        match k.kind {
+            TakeKind::Section => add(out_l, out_r, s, offset, &|t| k.weight(t)),
+            // A lane take follows its lane's level, mute and solo.
+            TakeKind::Lane(lane) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t) * mix.gain_at(lane, t)),
+            TakeKind::Layer(None) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t)),
+            TakeKind::Layer(Some(lane)) => add(out_l, out_r, s, offset, &|t| k.blend * k.weight(t) * mix.gain_at(lane, t)),
+            TakeKind::Song => {}
         }
     }
 }
-
 /// State shared with the audio callback: transport flags and the published mix.
 /// The callback only `try_lock`s `mix` and keeps its own copy when the UI holds it.
 pub struct Shared {
@@ -271,9 +385,9 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         }
         // The song ends with its lanes, or with the song take being heard.
         let lanes = stems.iter().take(cache.gains.len()).map(|s| s.l.len()).max().unwrap_or(0);
-        let total = match cache.take {
-            Some(k) if k.song => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
-            _ => lanes,
+        let total = match cache.song_take() {
+            Some(k) => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
+            None => lanes,
         };
         if !shared.playing() {
             return;
@@ -322,6 +436,10 @@ pub enum Job {
     Generate { bundle: PathBuf, take: Take, fixture: Yue2Fixture, sr: u32 },
     /// Repaint [take.start, take.end] of `src` with ACE-Step into `bundle/<take.file>`.
     Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
+    /// Split `lane` into dry voice and echo; the dry voice is the take.
+    Dereverb { bundle: PathBuf, take: Take, lane: PathBuf, sr: u32 },
+    /// A new part: lego plays it, then it is cleaned and fitted into the gaps.
+    Layer { bundle: PathBuf, take: Take, lego: LegoJob, clean: LayerJob, sr: u32 },
 }
 
 /// What `sidecar/acestep_repaint.py` reads (src, out, start and end are filled in by the job).
@@ -384,6 +502,8 @@ impl Jobs {
                         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
                         Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, &up_tx),
                         Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, &up_tx),
+                        Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, &up_tx),
+                        Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, &up_tx),
                     }
                 }
             })
@@ -413,7 +533,7 @@ fn ffmpeg() -> Option<PathBuf> {
 }
 
 /// 24-bit stereo PCM WAV.
-fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::io::Result<()> {
+pub fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::io::Result<()> {
     let frames = l.len().min(r.len());
     let data_len = (frames * 2 * 3) as u32;
     let mut b = Vec::with_capacity(44 + data_len as usize);
@@ -736,6 +856,186 @@ fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Send
     }
 }
 
+/// One run of a Poing script under `uv run --project <project>`.
+struct UvScript<'a> {
+    project: PathBuf,
+    script: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    cwd: Option<PathBuf>,
+    envs: Vec<(&'a str, std::ffi::OsString)>,
+    /// stderr goes here
+    log: PathBuf,
+}
+
+/// Run a script that prints JSON progress lines, mapping its 0..1 into
+/// [from, to] of the job (`progress`). Returns the closing "done" line's
+/// range (start, end) when it gives one.
+fn run_uv_script(run: UvScript, progress: &dyn Fn(&str, f32), from: f32, to: f32) -> Result<Option<(f64, f64)>, String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let log = std::fs::File::create(&run.log).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&run.project).arg("python").arg(&run.script).args(&run.args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
+    for (k, v) in &run.envs {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = &run.cwd {
+        cmd.current_dir(dir);
+    }
+    // Demucs and SheetSage2 decode with the ffmpeg CLI; put the one we found on PATH.
+    if let Some(ff) = ffmpeg().and_then(|f| f.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()) {
+        let mut paths = vec![ff];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("needs `uv` on PATH ({e})"))?;
+    let (mut range, mut error) = (None, None);
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
+            let message = l.message.unwrap_or_default();
+            match l.stage.as_str() {
+                "error" => error = Some(message),
+                "done" => range = l.start.zip(l.end),
+                _ => progress(&message, from + (to - from) * l.progress.unwrap_or(0.0) as f32),
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    match error {
+        Some(e) => Err(format!("{e} (see {})", run.log.display())),
+        None if !ok => Err(format!("the script exited with an error (see {})", run.log.display())),
+        None => Ok(range),
+    }
+}
+
+/// Split lane `lane` into dry voice and echo (`sidecar/dereverb`); the dry
+/// voice over the take's range is the take. Its blend sets how much echo is
+/// left: lane * (1 - b) + dry * b = dry + (1 - b) * echo.
+fn dereverb(bundle: &Path, take: Take, lane: &Path, sr: u32, tx: &Sender<JobUpdate>) {
+    let n = take.id.trim_start_matches('t').to_string();
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("Take {n} failed: {why}") });
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Take {n}  ·  {message}"), progress })
+    };
+    progress("Starting the de-reverb", 0.0);
+    let work = bundle.join("takes").join(&take.id);
+    if let Err(e) = std::fs::create_dir_all(&work) {
+        return fail(e.to_string());
+    }
+    let project = sidecar_dir().join("dereverb");
+    let run = UvScript {
+        script: project.join("poing_dereverb.py"),
+        project,
+        args: vec![lane.into(), work.clone().into(), take.start.to_string().into(), take.end.to_string().into()],
+        cwd: None,
+        envs: Vec::new(),
+        log: work.join("render.log"),
+    };
+    if let Err(e) = run_uv_script(run, &progress, 0.0, 1.0) {
+        return fail(e);
+    }
+    finish_take(bundle, take, &work.join("dry.wav"), sr, tx, &fail);
+}
+
+/// What `sidecar/acestep_lego.py` reads.
+#[derive(SerJson, Clone, Default)]
+pub struct LegoJob {
+    pub src: String,
+    pub out: String,
+    pub track: String,
+    pub caption: String,
+    pub seed: u64,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+}
+
+/// What `sidecar/poing_layer.py` reads.
+#[derive(SerJson, Clone, Default)]
+pub struct LayerJob {
+    pub src: String,
+    pub out: String,
+    pub stem: String,
+    /// The lane whose gaps the layer fills (full level where it is thin).
+    pub reference: Option<String>,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A new part: ACE-Step lego plays it against the song, then Demucs keeps
+/// just that instrument and it is fitted into the reference lane's gaps.
+fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: u32, tx: &Sender<JobUpdate>) {
+    let n = take.id.trim_start_matches('t').to_string();
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("Take {n} failed: {why}") });
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Take {n}  ·  {message}"), progress })
+    };
+    progress("Starting ACE-Step", 0.0);
+    let work = bundle.join("takes").join(&take.id);
+    if let Err(e) = std::fs::create_dir_all(&work) {
+        return fail(e.to_string());
+    }
+    let played = work.join("lego.wav");
+    let cleaned = work.join("layer.wav");
+    lego.out = played.to_string_lossy().into_owned();
+    clean.src = lego.out.clone();
+    clean.out = cleaned.to_string_lossy().into_owned();
+    let (lego_json, layer_json) = (work.join("lego.json"), work.join("layer.json"));
+    if let Err(e) = std::fs::write(&lego_json, lego.serialize_json()).and_then(|_| std::fs::write(&layer_json, clean.serialize_json())) {
+        return fail(e.to_string());
+    }
+    let ace = acestep_dir();
+    let run = UvScript {
+        project: ace.clone(),
+        script: sidecar_dir().join("acestep_lego.py"),
+        args: vec![lego_json.into()],
+        cwd: Some(ace.clone()),
+        envs: vec![("POING_ACESTEP", ace.into())],
+        log: work.join("lego.log"),
+    };
+    if let Err(e) = run_uv_script(run, &progress, 0.0, 0.75) {
+        return fail(e);
+    }
+    let run = UvScript {
+        project: sidecar_dir(),
+        script: sidecar_dir().join("poing_layer.py"),
+        args: vec![layer_json.into()],
+        cwd: None,
+        envs: Vec::new(),
+        log: work.join("layer.log"),
+    };
+    if let Err(e) = run_uv_script(run, &progress, 0.75, 1.0) {
+        return fail(e);
+    }
+    let _ = std::fs::remove_file(&played);
+    finish_take(bundle, take, &cleaned, sr, tx, &fail);
+}
+
+/// Move a rendered take into place, decode it and hand it to the UI.
+fn finish_take(bundle: &Path, take: Take, rendered: &Path, sr: u32, tx: &Sender<JobUpdate>, fail: &dyn Fn(String)) {
+    let dest = bundle.join(&take.file);
+    if let Err(e) = std::fs::rename(rendered, &dest).or_else(|_| std::fs::copy(rendered, &dest).map(|_| ())) {
+        return fail(format!("move {}: {e}", rendered.display()));
+    }
+    match load_stem(&dest, sr) {
+        Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
+        Err(e) => fail(e),
+    }
+}
+
 /// The ACE-Step 1.5 checkout (a uv project): `POING_ACESTEP`, else
 /// `ACE-Step-1.5` next to this repository.
 fn acestep_dir() -> PathBuf {
@@ -817,7 +1117,7 @@ fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u
 
 #[cfg(test)]
 mod tests {
-    use super::{mix_into, yue2_progress, MixParams, MixTake, Stem};
+    use super::{mix_into, yue2_progress, MixParams, MixTake, Stem, TakeKind, MAX_ACTIVE_TAKES};
     use std::sync::Arc;
 
     fn constant(v: f32, frames: usize) -> Arc<Stem> {
@@ -827,7 +1127,7 @@ mod tests {
     #[test]
     fn a_song_take_replaces_the_lanes() {
         let stems = vec![constant(0.25, 1000), constant(1.0, 1500)];
-        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 0.0, end: 1.5, song: true }), ..Default::default() };
+        let mix = with_takes(&[MixTake { stem: 1, start: 0.0, end: 1.5, ..Default::default() }]);
         let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
         mix_into(&stems, &mix, 1000, 1200, &mut l, &mut r);
         assert!(l.iter().chain(&r).all(|&x| x == 1.0), "past the lanes' end the take still plays alone");
@@ -837,7 +1137,8 @@ mod tests {
     fn a_section_take_crossfades_in_its_range() {
         // lanes 0.25 everywhere for 4 s; a 2 s take placed at 1 s (rate 1000)
         let stems = vec![constant(0.25, 4000), constant(1.0, 2000)];
-        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 1.0, end: 3.0, song: false }), ..Default::default() };
+        let section = MixTake { stem: 1, start: 1.0, end: 3.0, kind: TakeKind::Section, blend: 1.0, fade_in: true, fade_out: true };
+        let mix = with_takes(&[section]);
         let (mut l, mut r) = (vec![0.0; 4000], vec![0.0; 4000]);
         mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
         assert_eq!(l[500], 0.25, "before the take: lanes");
@@ -848,6 +1149,50 @@ mod tests {
         let (mut l2, mut r2) = (vec![0.0; 10], vec![0.0; 10]);
         mix_into(&stems, &mix, 1000, 2000, &mut l2, &mut r2);
         assert_eq!(l2[0], 1.0);
+    }
+
+    /// One lane at unity plus these takes.
+    fn with_takes(takes: &[MixTake]) -> MixParams {
+        let mut mix = MixParams { gains: vec![1.0], ..Default::default() };
+        for (slot, k) in mix.takes.iter_mut().zip(takes) {
+            *slot = Some(*k);
+        }
+        mix
+    }
+
+    #[test]
+    fn a_lane_take_blends_into_its_lane_like_dry_plus_some_echo() {
+        // vocals = dry 0.6 + wet 0.4; the take is the dry voice; blend 0.65
+        // must sound like dry + 0.35 * wet (the disco v4 vocal).
+        let stems = vec![constant(1.0, 1000), constant(0.6, 1000)];
+        let lane = MixTake { stem: 1, start: 0.0, end: 1.0, kind: TakeKind::Lane(0), blend: 0.65, ..Default::default() };
+        let mix = with_takes(&[lane]);
+        let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        assert!((l[50] - (0.6 + 0.35 * 0.4)).abs() < 1e-6, "{}", l[50]);
+    }
+
+    #[test]
+    fn layers_and_lane_takes_stack() {
+        let stems = vec![constant(0.5, 1000), constant(0.25, 1000), constant(0.2, 1000), constant(0.1, 1000)];
+        let mut mix = with_takes(&[
+            MixTake { stem: 2, start: 0.0, end: 1.0, kind: TakeKind::Lane(0), blend: 1.0, ..Default::default() },
+            MixTake { stem: 3, start: 0.0, end: 1.0, kind: TakeKind::Layer(Some(1)), blend: 0.5, ..Default::default() },
+        ]);
+        mix.gains = vec![1.0, 1.0];
+        let (mut l, mut r) = (vec![0.0; 10], vec![0.0; 10]);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        // lane 0 replaced by 0.2, lane 1 kept at 0.25, layer adds 0.05
+        assert!((l[5] - 0.5).abs() < 1e-6, "{}", l[5]);
+        // muting lane 0 mutes its lane take too
+        mix.gains[0] = 0.0;
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        assert!((l[5] - 0.3).abs() < 1e-6, "{}", l[5]);
+        // and a layer follows the lane it was added to (solo another lane: it goes quiet)
+        mix.gains = vec![1.0, 0.0];
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
+        assert!((l[5] - 0.2).abs() < 1e-6, "{}", l[5]);
+        assert_eq!(MAX_ACTIVE_TAKES, mix.takes.len());
     }
 
     #[test]
