@@ -14,6 +14,11 @@ use std::sync::{Arc, Mutex};
 pub const PEAK_BLOCK: usize = 256;
 /// Region edges fade over this many seconds, in playback and render alike.
 const REGION_RAMP_S: f64 = 0.010;
+/// A section take fades in and out over this long, inside its margin (where it
+/// is still the original), so the seam is inaudible.
+pub const TAKE_RAMP_S: f64 = 0.5;
+/// Seconds of original kept on each side of a repainted range.
+pub const TAKE_MARGIN_S: f64 = 1.0;
 
 /// A song's lanes, in track order. Each stem is shared, so adding lanes copies
 /// pointers, not audio.
@@ -127,7 +132,7 @@ impl MixParams {
         match self.take {
             None => 0.0,
             Some(k) if k.song => 1.0,
-            Some(k) => (((t - k.start) / REGION_RAMP_S).clamp(0.0, 1.0) * ((k.end - t) / REGION_RAMP_S).clamp(0.0, 1.0)) as f32,
+            Some(k) => (((t - k.start) / TAKE_RAMP_S).clamp(0.0, 1.0) * ((k.end - t) / TAKE_RAMP_S).clamp(0.0, 1.0)) as f32,
         }
     }
 
@@ -159,7 +164,7 @@ pub fn mix_into(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, start: usize, out
     let t0 = start as f64 * inv_sr;
     let t1 = (start + out_l.len()) as f64 * inv_sr;
     // The take's span touches this block: lanes fade out under it.
-    let take_here = mix.take.filter(|k| k.song || (k.end > t0 - REGION_RAMP_S && k.start < t1 + REGION_RAMP_S));
+    let take_here = mix.take.filter(|k| k.song || (k.end > t0 && k.start < t1));
     if take_here.is_some_and(|k| k.song) {
         // A song take is the whole song: the lanes are silent.
     } else {
@@ -315,6 +320,23 @@ pub enum Job {
     Analyze { audio: PathBuf, bundle: PathBuf, sr: u32 },
     /// Render a take with native YuE2 from `fixture` into `bundle/<take.file>`.
     Generate { bundle: PathBuf, take: Take, fixture: Yue2Fixture, sr: u32 },
+    /// Repaint [take.start, take.end] of `src` with ACE-Step into `bundle/<take.file>`.
+    Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
+}
+
+/// What `sidecar/acestep_repaint.py` reads (src, out, start and end are filled in by the job).
+#[derive(SerJson, Clone, Default)]
+pub struct RepaintJob {
+    pub src: String,
+    pub out: String,
+    pub start: f64,
+    pub end: f64,
+    pub margin: f64,
+    pub caption: String,
+    pub lyrics: String,
+    pub seed: u64,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
 }
 
 /// What `yue2_render --fixture` reads: style, section-tagged lyrics, seed,
@@ -361,6 +383,7 @@ impl Jobs {
                         Job::Render { stems, mix, sr, out_dir, name } => render(&stems, &mix, sr, &out_dir, &name, &up_tx),
                         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
                         Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, &up_tx),
+                        Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, &up_tx),
                     }
                 }
             })
@@ -500,6 +523,9 @@ struct SidecarLine {
     stage: String,
     progress: Option<f64>,
     message: Option<String>,
+    /// Repaint: where the written range starts and ends in the song.
+    start: Option<f64>,
+    end: Option<f64>,
 }
 
 /// Run the sidecar on `audio` into `bundle`, relaying its progress, then decode
@@ -710,6 +736,85 @@ fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Send
     }
 }
 
+/// The ACE-Step 1.5 checkout (a uv project): `POING_ACESTEP`, else
+/// `ACE-Step-1.5` next to this repository.
+fn acestep_dir() -> PathBuf {
+    std::env::var_os("POING_ACESTEP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("ACE-Step-1.5"))
+}
+
+/// Repaint one range with ACE-Step (`sidecar/acestep_repaint.py` in its uv
+/// project), relaying progress; the take covers the range plus its margins.
+fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u32, tx: &Sender<JobUpdate>) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let n = take.id.trim_start_matches('t').to_string();
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("Take {n} failed: {why}") });
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Take {n}  ·  {message}"), progress })
+    };
+    progress("Starting ACE-Step", 0.0);
+    let work = bundle.join("takes").join(&take.id);
+    if let Err(e) = std::fs::create_dir_all(&work) {
+        return fail(e.to_string());
+    }
+    let dest = bundle.join(&take.file);
+    job.src = src.to_string_lossy().into_owned();
+    job.out = dest.to_string_lossy().into_owned();
+    let job_path = work.join("job.json");
+    if let Err(e) = std::fs::write(&job_path, job.serialize_json()) {
+        return fail(e.to_string());
+    }
+    let ace = acestep_dir();
+    let log = match std::fs::File::create(work.join("render.log")) {
+        Ok(f) => f,
+        Err(e) => return fail(e.to_string()),
+    };
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&ace).arg("python").arg(sidecar_dir().join("acestep_repaint.py")).arg(&job_path)
+        .current_dir(&ace)
+        .env("POING_ACESTEP", &ace)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return fail(format!("repaint needs `uv` on PATH ({e})")),
+    };
+    let (mut range, mut error) = (None, None);
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
+            let message = l.message.unwrap_or_default();
+            match l.stage.as_str() {
+                "error" => error = Some(message),
+                "done" => range = l.start.zip(l.end),
+                _ => progress(&message, l.progress.unwrap_or(0.0) as f32),
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    let Some((start, end)) = range.filter(|_| ok && error.is_none()) else {
+        let why = error.unwrap_or_else(|| "ACE-Step exited with an error".into());
+        return fail(format!("{why} (see {})", work.join("render.log").display()));
+    };
+    take.start = start;
+    take.end = end;
+    match load_stem(&dest, sr) {
+        Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
+        Err(e) => fail(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{mix_into, yue2_progress, MixParams, MixTake, Stem};
@@ -730,15 +835,19 @@ mod tests {
 
     #[test]
     fn a_section_take_crossfades_in_its_range() {
-        // lanes 0.25 everywhere; a 0.4 s take placed at 0.3 s
-        let stems = vec![constant(0.25, 1000), constant(1.0, 400)];
-        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 0.3, end: 0.7, song: false }), ..Default::default() };
-        let (mut l, mut r) = (vec![0.0; 1000], vec![0.0; 1000]);
+        // lanes 0.25 everywhere for 4 s; a 2 s take placed at 1 s (rate 1000)
+        let stems = vec![constant(0.25, 4000), constant(1.0, 2000)];
+        let mix = MixParams { gains: vec![1.0], take: Some(MixTake { stem: 1, start: 1.0, end: 3.0, song: false }), ..Default::default() };
+        let (mut l, mut r) = (vec![0.0; 4000], vec![0.0; 4000]);
         mix_into(&stems, &mix, 1000, 0, &mut l, &mut r);
-        assert_eq!(l[100], 0.25, "before the take: lanes");
-        assert_eq!(l[500], 1.0, "inside: the take alone");
-        assert_eq!(l[900], 0.25, "after: lanes again");
-        assert!(l[305] > 0.25 && l[305] < 1.0, "the edge is a ramp, not a click");
+        assert_eq!(l[500], 0.25, "before the take: lanes");
+        assert_eq!(l[2000], 1.0, "inside: the take alone");
+        assert_eq!(l[3500], 0.25, "after: lanes again");
+        assert!((l[1250] - 0.625).abs() < 1e-6, "halfway up the ramp: an even blend");
+        // a block that starts inside the take plays it from the right offset
+        let (mut l2, mut r2) = (vec![0.0; 10], vec![0.0; 10]);
+        mix_into(&stems, &mix, 1000, 2000, &mut l2, &mut r2);
+        assert_eq!(l2[0], 1.0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 An AI-native music workstation. Poing shows how a song is built, lets you replace any part of it per stem, per section or entirely, from a prompt and/or reference audio, and hosts instruments and effects (Splash audio shaders, CLAP, VST3, AU) that you or an AI agent can play. Native, fast, realtime where physics allows, on macOS, Windows and Linux. Built on [Makepad](https://github.com/makepad/makepad) 2.0 (`work` branch).
 
-Status: M0-M2 done; M3 song covers done (2026-10-22): "It's Autumn" Beatles cover from Describe to playable take in 46 s, Keep re-analyses it. Section repaint (ACE-Step) is next. The previous Poing (a MusicGen VST3/CLAP plugin) is archived at tag [`legacy-musicgen-plugin`](https://github.com/gijzelaerr/poing/tree/legacy-musicgen-plugin).
+Status: M0-M2 done; M3 song covers done (2026-10-22): "It's Autumn" Beatles cover from Describe to playable take in 46 s, Keep re-analyses it; section repaint with ACE-Step in 30 s with seamless 1 s cross-fades. M4 (per-stem replace) is next. The previous Poing (a MusicGen VST3/CLAP plugin) is archived at tag [`legacy-musicgen-plugin`](https://github.com/gijzelaerr/poing/tree/legacy-musicgen-plugin).
 
 ---
 

@@ -12,7 +12,7 @@ pub(crate) use poing_model as model;
 mod state;
 mod timeline;
 
-use audio::{Job, JobUpdate, Jobs, Stem, Yue2Fixture};
+use audio::{Job, JobUpdate, Jobs, RepaintJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
 use model::{default_gain_for, Analysis, Project, Take, REGION_KINDS};
@@ -181,6 +181,9 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
     let abc = std::fs::read_to_string(bundle.join("score").join("score.abc")).ok().filter(|s| !s.trim().is_empty());
     let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
+    if let Selection::Section(i) = st.sel {
+        return repaint_section(st, jobs, bundle, i, text, lyrics);
+    }
     // Key and tempo anchor the style, as in the cover that worked.
     let mut style = text.to_string();
     if let Some(a) = &st.project.analysis {
@@ -216,6 +219,43 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     } else {
         format!("Making take {n}; no score was found, so YuE2 writes its own (slower)...")
     }
+}
+
+/// Describe on a selected section: ACE-Step repaints that range of the song
+/// (the source audio), keeping a second of original each side for the seam.
+fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize, text: &str, lyrics: String) -> String {
+    let Some(section) = st.project.sections().get(i).cloned() else { return "No such section".into() };
+    let Some(source) = st.project.source.clone() else { return "This project has no source audio to repaint".into() };
+    let (id, seed) = st.project.next_take();
+    let n = id.trim_start_matches('t').to_string();
+    let take = Take {
+        file: format!("takes/{id}.wav"),
+        id,
+        scope: "section".into(),
+        start: section.start,
+        end: section.end,
+        engine: "acestep".into(),
+        prompt: text.to_string(),
+        seed,
+    };
+    let a = st.project.analysis.clone().unwrap_or_default();
+    let job = RepaintJob {
+        start: section.start,
+        end: section.end,
+        margin: audio::TAKE_MARGIN_S,
+        caption: text.to_string(),
+        lyrics,
+        seed,
+        bpm: a.tempo.map(f64::round),
+        key: a.key,
+        ..Default::default()
+    };
+    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, take, job, sr: st.sr() }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some((format!("Take {n}"), 0.0));
+    let _ = st.save();
+    format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", section.label, section.start, section.end)
 }
 
 /// The rate stems are decoded at (the open song's; all songs use 48 kHz).
@@ -354,16 +394,22 @@ impl App {
             }
             Selection::Section(i) if i < st.project.sections().len() => {
                 let s = st.project.sections()[i].clone();
-                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Section {}   {:.2}s - {:.2}s", i + 1, s.start, s.end));
+                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Section {}   {:.2}s - {:.2}s   ·   Describe above to repaint it", i + 1, s.start, s.end));
                 ui.text_input(cx, ids!(section_input)).set_text(cx, &s.label);
                 show_section = true;
             }
-            _ => match st.song_take() {
-                Some((_, t)) => {
+            _ => match st.audition.as_deref().and_then(|id| st.project.take_index(id)).map(|i| st.project.takes()[i].clone()) {
+                Some(t) => {
                     let n = t.id.trim_start_matches('t');
-                    let len = t.end - t.start;
-                    let title = format!("Take {n}  ·  {}  ·  seed {}  ·  {}:{:02}", t.prompt, t.seed, (len / 60.0) as u32, (len % 60.0) as u32);
+                    let span = if t.scope == "song" {
+                        let len = t.end - t.start;
+                        format!("whole song, {}:{:02}", (len / 60.0) as u32, (len % 60.0) as u32)
+                    } else {
+                        format!("{:.0}s - {:.0}s", t.start, t.end)
+                    };
+                    let title = format!("Take {n}  ·  {}  ·  {span}  ·  seed {}", t.prompt, t.seed);
                     ui.label(cx, ids!(insp_title)).set_text(cx, &title);
+                    ui.button(cx, ids!(keep_btn)).set_visible(cx, t.scope == "song");
                     show_take = true;
                 }
                 None => ui.label(cx, ids!(insp_title)).set_text(cx, HELP),

@@ -423,6 +423,23 @@ impl DawTimeline {
             }
         }
 
+        // a section take: its range glows over the lanes it replaces
+        let section_take = st
+            .audition
+            .as_deref()
+            .and_then(|id| st.project.take_index(id))
+            .map(|i| st.project.takes()[i].clone())
+            .filter(|t| t.scope != "song");
+        if let Some(t) = section_take {
+            if let Some((x, tw)) = self.span(st, t.start, t.end) {
+                let h = lane_h * n as f64;
+                self.rect(cx, x, lanes_y, tw, h, rgba(0x4fc3f7, 0.10));
+                self.outline(cx, x, lanes_y, tw, h, rgba(0x4fc3f7, 0.8));
+                self.rect(cx, x, lanes_y, tw.min(70.0), 16.0, rgba(0x4fc3f7, 1.0));
+                self.text(cx, x + 5.0, lanes_y + 2.0, rgba(0x111111, 1.0), &format!("Take {}", t.id.trim_start_matches('t')));
+            }
+        }
+
         // playhead
         let px = self.x_of(st, ph);
         if px >= x0 && px <= x0 + w {
