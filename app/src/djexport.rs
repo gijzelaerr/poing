@@ -170,9 +170,14 @@ fn encode(dir: &Path, name: &str, l: &[f32], r: &[f32], sr: u32, gain: f32, mp3:
         audio::write_wav(&wav, l, r, sr, gain).map_err(|e| fail(&wav, e))?;
         return Ok((wav, "WAV File", wav_kbps(sr), sr, None));
     }
-    audio::write_wav(&tmp, l, r, sr, gain).map_err(|e| fail(&tmp, e))?;
-    let out = if mp3 { dir.join(format!("{name}.mp3")) } else { wav.clone() };
-    let codec: &[&str] = if mp3 { &["-c:a", "libmp3lame", "-b:a", "320k"] } else { &["-c:a", "pcm_s24le"] };
+    let scaled = |x: &[f32]| x.iter().map(|v| v * gain).collect::<Vec<f32>>();
+    std::fs::write(&tmp, crate::export::wav_f32_bytes(&scaled(l), &scaled(r), sr)).map_err(|e| fail(&tmp, e))?;
+    // ffmpeg resamples (and encodes the MP3); a WAV it would write as
+    // WAVE_FORMAT_EXTENSIBLE, which some DJ players refuse, so it hands back
+    // raw samples and Poing writes a plain PCM WAV
+    let raw = dir.join(format!("{name}.part.f32"));
+    let out = if mp3 { dir.join(format!("{name}.mp3")) } else { raw.clone() };
+    let codec: &[&str] = if mp3 { &["-c:a", "libmp3lame", "-b:a", "320k"] } else { &["-f", "f32le", "-c:a", "pcm_f32le", "-ac", "2"] };
     let convert = |resampler: Option<&str>| {
         let mut c = Command::new(ff);
         c.args(["-v", "error", "-y", "-i"]).arg(&tmp);
@@ -185,9 +190,18 @@ fn encode(dir: &Path, name: &str, l: &[f32], r: &[f32], sr: u32, gain: f32, mp3:
     let ok = convert(Some("aresample=resampler=soxr")) || convert(None);
     let _ = std::fs::remove_file(&tmp);
     if !ok {
+        let _ = std::fs::remove_file(&raw);
         return Err(format!("ffmpeg could not write {}", out.display()));
     }
-    Ok(if mp3 { (out, "MP3 File", 320, DJ_RATE, None) } else { (out, "WAV File", wav_kbps(DJ_RATE), DJ_RATE, None) })
+    if mp3 {
+        return Ok((out, "MP3 File", 320, DJ_RATE, None));
+    }
+    let bytes = std::fs::read(&raw).map_err(|e| fail(&raw, e));
+    let _ = std::fs::remove_file(&raw);
+    let samples: Vec<f32> = bytes?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let (l44, r44): (Vec<f32>, Vec<f32>) = samples.chunks_exact(2).map(|f| (f[0], f[1])).unzip();
+    audio::write_wav(&wav, &l44, &r44, DJ_RATE, 1.0).map_err(|e| fail(&wav, e))?;
+    Ok((wav, "WAV File", wav_kbps(DJ_RATE), DJ_RATE, None))
 }
 
 fn read_manifests(dir: &Path) -> Vec<DjSong> {

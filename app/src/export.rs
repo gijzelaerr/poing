@@ -577,7 +577,7 @@ pub fn dawproject_xml(map: &TempoMap, tracks: &[DawTrack], sections: &[poing_mod
     }
     x.push_str("    </Lanes>\n");
     if !sections.is_empty() {
-        x.push_str("    <Markers id=\"markers\">\n");
+        x.push_str("    <Markers id=\"markers\" timeUnit=\"beats\">\n");
         for s in sections {
             x.push_str(&format!("      <Marker time=\"{}\" name=\"{}\"/>\n", f(map.beat_of(s.start)), xml_escape(&s.label)));
         }
