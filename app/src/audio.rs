@@ -687,6 +687,8 @@ pub enum JobUpdate {
     MidiReady { bundle: PathBuf, name: String, role: String, notes: Vec<poing_model::Note>, request: String, note: String },
     /// A job for `bundle` is done (its status line says what came of it).
     Finished { bundle: PathBuf, message: String },
+    /// The worker finished job number `seq` (whatever it was): sent after its last update.
+    JobDone { seq: u64 },
     /// A song made from a prompt has its first version: open it.
     SongReady { project: PathBuf },
     /// Progress of a job that has no song open yet (a new song being made).
@@ -698,6 +700,9 @@ pub enum JobUpdate {
 pub struct Jobs {
     tx: Sender<Job>,
     pub rx: Receiver<JobUpdate>,
+    /// Jobs submitted so far: job n is the n-th, and the worker answers each
+    /// with `JobDone { seq: n }` when it is finished.
+    submitted: AtomicU64,
 }
 
 impl Jobs {
@@ -708,7 +713,9 @@ impl Jobs {
         let _ = cx
             .thread_spawner()
             .spawn_worker(ThreadOptions { name: Some("poing-jobs".into()), ..Default::default() }, move || {
+                let mut seq = 0u64;
                 while let Ok(job) = job_rx.recv() {
+                    seq += 1;
                     match job {
                         Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, &up_tx),
                         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
@@ -721,14 +728,24 @@ impl Jobs {
                         Job::Song { prompt, dir, count, sr } => make_song(&prompt, &dir, count, sr, &up_tx),
                         Job::Remix { bundle, takes, job, sr } => remix(&bundle, takes, job, sr, &up_tx),
                     }
+                    send(&up_tx, JobUpdate::JobDone { seq });
                 }
             })
             .map(|h| h.detach());
-        Jobs { tx, rx }
+        Jobs { tx, rx, submitted: AtomicU64::new(0) }
     }
 
     pub fn submit(&self, job: Job) -> bool {
-        self.tx.send(job).is_ok()
+        let ok = self.tx.send(job).is_ok();
+        if ok {
+            self.submitted.fetch_add(1, Ordering::SeqCst);
+        }
+        ok
+    }
+
+    /// The sequence number of the last job submitted.
+    pub fn last_seq(&self) -> u64 {
+        self.submitted.load(Ordering::SeqCst)
     }
 }
 

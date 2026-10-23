@@ -95,6 +95,10 @@ pub struct EditorState {
     pub next_instrument: Option<(String, PathBuf)>,
     /// A remix asked for when the song was dropped: made once it is understood.
     pub pending_remix: Option<String>,
+    /// Describe from the bar (not from an agent's tool): a request with nothing
+    /// selected may go to Claude, which then sets `ask_agent`.
+    pub agent_ok: bool,
+    pub ask_agent: Option<String>,
 }
 
 impl EditorState {
@@ -172,6 +176,8 @@ impl EditorState {
             pending_insts: Vec::new(),
             next_instrument: None,
             pending_remix: None,
+            agent_ok: false,
+            ask_agent: None,
         }
         .with_fx()
     }

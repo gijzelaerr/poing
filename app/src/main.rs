@@ -354,6 +354,12 @@ pub struct App {
     /// Poing's tools for an agent (Claude Code over `makepad-remote mcp poing`).
     #[rust]
     ai_port: Option<makepad_ai_services::port::AiServicePort>,
+    /// Tool calls waiting for the job they started: (call id, job number).
+    #[rust]
+    parked: Vec<(String, u64)>,
+    /// Claude working on a request from the Describe bar: its answer arrives here.
+    #[rust]
+    agent_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -594,6 +600,18 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     };
     if let Some((i, range)) = lane {
         return describe_lane(st, jobs, bundle, i, range, text);
+    }
+    // With nothing selected, anything else goes to Claude (from the bar only):
+    // it can change the mix with Poing's tools, or still ask for a remix.
+    if st.sel == Selection::None && st.agent_ok {
+        match agent::unavailable() {
+            None => {
+                st.ask_agent = Some(text.to_string());
+                return "Claude is working on it (it uses Poing's own tools; Ctrl+Z undoes the whole pass)...".into();
+            }
+            Some(why) if agent::is_mix_text(text) => return format!("Changing the mix in words needs Claude here, but {why}. Use the lane levels and chips meanwhile."),
+            Some(_) => {}
+        }
     }
     // Without native YuE2 here, the whole song is remixed with ACE-Step instead.
     if !audio::yue2_available() {
@@ -1235,6 +1253,22 @@ impl App {
         let open_bundle = self.state.as_ref().and_then(|st| st.path.parent().map(Path::to_path_buf));
         let mine = |b: &Path| open_bundle.as_deref() == Some(b);
         for u in updates {
+            if let JobUpdate::JobDone { seq } = u {
+                let status = self.ui.label(cx, ids!(status_label)).text();
+                let (done, waiting): (Vec<_>, Vec<_>) = self.parked.drain(..).partition(|(_, s)| *s <= seq);
+                self.parked = waiting;
+                if let Some(port) = self.ai_port.as_ref() {
+                    for (call_id, _) in done {
+                        port.reply(makepad_ai_services::wire::ToolResult::ok(&call_id, status.clone(), ""));
+                    }
+                }
+                continue;
+            }
+            if let (JobUpdate::Progress { message, progress, .. }, Some(port)) = (&u, self.ai_port.as_ref()) {
+                for (call_id, _) in &self.parked {
+                    port.progress(call_id, message, (progress * 1000.0) as u16);
+                }
+            }
             let status = match u {
                 JobUpdate::Status(s) | JobUpdate::Done(s) => s,
                 JobUpdate::Failed { bundle, message } => {
@@ -1247,6 +1281,7 @@ impl App {
                     }
                     message
                 }
+                JobUpdate::JobDone { .. } => continue,
                 JobUpdate::Starting { message, progress } => {
                     let line = format!("{message}  {:.0}%", progress * 100.0);
                     self.ui.label(cx, ids!(home_status)).set_text(cx, &line);
@@ -1371,16 +1406,34 @@ impl App {
             None => return,
         };
         for e in events {
-            if let PortEvent::Call(call) = e {
-                let result = self.agent_call(cx, &call);
-                if let Some(port) = self.ai_port.as_ref() {
-                    port.reply(result);
+            match e {
+                PortEvent::Call(call) => {
+                    // None: parked until the job it started is done
+                    if let Some(result) = self.agent_call(cx, &call) {
+                        if let Some(port) = self.ai_port.as_ref() {
+                            port.reply(result);
+                        }
+                    }
                 }
+                PortEvent::Cancel { call_id } => self.parked.retain(|(id, _)| *id != call_id),
+                _ => {}
             }
         }
     }
 
-    fn agent_call(&mut self, cx: &mut Cx, call: &makepad_ai_services::wire::ServiceCall) -> makepad_ai_services::wire::ToolResult {
+    fn agent_call(&mut self, cx: &mut Cx, call: &makepad_ai_services::wire::ServiceCall) -> Option<makepad_ai_services::wire::ToolResult> {
+        let seq_before = self.jobs.as_ref().map_or(0, |j| j.last_seq());
+        let result = self.agent_tool(cx, call);
+        let seq_after = self.jobs.as_ref().map_or(0, |j| j.last_seq());
+        // a job was started: answer when it is done, with what came of it
+        if seq_after > seq_before && result.outcome == makepad_ai_services::wire::ToolOutcome::Ok {
+            self.parked.push((call.call_id.clone(), seq_after));
+            return None;
+        }
+        Some(result)
+    }
+
+    fn agent_tool(&mut self, cx: &mut Cx, call: &makepad_ai_services::wire::ServiceCall) -> makepad_ai_services::wire::ToolResult {
         use agent::{get, index, num};
         use makepad_ai_services::wire::ToolResult;
         let id = call.call_id.clone();
@@ -1417,10 +1470,43 @@ impl App {
                     })
                 }
             },
+            "add_part" => match (get(&a, "role").and_then(|v| v.as_str()), get(&a, "text").and_then(|v| v.as_str())) {
+                (Some(role @ ("bass" | "keys" | "lead" | "drums")), Some(text)) => {
+                    let role: &'static str = match role {
+                        "bass" => "bass",
+                        "keys" => "keys",
+                        "drums" => "drums",
+                        _ => "lead",
+                    };
+                    match index(&a, "section") {
+                        Some(s) if s >= st.project.sections().len() => Err("no such section".into()),
+                        sel => {
+                            st.select(sel.map_or(Selection::None, Selection::Section));
+                            let named = get(&a, "instrument").and_then(|v| v.as_str()).map(|n| n.to_string());
+                            st.next_instrument = named.as_deref().and_then(|n| named_plugin(st, n));
+                            if named.is_some() && st.next_instrument.is_none() {
+                                Err(format!("no installed instrument called {}", named.unwrap_or_default()))
+                            } else if st.analysing.is_some() {
+                                Err("a job is still running; try again when song.busy is false".into())
+                            } else {
+                                let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+                                match self.jobs.as_ref() {
+                                    Some(jobs) => Ok(write_midi(st, jobs, bundle, role, text)),
+                                    None => Err("the job worker is not running".into()),
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => Err("give a role (bass, keys, lead or drums) and the style in `text`".into()),
+            },
             "set_lane" => match index(&a, "lane").filter(|&l| l < lanes) {
                 None => Err("no such lane".into()),
                 Some(l) => {
-                    st.checkpoint();
+                    // during Claude's pass from the bar, one undo step covers it all
+                    if self.agent_rx.is_none() {
+                        st.checkpoint();
+                    }
                     let t = &mut st.project.tracks[l];
                     if let Some(g) = get(&a, "gain_db").and_then(num) {
                         t.gain_db = Some(g.clamp(-36.0, 12.0));
@@ -1548,6 +1634,22 @@ impl App {
     }
 }
 
+impl App {
+    /// Claude's answer to a request from the Describe bar.
+    fn drain_agent(&mut self, cx: &mut Cx) {
+        let Some(rx) = &self.agent_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.agent_rx = None;
+        let line = result.unwrap_or_else(|e| format!("Claude could not do it: {e}"));
+        if let Some(st) = self.state.as_mut() {
+            st.sel_changed = true;
+        }
+        self.set_status(cx, &line);
+        self.refresh_inspector(cx);
+        self.ui.widget(cx, ids!(timeline)).redraw(cx);
+    }
+}
+
 impl MatchEvent for App {
     /// Play through the system's default output (the audio callback only
     /// runs once an output device is opened).
@@ -1624,8 +1726,22 @@ impl MatchEvent for App {
         }
 
         if let Some((text, _)) = ui.text_input(cx, ids!(describe_input)).returned(actions) {
-            if !text.trim().is_empty() {
+            if self.agent_rx.is_some() && !text.trim().is_empty() {
+                status = Some("Claude is still working on the last request.".into());
+            } else if !text.trim().is_empty() {
+                st.agent_ok = true;
                 status = Some(describe(st, self.jobs.as_ref(), text.trim()));
+                st.agent_ok = false;
+                ui.text_input(cx, ids!(describe_input)).set_text(cx, "");
+                if let Some(request) = st.ask_agent.take() {
+                    // one undo step for the whole pass
+                    st.checkpoint();
+                    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let work = st.path.parent().map(|p| p.join("agent").join(stamp.to_string())).unwrap_or_default();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    agent::run(request, work, tx);
+                    self.agent_rx = Some(rx);
+                }
                 // back to the song: shortcuts work again
                 cx.set_key_focus(Area::Empty);
             }
@@ -1767,6 +1883,7 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if let Event::Signal = event {
             self.drain_jobs(cx);
+            self.drain_agent(cx);
         }
         self.drain_ai_port(cx, event);
         if self.autosave.is_event(event).is_some() {

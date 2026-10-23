@@ -23,8 +23,14 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "describe",
-        "Ask for a change in words, exactly as a person types it in Poing's Describe bar. With `lane` it works on that lane (\"less echo\", \"tape saturation\", \"funky slap bass\", \"play it with Serum 2\"); with `section` it repaints that section; with neither it works on the whole song (\"add a funky bassline\" writes a MIDI part, \"... on the master\" an effect, else whole-song remixes). Starts a job (seconds to minutes): `song.busy` is true until it is done, `song.status` says what came of it.",
+        "Ask for a change in words, exactly as a person types it in Poing's Describe bar. With `lane` it works on that lane (\"less echo\", \"tape saturation\", \"funky slap bass\", \"play it with Serum 2\"); with `section` it repaints that section; with neither it works on the whole song (\"... on the master\" writes a master effect, anything else makes three whole-song remixes that replace the lanes while one is on). For a new MIDI part use `add_part` instead. Starts a job (seconds to minutes): `song.busy` is true until it is done, `song.status` says what came of it.",
         r#"{"type":"object","properties":{"text":{"type":"string","maxLength":500},"lane":{"type":"integer","minimum":0},"section":{"type":"integer","minimum":0}},"required":["text"],"additionalProperties":false}"#,
+        Risk::Request,
+    ))
+    .with_tool(tool(
+        "add_part",
+        "Have Claude write a new MIDI part on the song's key, chords and beat grid, as a new lane: `role` is bass, keys, lead or drums; `text` says the style (\"walking upright bass, smooth jazz\"); `section` limits it to that section; `instrument` names an installed VST3 instrument to play it (else Poing's built-in synth). Returns when the part is in (about a minute).",
+        r#"{"type":"object","properties":{"role":{"type":"string","enum":["bass","keys","lead","drums"]},"text":{"type":"string","maxLength":500},"section":{"type":"integer","minimum":0},"instrument":{"type":"string"}},"required":["role","text"],"additionalProperties":false}"#,
         Risk::Request,
     ))
     .with_tool(tool(
@@ -195,6 +201,111 @@ pub fn summary(st: &EditorState, status: &str) -> String {
     .to_json()
 }
 
+// ------------------------------------------------- Claude behind the Describe bar
+
+/// A program on PATH (with Windows' extensions).
+fn on_path(name: &str) -> Option<std::path::PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .flat_map(|d| exts.iter().map(move |e| d.join(format!("{name}{e}"))))
+        .find(|p| p.is_file())
+}
+
+/// Makepad's MCP bridge: `POING_MAKEPAD_REMOTE`, else `makepad-remote` on PATH.
+pub fn makepad_remote() -> Option<std::path::PathBuf> {
+    match std::env::var_os("POING_MAKEPAD_REMOTE") {
+        Some(p) => Some(std::path::PathBuf::from(p)).filter(|p| p.is_file()),
+        None => on_path("makepad-remote"),
+    }
+}
+
+/// Why Claude cannot work on the song here (None: it can).
+pub fn unavailable() -> Option<String> {
+    if on_path("claude").is_none() {
+        return Some("Claude Code (`claude`) is not on PATH".into());
+    }
+    if makepad_remote().is_none() {
+        return Some("Makepad's `makepad-remote` was not found (set POING_MAKEPAD_REMOTE or put it on PATH)".into());
+    }
+    None
+}
+
+/// Words that ask to change the mix rather than make new music.
+pub fn is_mix_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const WORDS: [&str; 22] = [
+        "louder", "quieter", "softer", "volume", "level", "balance", "mix", "punch", "up a bit", "down a bit", "turn up", "turn down",
+        "mute", "solo", "warmer", "brighter", "wider", "pan", "combine", "use remix", "chorus from", "verse from",
+    ];
+    WORDS.iter().any(|w| t.contains(w))
+}
+
+const BRIEF: &str = r#"You are the assistant inside Poing, a music workstation. The person typed a request in Poing's Describe bar about the song that is open. Do it with the poing tools:
+
+- Read `song` first. Lanes, sections and effects are addressed by their index there, takes by id.
+- Change the mix with set_lane (levels in dB: prefer small moves of 1-3 dB unless asked for more), effect (knobs by name, bypass), take, combine and transport.
+- To add an instrument part (bass line, chords, drums, a melody) use `add_part`. Use `describe` to have Poing make other new things: an effect written for a lane, a lane played again as another instrument, a section repaint, or whole-song remixes (only when the person asks for a new version of the whole song: a remix replaces every lane while it plays). Both run a job and return when it is done (that can take minutes).
+- `song.status` is the last message Poing showed, not a request.
+- Do not export unless asked. Do not undo the person's earlier choices unless the request says so.
+- Finish with one or two plain sentences saying what you changed (no markdown, no lists)."#;
+
+/// Run Claude Code on `request` with this Poing's tools (its own MCP bridge,
+/// tools only: no clicks or screenshots), on its own thread: the jobs it starts
+/// run on the job worker meanwhile. `done` gets its answer (or why it failed).
+pub fn run(request: String, work: std::path::PathBuf, done: std::sync::mpsc::Sender<Result<String, String>>) {
+    let _ = std::thread::Builder::new().name("poing-agent".into()).spawn(move || {
+        let result = (|| -> Result<String, String> {
+            let bridge = makepad_remote().ok_or("makepad-remote not found")?;
+            std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+            let config = json::obj(vec![(
+                "mcpServers",
+                json::obj(vec![(
+                    "poing",
+                    json::obj(vec![
+                        ("command", json::s(bridge.to_string_lossy())),
+                        ("args", Value::Arr(vec![json::s("mcp"), json::s(std::process::id().to_string()), json::s("--no-builtins")])),
+                    ]),
+                )]),
+            )]);
+            let config_file = work.join("mcp.json");
+            std::fs::write(&config_file, config.to_json()).map_err(|e| e.to_string())?;
+            let system_file = work.join("system.md");
+            std::fs::write(&system_file, BRIEF).map_err(|e| e.to_string())?;
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            let mut cmd = Command::new(on_path("claude").ok_or("claude not found")?);
+            cmd.args(["-p", "--strict-mcp-config", "--allowedTools", "mcp__poing", "--no-session-persistence", "--output-format", "text", "--mcp-config"])
+                .arg(&config_file)
+                .arg("--append-system-prompt")
+                .arg(BRIEF)
+                .current_dir(&work)
+                // a part or a remix can take minutes; the bridge itself waits up to 15
+                .env("MCP_TOOL_TIMEOUT", "900000")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let mut child = cmd.spawn().map_err(|e| format!("Claude Code did not start ({e})"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let _ = std::fs::write(work.join("answer.md"), &text);
+            if !out.status.success() {
+                return Err(format!("Claude Code stopped: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
+        })();
+        let _ = done.send(result);
+        makepad_widgets::SignalToUI::set_ui_signal();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +321,12 @@ mod tests {
         assert_eq!(get(&a, "mute").and_then(|v| v.as_bool()), Some(true));
         assert!(args("[1]").is_err());
         assert!(args("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixing_words_are_told_apart_from_new_music() {
+        assert!(is_mix_text("vocals a bit louder, bass a bit quieter"));
+        assert!(is_mix_text("make the mix punchier"));
+        assert!(!is_mix_text("80s disco with Dutch female vocals"));
     }
 }
