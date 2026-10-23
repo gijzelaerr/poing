@@ -16,6 +16,8 @@ mod export;
 mod fx;
 #[path = "fx_writer.rs"]
 mod fx_writer;
+#[path = "live.rs"]
+mod live;
 #[path = "llm.rs"]
 mod llm;
 #[path = "midi_writer.rs"]

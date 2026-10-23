@@ -83,7 +83,7 @@ One window, three zones, nothing else by default:
 - **Inspector (right, ~320 px):** title of the selection; the **Describe** field with drop target; context actions (≤ 4 visible: e.g. *New take*, *Keep*, *Solo*, *Effects*); the take badges. Depth (parameters, score, lyrics, plugin list) is behind disclosure triangles.
 - **Transport (top bar):** play, position, tempo/key, the song's name, a jobs indicator (ring) that expands into the job list.
 
-Keyboard first: Space play, L loop selection, ↑/↓ takes, Return keep, Delete remove take, Cmd-Z/Shift-Cmd-Z undo/redo, `/` focuses Describe. Dark and light themes, following the system. Makepad Splash for the UI, styled like Amp's hardware-grade widgets but quieter.
+Keyboard first: Space play, L loop selection, ↑/↓ takes, Return keep, Delete remove take, Cmd-Z/Shift-Cmd-Z undo/redo, `/` focuses Describe, R records a MIDI keyboard into the selected MIDI lane (A to K play it when no MIDI keyboard is plugged in). Dark and light themes, following the system. Makepad Splash for the UI, styled like Amp's hardware-grade widgets but quieter.
 
 ## 5. Architecture
 
@@ -169,7 +169,7 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 | A | Remote compute: UI on the Mac, AI and compute on a Windows node (`poing-node`, Makepad AI hub discovery and credentials) | proposed |
 | G+K | Export: stems, MIDI files, DAWproject; DJ export (rekordbox XML with beatgrid, key, section cues) for rekordbox and the OMNIS-DUO | next |
 | E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | PR |
-| F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | after D |
+| F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | PR |
 | H | Plugins phase 2: latency compensation, plugins in a helper process | after A or G |
 | QA | End-to-end on the Mac UI against the Windows node, then tag v1.0 | last |
 

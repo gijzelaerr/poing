@@ -80,6 +80,8 @@ const LANE_GAP: f64 = 3.0;
 const EDGE_PX: f64 = 6.0;
 
 const ACCENT: u32 = 0x0a84ff;
+/// A lane being recorded into, and what it records.
+const RECORD: u32 = 0xff453a;
 const TEXT: u32 = 0xeceef2;
 const TEXT_2: u32 = 0x8d939e;
 const CARD: u32 = 0x16181d;
@@ -465,10 +467,12 @@ impl DawTimeline {
     /// row shading, C labels and beat lines.
     fn draw_notes(&mut self, cx: &mut Cx2d, st: &EditorState, lane: usize, ly: f64, lh: f64, col: Vec4f) {
         let notes = st.project.tracks[lane].notes.clone().unwrap_or_default();
+        // a recording into this lane shows as it will land
+        let recorded = st.recorded_notes().filter(|(l, _)| *l == lane).map(|(_, n)| n).unwrap_or_default();
         let grid = poing_model::BeatGrid::of(&st.project);
         let open = lh > 200.0;
-        let (mut lo, mut hi) = notes.iter().fold((127u8, 0u8), |(a, b), n| (a.min(n.pitch), b.max(n.pitch)));
-        if notes.is_empty() {
+        let (mut lo, mut hi) = notes.iter().chain(&recorded).fold((127u8, 0u8), |(a, b), n| (a.min(n.pitch), b.max(n.pitch)));
+        if notes.is_empty() && recorded.is_empty() {
             (lo, hi) = (48, 72);
         }
         let want = if open { 24 } else { 12 };
@@ -521,6 +525,18 @@ impl DawTimeline {
             } else {
                 self.shape(cx, r, 2.0, shown, shade(shown, 0.85));
             }
+        }
+        for n in &recorded {
+            let (a, b) = (self.x_of(st, grid.time_of(n.start)), self.x_of(st, grid.time_of(n.start + n.len)));
+            if b < x0 || a > x0 + w || n.pitch < lo || n.pitch > hi {
+                continue;
+            }
+            let (a, b) = (a.max(x0), b.min(x0 + w));
+            let y = top + (hi - n.pitch) as f64 * rh;
+            let h = (rh - 1.0).max(if open { 2.0 } else { 3.0 });
+            let r = Rect { pos: dvec2(a, y + rh * 0.5 - h * 0.5), size: dvec2((b - a - 1.0).max(2.0), h) };
+            let c = rgba(RECORD, 0.55 + 0.45 * n.vel as f32);
+            self.shape(cx, r, 2.0, c, shade(c, 0.85));
         }
     }
 
@@ -869,10 +885,16 @@ impl DawTimeline {
             } else {
                 self.shape(cx, head, 8.0, rgba(HEADER, 1.0), rgba(0x181a1f, 1.0));
             }
-            let dot = if audible { col } else { vec4(col.x, col.y, col.z, 0.35) };
+            // a lane being recorded into: a red dot, and it says so
+            let recording = st.rec.as_ref().is_some_and(|r| r.lane == i);
+            let dot = if recording { rgba(RECORD, 1.0) } else if audible { col } else { vec4(col.x, col.y, col.z, 0.35) };
             self.shape(cx, Rect { pos: dvec2(left + 16.0, ly + 14.0), size: dvec2(8.0, 8.0) }, 8.0, dot, dot);
             self.bold(cx, left + 30.0, ly + 10.0, if audible { white } else { dim }, &cut(&tr.name, 16));
-            self.text(cx, left + 30.0, ly + 27.0, dim, &format!("{:+.1} dB", tr.gain()));
+            match (recording, st.shared.live.counting_in()) {
+                (true, true) => self.text(cx, left + 30.0, ly + 27.0, rgba(RECORD, 1.0), "Count-in"),
+                (true, false) => self.text(cx, left + 30.0, ly + 27.0, rgba(RECORD, 1.0), "Recording"),
+                _ => self.text(cx, left + 30.0, ly + 27.0, dim, &format!("{:+.1} dB", tr.gain())),
+            }
             let (mb, sb) = (self.mute_box(i), self.solo_box(i));
             let (mf, mi) = if tr.muted() { (rgba(0xff453a, 1.0), rgba(0xffffff, 1.0)) } else { (rgba(0x2a2e37, 1.0), rgba(TEXT, 0.8)) };
             self.shape(cx, mb, 5.0, mf, shade(mf, 0.9));
@@ -1066,6 +1088,8 @@ pub fn shortcut(st: &mut EditorState, ke: &KeyEvent) -> bool {
                 Err(e) => format!("Could not save: {e}"),
             });
         }
+        // R: record a MIDI keyboard into the selected MIDI lane (again: stop)
+        KeyCode::KeyR if !cmd => st.notice = Some(st.toggle_record()),
         // Escape: select nothing
         KeyCode::Escape => st.select(Selection::None),
         _ => return false,

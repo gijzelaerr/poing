@@ -16,6 +16,10 @@ pub mod arrange {
     include!("arrange.rs");
 }
 
+pub mod record {
+    include!("record.rs");
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Selection {
     None,
@@ -120,6 +124,11 @@ pub struct EditorState {
     /// Tags this song's effect racks: a rack only carries effect state and
     /// plugin instances over from a rack of the same song.
     pub song_tag: u64,
+    /// A MIDI keyboard being recorded into a lane, how its notes land on the
+    /// grid, and whether they go on top of the lane's notes or replace them.
+    pub rec: Option<record::Recording>,
+    pub quantise: poing_model::record::Quantise,
+    pub overdub: bool,
 }
 
 impl EditorState {
@@ -210,6 +219,9 @@ impl EditorState {
             is_current: true,
             saved_pos: 0.0,
             song_tag,
+            rec: None,
+            quantise: Default::default(),
+            overdub: true,
         }
         .with_fx()
     }
@@ -272,6 +284,11 @@ impl EditorState {
         // MIDI lanes: their notes on the song's beat grid, played by their instruments
         let grid = poing_model::BeatGrid::of(&self.project);
         let sr = self.sr();
+        // the metronome's beats, over the song
+        let song_beats = grid.beat_at(self.project.duration).ceil().max(0.0) as u64;
+        rack.clicks = (0..=song_beats)
+            .map(|b| ((grid.time_of(b as f64).max(0.0) * sr as f64) as u64, (b as f64 - grid.bar_offset).rem_euclid(grid.per_bar as f64) == 0.0))
+            .collect();
         for (i, t) in self.project.tracks.iter().enumerate() {
             let Some(notes) = &t.notes else { continue };
             let events = crate::synth::events(notes, &grid, sr);
@@ -817,6 +834,10 @@ impl EditorState {
     }
 
     fn go_back(&mut self) -> Vec<Stems> {
+        // a recording ends with its song going to the back (what was played lands)
+        if self.recording() {
+            self.notice = Some(self.finish_recording());
+        }
         self.saved_pos = self.playhead();
         self.is_current = false;
         self.plugin_params.retain(|_, _| false);
@@ -1418,6 +1439,9 @@ impl EditorState {
 
     /// Step back one edit (or forward again with `redo`).
     pub fn undo(&mut self, redo: bool) -> Option<String> {
+        if self.recording() {
+            return Some("Stop recording first (R)".into());
+        }
         let (project, stems) = if redo { self.redo.pop()? } else { self.undo.pop()? };
         let stems = match stems {
             Some(s) => s,

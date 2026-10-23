@@ -14,6 +14,7 @@ mod export;
 mod fx;
 mod fx_writer;
 mod listen;
+mod live;
 mod llm;
 mod plugins;
 mod remote;
@@ -539,6 +540,13 @@ script_mod! {
                             track_gain := Slider{width: 300 text: "Level dB" min: -36.0 max: 12.0 step: 0.5 precision: 1 default: 0.0}
                             mute_cb := CheckBox{text: "Mute"}
                             solo_cb := CheckBox{text: "Solo"}
+                            rec_box := View{
+                                visible: false width: Fit height: Fit flow: Right spacing: 14
+                                align: Align{y: 0.5}
+                                rec_btn := PillButton{text: "Record"}
+                                quant_dd := DropDown{width: 170 labels: ["As played" "Quantise 1/8" "Quantise 1/16" "Quantise 1/16 swing"]}
+                                overdub_cb := CheckBox{text: "On top of the notes"}
+                            }
                         }
                         section_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
@@ -647,6 +655,18 @@ pub struct App {
     /// Services open plugin windows (and knob moves waiting for a busy plugin).
     #[rust]
     plugin_pump: Timer,
+    /// While the keys play a MIDI lane: shows its meter moving (also stopped)
+    /// and takes in a recording's keys.
+    #[rust]
+    keys_pump: Timer,
+    /// MIDI keyboards plugged in (none: the computer keyboard plays).
+    #[rust]
+    midi_inputs: usize,
+    /// The computer keyboard as a piano: its octave (C of it) and the keys down.
+    #[rust]
+    piano_octave: Option<u8>,
+    #[rust]
+    piano_down: Vec<(KeyCode, u8)>,
     /// A remix waiting for the answer to "this song already has a project":
     /// (the song, the prompt, its existing project).
     #[rust]
@@ -809,6 +829,65 @@ enum Open {
 /// Is a text field (or a slider's typed value) taking the keyboard? Then
 /// keys are text; otherwise they are shortcuts (a clicked button keeps the
 /// focus but does not want keys).
+/// MIDI keyboards: a thread takes their notes as they come and queues them
+/// straight to the audio thread (the selected MIDI lane plays them).
+fn start_midi_input(cx: &mut Cx, shared: std::sync::Arc<audio::Shared>) {
+    let mut input = cx.midi_input();
+    let _ = std::thread::Builder::new().name("poing-midi".into()).spawn(move || loop {
+        while let Some((_, data)) = input.receive() {
+            if let MidiEvent::Note(n) = data.decode() {
+                shared.live.key(n.note_number, n.velocity, n.is_on);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    });
+}
+
+impl App {
+    /// The computer keyboard as a piano for the selected MIDI lane when no
+    /// MIDI keyboard is plugged in: A W S E D F T G Y H U J K are the keys
+    /// from C up, Z and X go an octave down and up. True when the key was
+    /// the piano's (then it is no shortcut: S solos and F fits elsewhere).
+    fn piano(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        let (ke, down) = match event {
+            Event::KeyDown(ke) => (ke, true),
+            Event::KeyUp(ke) => (ke, false),
+            _ => return false,
+        };
+        let Some(st) = self.state.as_mut() else { return false };
+        // a key let go ends its note, whatever happened since it went down
+        if !down {
+            let Some(i) = self.piano_down.iter().position(|(k, _)| *k == ke.key_code) else { return false };
+            let (_, pitch) = self.piano_down.remove(i);
+            st.shared.live.key(pitch, 0, false);
+            return true;
+        }
+        let m = &ke.modifiers;
+        if self.midi_inputs > 0 || m.control || m.logo || m.alt || st.keys_lane().is_none() || typing(&self.ui, cx) {
+            return false;
+        }
+        let octave = self.piano_octave.get_or_insert(60);
+        let shift = match ke.key_code {
+            KeyCode::KeyZ => Some(-12),
+            KeyCode::KeyX => Some(12),
+            _ => None,
+        };
+        if let Some(by) = shift {
+            *octave = (*octave as i32 + by).clamp(12, 108) as u8;
+            st.notice = Some(format!("The keys A to K play from C{}", *octave as i32 / 12 - 1));
+            return true;
+        }
+        let Some(semitone) = live::piano_key(ke.key_code) else { return false };
+        if ke.is_repeat || self.piano_down.iter().any(|(k, _)| *k == ke.key_code) {
+            return true;
+        }
+        let pitch = (*octave + semitone).min(127);
+        st.shared.live.key(pitch, 100, true);
+        self.piano_down.push((ke.key_code, pitch));
+        true
+    }
+}
+
 fn typing(ui: &WidgetRef, cx: &Cx) -> bool {
     let focus = cx.key_focus();
     if focus.is_empty() {
@@ -1511,7 +1590,7 @@ fn promote_take(st: &EditorState) -> Result<PathBuf, String> {
     Ok(project_file)
 }
 
-const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  L loop selection  ·  F fit  ·  B split section  ·  Ctrl+wheel zoom  ·  Del delete  ·  Ctrl+Z undo";
+const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  L loop selection  ·  F fit  ·  B split section  ·  R record a MIDI lane  ·  Ctrl+wheel zoom  ·  Del delete  ·  Ctrl+Z undo";
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
@@ -1657,6 +1736,7 @@ impl App {
         remember_song(&st.path);
         if first {
             audio::start_output(cx, st.shared.clone(), st.sr());
+            start_midi_input(cx, st.shared.clone());
         }
         if analyse {
             self.start_analysis(&mut st);
@@ -1906,6 +1986,16 @@ impl App {
                 ui.check_box(cx, ids!(mute_cb)).set_active(cx, t.muted(), Animate::No);
                 ui.check_box(cx, ids!(solo_cb)).set_active(cx, t.soloed(), Animate::No);
                 show_track = true;
+                // a MIDI lane records from a MIDI keyboard (or A to K)
+                ui.view(cx, ids!(rec_box)).set_visible(cx, t.is_midi());
+                if t.is_midi() {
+                    let q = poing_model::record::Quantise::ALL.iter().position(|q| *q == st.quantise).unwrap_or(0);
+                    ui.drop_down(cx, ids!(quant_dd)).set_selected_item(cx, q);
+                    ui.check_box(cx, ids!(overdub_cb)).set_active(cx, st.overdub, Animate::No);
+                    ui.button(cx, ids!(rec_btn)).set_text(cx, if st.recording() { "Stop recording (R)" } else { "Record (R)" });
+                    let keys = if self.midi_inputs > 0 { "your MIDI keyboard" } else { "a MIDI keyboard, or A to K (Z/X octave)" };
+                    ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Track: {}   ({what})   ·   play it from {keys}", t.name));
+                }
                 // a built-in instrument's knobs, under the lane's level; a plugin's own window
                 let knobs = st.inst_knobs(i);
                 let plugin = t.instrument.as_ref().is_some_and(|i| i.plugin.is_some());
@@ -3066,6 +3156,15 @@ impl MatchEvent for App {
                 st.project.tracks[i].solo = Some(v);
                 st.push_mix();
             }
+            if ui.button(cx, ids!(rec_btn)).clicked(actions) {
+                status = Some(st.toggle_record());
+            }
+            if let Some(q) = ui.drop_down(cx, ids!(quant_dd)).selected(actions) {
+                st.quantise = poing_model::record::Quantise::ALL.get(q).copied().unwrap_or_default();
+            }
+            if let Some(v) = ui.check_box(cx, ids!(overdub_cb)).changed(actions) {
+                st.overdub = v;
+            }
         }
         if let Selection::Section(i) = st.sel {
             if let Some(text) = ui.text_input(cx, ids!(section_input)).changed(actions) {
@@ -3151,6 +3250,30 @@ impl AppMain for App {
             self.drain_agent(cx);
         }
         self.drain_ai_port(cx, event);
+        if let Some(st) = self.state.as_mut() {
+            st.sync_keys();
+            if st.keys_lane().is_some() && self.keys_pump.is_empty() {
+                self.keys_pump = cx.start_interval(0.03);
+            }
+        }
+        if self.keys_pump.is_event(event).is_some() {
+            match self.state.as_mut().filter(|st| st.keys_lane().is_some()) {
+                Some(st) => {
+                    if let Some(note) = st.pump_recording() {
+                        st.notice = Some(note);
+                    }
+                    // the meters are read when the timeline draws: it draws while they move
+                    let heard = st.shared.meters.iter().any(|m| m.load(std::sync::atomic::Ordering::Relaxed) != 0);
+                    if heard || st.recording() {
+                        self.ui.widget(cx, ids!(timeline)).redraw(cx);
+                    }
+                }
+                None => {
+                    cx.stop_timer(self.keys_pump);
+                    self.keys_pump = Timer::empty();
+                }
+            }
+        }
         if self.plugin_pump.is_event(event).is_some() {
             match self.state.as_mut() {
                 Some(st) => {
@@ -3209,8 +3332,16 @@ impl AppMain for App {
             }
             _ => {}
         }
+        if let Event::MidiPorts(ports) = event {
+            let inputs = ports.all_inputs();
+            cx.use_midi_inputs(&inputs);
+            self.midi_inputs = inputs.len();
+            let names: Vec<&str> = ports.descs.iter().filter(|d| d.port_type.is_input()).map(|d| d.name.as_str()).collect();
+            log!("poing: MIDI inputs: {}", if names.is_empty() { "none (A to K play)".into() } else { names.join(", ") });
+        }
+        let piano = self.piano(cx, event);
         // Shortcuts work anywhere but in a text field (which keeps its own keys).
-        if let Event::KeyDown(ke) = event {
+        if let (Event::KeyDown(ke), false) = (event, piano) {
             if let Some(st) = self.state.as_mut() {
                 if !typing(&self.ui, cx) && timeline::shortcut(st, ke) {
                     self.ui.widget(cx, ids!(timeline)).redraw(cx);
