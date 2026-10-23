@@ -17,6 +17,9 @@ makepad-audio-decode = { git = "https://github.com/gijzelaerr/makepad.git", tag 
 makepad-micro-serde = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 # Splash audio shaders: lane and master effects compiled to native code.
 makepad-script-audio-aot = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+# Poing as an AI service: tools an agent calls (makepad-remote mcp poing).
+makepad-ai-services = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-strict-json = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 
 # Makepad's own profiles: line tables for printf debugging, incremental release.
 [profile.dev]

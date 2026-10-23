@@ -137,6 +137,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "makepad-ai-services"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-micro-serde",
+ "makepad-platform",
+ "makepad-remote",
+ "makepad-strict-json",
+]
+
+[[package]]
 name = "makepad-alloc-epoch"
 version = "1.0.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
@@ -1036,9 +1047,11 @@ source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9
 name = "poing"
 version = "0.1.0"
 dependencies = [
+ "makepad-ai-services",
  "makepad-audio-decode",
  "makepad-micro-serde",
  "makepad-script-audio-aot",
+ "makepad-strict-json",
  "makepad-widgets",
  "poing-model",
  "vst3-host",

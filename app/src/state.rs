@@ -923,6 +923,23 @@ impl EditorState {
         Ok(name)
     }
 
+    /// Is any section combined from a remix playing?
+    pub fn combined_on(&self) -> bool {
+        self.project.takes().iter().any(|t| t.engine == "copy" && self.take_on(&t.id))
+    }
+
+    /// The Combined chip: every combined section off, or all back on.
+    pub fn toggle_combined(&mut self) {
+        if self.combined_on() {
+            let on: Vec<String> = self.project.takes().iter().filter(|t| t.engine == "copy" && self.take_on(&t.id)).map(|t| t.id.clone()).collect();
+            for id in on {
+                self.toggle_take(&id);
+            }
+        } else {
+            self.restore_combined();
+        }
+    }
+
     /// Sections combined from remixes play again when the song is reopened
     /// (the newest one per section wins, as when they were made).
     pub fn restore_combined(&mut self) {
@@ -951,6 +968,17 @@ impl EditorState {
         if fb <= fa {
             return Err("the remix is shorter than that section".into());
         }
+        let prompt = format!("{} in the {}", remix.prompt, s.label);
+        // the same remix in the same section again: that take, not a copy of it
+        let same = self.project.takes().iter().rev().find(|t| t.engine == "copy" && t.prompt == prompt && (t.start - a).abs() < 0.01 && (t.end - b).abs() < 0.01).map(|t| t.id.clone());
+        if let Some(id) = same {
+            self.restore_combined();
+            if !self.take_on(&id) {
+                self.toggle_take(&id);
+            }
+            self.sel = Selection::Section(i);
+            return Ok(format!("{prompt}: on again (it was combined before)"));
+        }
         let (id, seed) = self.project.next_take();
         let take = Take {
             file: format!("takes/{id}.wav"),
@@ -959,7 +987,7 @@ impl EditorState {
             start: a,
             end: b,
             engine: "copy".into(),
-            prompt: format!("{} in the {}", remix.prompt, s.label),
+            prompt,
             seed,
             track: None,
             blend: None,
@@ -1247,3 +1275,5 @@ impl EditorState {
 pub fn named_take(t: &Take) -> bool {
     matches!(t.engine.as_str(), "acestep-song" | "acestep-cover" | "copy")
 }
+/// The take chip that stands for every section combined from remixes.
+pub const COMBINED: &str = "@combined";

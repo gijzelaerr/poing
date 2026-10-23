@@ -11,6 +11,8 @@ makepad-widgets.workspace = true
 makepad-audio-decode.workspace = true
 makepad-micro-serde.workspace = true
 makepad-script-audio-aot.workspace = true
+makepad-ai-services.workspace = true
+makepad-strict-json.workspace = true
 
 # VST3 plugin hosting (M6): Windows first. No audio backend of its own (Poing's
 # engine drives it); process isolation runs a plugin in a helper process.

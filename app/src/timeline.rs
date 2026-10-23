@@ -703,8 +703,10 @@ impl DawTimeline {
             self.text(cx, left + 14.0, takes_y + 9.0, dim, "Takes");
             let mut x = x0;
             let original = if st.project.is_draft() { "Version 1" } else { "Original" };
-            let names: Vec<(String, Option<String>)> = std::iter::once((original.to_string(), None))
-                .chain(st.project.takes().iter().map(|t| {
+            let combined = st.project.takes().iter().filter(|t| t.engine == "copy").count();
+            // sections combined from remixes share one chip (each shows on the lanes)
+            let mut names: Vec<(String, Option<String>)> = std::iter::once((original.to_string(), None))
+                .chain(st.project.takes().iter().filter(|t| t.engine != "copy").map(|t| {
                     let n = t.id.trim_start_matches('t');
                     let label = match (t.scope.as_str(), t.track.as_deref()) {
                         _ if crate::state::named_take(t) => t.prompt.clone(),
@@ -715,9 +717,13 @@ impl DawTimeline {
                     (label, Some(t.id.clone()))
                 }))
                 .collect();
+            if combined > 0 {
+                names.push((format!("Combined · {combined} section{}", if combined == 1 { "" } else { "s" }), Some(crate::state::COMBINED.into())));
+            }
             for (label, id) in names {
                 let on = match &id {
                     None => st.active.is_empty(),
+                    Some(id) if id == crate::state::COMBINED => st.combined_on(),
                     Some(id) => st.take_on(id),
                 };
                 let (fill, ink) = if on { (rgba(ACCENT, 1.0), rgba(0xffffff, 1.0)) } else { (rgba(0x23262d, 1.0), rgba(TEXT, 0.85)) };
@@ -975,6 +981,7 @@ impl Widget for DawTimeline {
                         st.select(Selection::None);
                         match id {
                             None => st.all_takes_off(),
+                            Some(id) if id == crate::state::COMBINED => st.toggle_combined(),
                             Some(id) => st.toggle_take(&id),
                         }
                     }

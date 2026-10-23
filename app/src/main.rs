@@ -7,6 +7,7 @@
 
 pub use makepad_widgets;
 
+mod agent;
 mod audio;
 mod fx;
 mod fx_writer;
@@ -350,6 +351,9 @@ pub struct App {
     /// The start screen is showing (also while a song stays open behind it).
     #[rust]
     home_shown: bool,
+    /// Poing's tools for an agent (Claude Code over `makepad-remote mcp poing`).
+    #[rust]
+    ai_port: Option<makepad_ai_services::port::AiServicePort>,
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -1358,6 +1362,192 @@ impl App {
     }
 }
 
+impl App {
+    /// Calls from an agent: answered here, on the UI thread, like a click.
+    fn drain_ai_port(&mut self, cx: &mut Cx, event: &Event) {
+        use makepad_ai_services::port::PortEvent;
+        let events = match self.ai_port.as_mut() {
+            Some(port) => port.handle_event(cx, event),
+            None => return,
+        };
+        for e in events {
+            if let PortEvent::Call(call) = e {
+                let result = self.agent_call(cx, &call);
+                if let Some(port) = self.ai_port.as_ref() {
+                    port.reply(result);
+                }
+            }
+        }
+    }
+
+    fn agent_call(&mut self, cx: &mut Cx, call: &makepad_ai_services::wire::ServiceCall) -> makepad_ai_services::wire::ToolResult {
+        use agent::{get, index, num};
+        use makepad_ai_services::wire::ToolResult;
+        let id = call.call_id.clone();
+        let a = match agent::args(&call.args) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::refused(&id, e),
+        };
+        let status_now = self.ui.label(cx, ids!(status_label)).text();
+        if self.state.is_none() {
+            return ToolResult::unavailable(&id, "no song is open (Poing shows its start screen)");
+        }
+        if self.home_shown {
+            self.show_song_view(cx, true);
+        }
+        let Some(st) = self.state.as_mut() else { return ToolResult::unavailable(&id, "no song is open") };
+        let lanes = st.project.tracks.len();
+        let result: Result<String, String> = match call.tool.as_str() {
+            "song" => {
+                let data = agent::summary(st, &status_now);
+                return ToolResult::ok(&id, format!("{} ({} lanes, {} sections, {} takes)", st.project.name, lanes, st.project.sections().len(), st.project.takes().len()), "").with_data(data);
+            }
+            "describe" => match get(&a, "text").and_then(|v| v.as_str()) {
+                None => Err("say what to change in `text`".into()),
+                Some(text) => {
+                    let place = match (index(&a, "lane"), index(&a, "section")) {
+                        (Some(l), _) if l < lanes => Ok(Selection::Track(l)),
+                        (None, Some(s)) if s < st.project.sections().len() => Ok(Selection::Section(s)),
+                        (None, None) => Ok(Selection::None),
+                        _ => Err("no such lane or section".to_string()),
+                    };
+                    place.map(|sel| {
+                        st.select(sel);
+                        describe(st, self.jobs.as_ref(), text.trim())
+                    })
+                }
+            },
+            "set_lane" => match index(&a, "lane").filter(|&l| l < lanes) {
+                None => Err("no such lane".into()),
+                Some(l) => {
+                    st.checkpoint();
+                    let t = &mut st.project.tracks[l];
+                    if let Some(g) = get(&a, "gain_db").and_then(num) {
+                        t.gain_db = Some(g.clamp(-36.0, 12.0));
+                    }
+                    if let Some(m) = get(&a, "mute").and_then(|v| v.as_bool()) {
+                        t.mute = Some(m);
+                    }
+                    if let Some(s) = get(&a, "solo").and_then(|v| v.as_bool()) {
+                        t.solo = Some(s);
+                    }
+                    let line = format!("{}: {:+.1} dB{}{}", t.name, t.gain(), if t.muted() { ", muted" } else { "" }, if t.soloed() { ", soloed" } else { "" });
+                    st.push_mix();
+                    st.sel_changed = true;
+                    Ok(line)
+                }
+            },
+            "effect" => {
+                let lane = index(&a, "lane");
+                match index(&a, "effect").and_then(|i| (lane.map_or(true, |l| l < lanes)).then(|| st.project.chain(lane).get(i).cloned()).flatten()) {
+                    None => Err("no such effect (see `song`)".into()),
+                    Some(fx) => {
+                        let mut done = Vec::new();
+                        if let Some(b) = get(&a, "bypass").and_then(|v| v.as_bool()) {
+                            st.set_fx_bypass(&fx.id, b);
+                            done.push(if b { "bypassed".to_string() } else { "on".to_string() });
+                        }
+                        let mut err = None;
+                        if let (Some(knob), Some(v)) = (get(&a, "knob").and_then(|v| v.as_str()), get(&a, "value").and_then(num)) {
+                            let norm = |n: &str| n.to_lowercase().replace('_', " ");
+                            let knobs = st.fx_knobs(&fx.id);
+                            match knobs.iter().position(|(n, ..)| norm(n) == norm(knob)) {
+                                Some(k) => {
+                                    let (name, _, min, max) = knobs[k].clone();
+                                    if let Some(i) = st.fx_param_index(&fx.id, k) {
+                                        st.set_fx_param(&fx.id, i, v.clamp(min, max));
+                                        done.push(format!("{} = {:.3}", name.replace('_', " "), v.clamp(min, max)));
+                                    }
+                                }
+                                None => err = Some(format!("{} has no knob `{knob}`; it has: {}", fx.name, knobs.iter().map(|(n, ..)| n.clone()).collect::<Vec<_>>().join(", "))),
+                            }
+                        }
+                        st.sel_changed = true;
+                        match err {
+                            Some(e) => Err(e),
+                            None => Ok(format!("{}: {}", fx.name, if done.is_empty() { "unchanged".into() } else { done.join(", ") })),
+                        }
+                    }
+                }
+            }
+            "take" => match get(&a, "id").and_then(|v| v.as_str()) {
+                Some("original") => {
+                    st.all_takes_off();
+                    Ok("Every take is off: the lanes play".into())
+                }
+                Some(tid) if st.project.take_index(tid).is_some() => {
+                    let on = get(&a, "on").and_then(|v| v.as_bool()).unwrap_or(true);
+                    if on != st.take_on(tid) {
+                        st.toggle_take(tid);
+                    }
+                    if get(&a, "use").and_then(|v| v.as_bool()) == Some(true) {
+                        if !st.take_on(tid) {
+                            st.toggle_take(tid);
+                        }
+                        st.use_version().map(|name| {
+                            analyse(self.jobs.as_ref(), st);
+                            format!("{name} is the song now; Poing is analysing it (song.busy)")
+                        })
+                    } else {
+                        Ok(format!("Take {tid} is {}", if st.take_on(tid) { "on" } else { "off" }))
+                    }
+                }
+                _ => Err("no such take (see `song`)".into()),
+            },
+            "combine" => match (index(&a, "section"), get(&a, "take").and_then(|v| v.as_str())) {
+                (Some(s), Some(tid)) if st.project.take_index(tid).is_some() => {
+                    if !st.take_on(tid) {
+                        st.toggle_take(tid);
+                    }
+                    st.use_remix_here(s)
+                }
+                _ => Err("give a section index and a take id (see `song`)".into()),
+            },
+            "transport" => {
+                if let Some(t) = get(&a, "seek").and_then(num) {
+                    st.seek(t);
+                }
+                match a.iter().find(|(k, _)| k == "loop").map(|(_, v)| v) {
+                    Some(v) if v.is_null() => st.set_loop(None),
+                    Some(v) => {
+                        if let Some([x, y]) = v.as_arr().map(|r| r.iter().filter_map(num).collect::<Vec<_>>()).as_deref() {
+                            st.set_loop(Some((x.min(*y), x.max(*y))));
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(p) = get(&a, "play").and_then(|v| v.as_bool()) {
+                    if p != st.shared.playing() {
+                        st.toggle_play();
+                    }
+                }
+                st.sel_changed = true;
+                Ok(format!("{} at {:.1}s", if st.shared.playing() { "Playing" } else { "Paused" }, st.playhead()))
+            }
+            "export" => {
+                let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
+                let (rack, missing) = st.make_render_rack();
+                let job = Job::Render { stems: st.stems.clone(), mix: st.mix_snapshot(), rack: Box::new(rack), sr: st.sr(), out_dir, name: st.project.name.clone() };
+                match self.jobs.as_ref().map(|j| j.submit(job)) {
+                    Some(true) if missing.is_empty() => Ok("Rendering; song.status names the file when it is done".into()),
+                    Some(true) => Ok(format!("Rendering without {}; song.status names the file when it is done", missing.join(", "))),
+                    _ => Err("the render worker is not running".into()),
+                }
+            }
+            other => Err(format!("Poing has no tool `{other}`")),
+        };
+        self.refresh_inspector(cx);
+        self.ui.widget(cx, ids!(timeline)).redraw(cx);
+        match result {
+            Ok(line) => {
+                self.set_status(cx, &line);
+                ToolResult::ok(&id, line, "")
+            }
+            Err(e) => ToolResult::failed(&id, e),
+        }
+    }
+}
+
 impl MatchEvent for App {
     /// Play through the system's default output (the audio callback only
     /// runs once an output device is opened).
@@ -1379,6 +1569,7 @@ impl MatchEvent for App {
 
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.jobs = Some(Jobs::start(cx));
+        self.ai_port = makepad_ai_services::port::AiServicePort::open(cx, agent::manifest());
         self.load(cx);
     }
 
@@ -1577,6 +1768,7 @@ impl AppMain for App {
         if let Event::Signal = event {
             self.drain_jobs(cx);
         }
+        self.drain_ai_port(cx, event);
         if self.autosave.is_event(event).is_some() {
             self.autosave = Timer::empty();
             if let Some(st) = self.state.as_mut().filter(|st| st.dirty) {
