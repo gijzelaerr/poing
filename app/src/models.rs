@@ -240,6 +240,10 @@ pub enum Readiness {
 /// Can `feature` run now, or what does it need first?
 pub fn readiness(feature_id: &str) -> Readiness {
     let Some(f) = feature(feature_id) else { return Readiness::Ready };
+    // GPU jobs run on a poing-node: its models count, not this machine's
+    if crate::remote::target() != crate::remote::Target::Local {
+        return Readiness::Ready;
+    }
     if paths::dev_ready(feature_id) {
         return Readiness::Ready;
     }

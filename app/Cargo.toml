@@ -17,6 +17,15 @@ makepad-strict-json.workspace = true
 # poing never links a model runtime).
 makepad-ai-hub.workspace = true
 makepad-zip-file.workspace = true
+# GPU jobs on another machine (remote.rs, node.rs): the hub's fleet
+# credentials, TLS front and LAN beacon (above), TLS and sha256.
+makepad-network.workspace = true
+makepad-core-util.workspace = true
+
+# The Windows PC's side of a Mac UI: Poing's GPU jobs served over the LAN.
+[[bin]]
+name = "poing-node"
+path = "src/node_main.rs"
 
 # VST3 plugin hosting (M6): Windows first. No audio backend of its own (Poing's
 # engine drives it); process isolation runs a plugin in a helper process.
@@ -40,6 +49,8 @@ binaries = [
     { path = "poing", main = true },
     # The CPU stub in CI (no CUDA toolkit on the runners): analysis then uses Python.
     { path = "poing-engine" },
+    # Serves this PC's GPU jobs to a Poing on a Mac (docs/REMOTE.md).
+    { path = "poing-node" },
 ]
 resources = [
     { src = "../sidecar/*.py", target = "sidecar" },

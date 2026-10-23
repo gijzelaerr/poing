@@ -30,6 +30,9 @@ makepad-ai-hub = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poi
 makepad-strict-json = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 # The model manager unpacks a pinned source zip (ACE-Step) with it.
 makepad-zip-file = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+# poing-node: TLS to the Windows PC (self-signed, pinned) and sha256 for the bundle mirror.
+makepad-network = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-core-util = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 
 # Makepad's own profiles: line tables for printf debugging, incremental release.
 [profile.dev]
