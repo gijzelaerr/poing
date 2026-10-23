@@ -100,6 +100,8 @@ pub struct EditorState {
     /// selected may go to Claude, which then sets `ask_agent`.
     pub agent_ok: bool,
     pub ask_agent: Option<String>,
+    /// An AI feature was asked for that needs a download first: the app offers it.
+    pub needs_download: Option<(&'static str, crate::model_view::Resume)>,
     /// The song in front (its tab is selected): only it talks to the audio thread.
     is_current: bool,
     /// Where a song in a background tab was, to come back to.
@@ -192,6 +194,7 @@ impl EditorState {
             pending_remix: None,
             agent_ok: false,
             ask_agent: None,
+            needs_download: None,
             is_current: true,
             saved_pos: 0.0,
             song_tag,

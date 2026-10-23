@@ -1,0 +1,85 @@
+name: Installer
+
+# docs/INSTALL.md I1: a small unsigned per-user installer on every tag (and on
+# demand). No Python, CUDA, weights or ffmpeg inside: features download what
+# they need on first use.
+on:
+  push:
+    tags: ["v*"]
+  # a change to the packaging proves itself before it lands
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - "app/Cargo.toml"
+      - "app/models.json"
+      - "packaging/**"
+      - "sidecar/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  POING_MUTE: "1"
+  # The uv that builds the Python envs on users' PCs, pinned with its checksum.
+  UV_VERSION: "0.13.1"
+  UV_SHA256: "3b2661a463a5baea7f5076ea2b25ab71d77f36a6c0d809e5350651792f80a672"
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  # The download must stay small.
+  MAX_INSTALLER_MB: "50"
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: installer-windows
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Test
+        run: cargo test --release --workspace --locked
+
+      - name: Fetch uv
+        shell: bash
+        run: |
+          mkdir -p target/packaging
+          curl -sfL -o target/packaging/uv.zip "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-pc-windows-msvc.zip"
+          echo "${UV_SHA256}  target/packaging/uv.zip" | sha256sum -c -
+          unzip -o -q target/packaging/uv.zip -d target/packaging/uv
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version ${{ env.CARGO_PACKAGER_VERSION }} --locked
+
+      - name: Package
+        run: cargo packager -p poing --release
+
+      - name: Check size
+        shell: bash
+        run: |
+          f=$(ls target/release/*-setup.exe)
+          mb=$(( $(stat -c %s "$f") / 1000000 ))
+          echo "$f: ${mb} MB"
+          test "$mb" -lt "$MAX_INSTALLER_MB"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: poing-windows-installer
+          path: target/release/*-setup.exe
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/*-setup.exe
+          prerelease: true

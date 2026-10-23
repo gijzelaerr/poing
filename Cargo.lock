@@ -1176,12 +1176,14 @@ source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9
 name = "poing"
 version = "0.1.0"
 dependencies = [
+ "makepad-ai-hub",
  "makepad-ai-services",
  "makepad-audio-decode",
  "makepad-micro-serde",
  "makepad-script-audio-aot",
  "makepad-strict-json",
  "makepad-widgets",
+ "makepad-zip-file",
  "poing-model",
  "vst3-host",
 ]

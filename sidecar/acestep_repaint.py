@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+import poing_ace
+
 
 def emit(stage, progress, message, **extra):
     print(json.dumps({"stage": stage, "progress": round(progress, 3), "message": message, **extra}), flush=True)
@@ -25,8 +27,7 @@ def emit(stage, progress, message, **extra):
 
 def main():
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    root = os.environ.get("POING_ACESTEP") or os.getcwd()
-    sys.path.insert(0, root)
+    root = poing_ace.root()
     emit("load", 0.0, "Loading ACE-Step")
     import soundfile as sf
     from acestep.handler import AceStepHandler

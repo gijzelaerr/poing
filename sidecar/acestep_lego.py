@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import poing_ace
+
 TRACKS = ["woodwinds", "brass", "fx", "synth", "strings", "percussion",
           "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"]
 
@@ -29,8 +31,7 @@ def main():
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     if job["track"] not in TRACKS:
         raise ValueError(f"lego cannot make a {job['track']!r} track (one of {', '.join(TRACKS)})")
-    root = os.environ.get("POING_ACESTEP") or os.getcwd()
-    sys.path.insert(0, root)
+    root = poing_ace.root()
     emit("load", 0.0, "Loading ACE-Step (base model)")
     from acestep.handler import AceStepHandler
     from acestep.inference import GenerationConfig, GenerationParams, generate_music

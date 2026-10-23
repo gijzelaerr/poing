@@ -17,6 +17,9 @@ mod listen;
 mod plugins;
 mod synth;
 mod midi_writer;
+mod model_view;
+mod models;
+mod paths;
 mod song_writer;
 pub(crate) use poing_model as model;
 mod state;
@@ -26,6 +29,7 @@ use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, SongJob, Stem, 
 use makepad_widgets::*;
 use makepad_micro_serde::{DeJson, DeJsonErr, DeJsonState, SerJson, SerJsonState};
 use model::{default_gain_for, demucs_stem_for, is_master_effect_text, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
+use models::Downloads;
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
 use timeline::kind_index;
@@ -87,6 +91,17 @@ script_mod! {
 
     let Caption = Label{
         draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9}}
+    }
+
+    // One downloadable pack on the Models page: name, what and size, one button.
+    let ModelRow = View{
+        visible: false
+        width: Fill height: Fit flow: Right spacing: 14
+        padding: Inset{left: 0 right: 0 top: 6 bottom: 6}
+        align: Align{y: 0.5}
+    }
+    let ModelName = Label{
+        draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 10.5}}
     }
 
     // A song tab: its name, a close cross, an accent line when it is in front.
@@ -273,6 +288,22 @@ script_mod! {
                             text: "Settings"
                         }
                     }
+                    // An AI feature that needs a download says so here, once it is
+                    // used: Download or Not now. Then the download's progress.
+                    offer_bar := SolidView{
+                        visible: false
+                        width: Fill height: Fit flow: Right spacing: 10
+                        padding: Inset{left: 18 right: 14 top: 7 bottom: 7}
+                        align: Align{y: 0.5}
+                        show_bg: true
+                        draw_bg +: {color: #x14202f}
+                        offer_label := Label{
+                            width: Fill
+                            draw_text +: {color: TEXT text_style: theme.font_regular{font_size: 9.5}}
+                        }
+                        offer_yes := PillButton{text: "Download"}
+                        offer_no := PillButton{text: "Not now"}
+                    }
                     // Open songs, one tab each: click to switch (playing on, at the same time), x to close.
                     tab_strip := SolidView{
                         visible: false
@@ -365,7 +396,7 @@ script_mod! {
                     }
 
                     // Settings: what Poing plays through, where its AI runs, what it found.
-                    settings := View{
+                    settings := ScrollYView{
                         visible: false
                         width: Fill height: Fill flow: Down spacing: 18
                         padding: Inset{left: 60 right: 60 top: 36 bottom: 24}
@@ -403,6 +434,13 @@ script_mod! {
                             CardTitle{width: 160 text: "Models"}
                             View{width: Fill height: Fit flow: Down spacing: 6
                                 models_status := CardText{text: ""}
+                                mp0 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp0_name := ModelName{} mp0_info := CardText{}} mp0_btn := PillButton{}}
+                                mp1 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp1_name := ModelName{} mp1_info := CardText{}} mp1_btn := PillButton{}}
+                                mp2 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp2_name := ModelName{} mp2_info := CardText{}} mp2_btn := PillButton{}}
+                                mp3 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp3_name := ModelName{} mp3_info := CardText{}} mp3_btn := PillButton{}}
+                                mp4 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp4_name := ModelName{} mp4_info := CardText{}} mp4_btn := PillButton{}}
+                                mp5 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp5_name := ModelName{} mp5_info := CardText{}} mp5_btn := PillButton{}}
+                                models_note := CardText{text: ""}
                             }
                         }
                         settings_done := PillButton{text: "Done"}
@@ -605,6 +643,12 @@ pub struct App {
     /// (the song, the prompt, its existing project).
     #[rust]
     remix_choice: Option<(PathBuf, String, PathBuf)>,
+    /// The model manager: the download that runs, if any.
+    #[rust]
+    downloads: Downloads,
+    /// A download offered in the offer bar, and what to do once it is in.
+    #[rust]
+    offer: Option<model_view::Offer>,
 }
 
 /// The song a job belongs to, in front or in a background tab.
@@ -935,6 +979,12 @@ fn short_prompt(prompt: &str) -> String {
 /// The remix asked for when the song was dropped (once it is understood):
 /// three ACE-Step covers, close to free, each a song take.
 fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
+    if st.pending_remix.is_none() {
+        return String::new();
+    }
+    if let Some(note) = model_view::gate(st, "remix", model_view::Resume::Remix(st.path.clone())) {
+        return note;
+    }
     let Some(prompt) = st.pending_remix.take() else { return String::new() };
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
     let Some(source) = st.project.source.clone() else { return "This song has no audio to remix".into() };
@@ -983,6 +1033,20 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
 fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     let Some(jobs) = jobs else { return "The job worker is not running".into() };
     if !st.project.is_analysed() {
+        // Not split (yet, or its download was declined): a range marked on the song can still be repainted.
+        if let Some(reg) = match st.sel {
+            Selection::Region(r) => st.project.regions().get(r).cloned(),
+            _ => None,
+        } {
+            let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_default().replace("
+", "
+");
+            return repaint_range(st, jobs, bundle, (reg.start, reg.end), "marked range", text, lyrics);
+        }
+        if st.analysing.is_none() {
+            return "This song isn't split into parts yet. Mark a range on it (drag on the lane) to repaint just that, or download the analysis in Settings → Models.".into();
+        }
         return "Poing is still listening to the song. Describe it again when the lanes are in.".into();
     }
     if st.analysing.is_some() {
@@ -1082,15 +1146,23 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
 /// (the source audio), keeping a second of original each side for the seam.
 fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize, text: &str, lyrics: String) -> String {
     let Some(section) = st.project.sections().get(i).cloned() else { return "No such section".into() };
+    repaint_range(st, jobs, bundle, (section.start, section.end), &section.label, text, lyrics)
+}
+
+/// ACE-Step repaints [start, end] of the song (a section, or a range marked on it).
+fn repaint_range(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, (start, end): (f64, f64), label: &str, text: &str, lyrics: String) -> String {
     let Some(source) = st.project.source.clone() else { return "This project has no source audio to repaint".into() };
+    if let Some(note) = model_view::gate(st, "repaint", model_view::Resume::Describe(st.path.clone(), text.to_string())) {
+        return note;
+    }
     let (id, seed) = st.project.next_take();
     let n = id.trim_start_matches('t').to_string();
     let take = Take {
         file: format!("takes/{id}.wav"),
         id,
         scope: "section".into(),
-        start: section.start,
-        end: section.end,
+        start,
+        end,
         engine: "acestep".into(),
         prompt: text.to_string(),
         seed,
@@ -1099,8 +1171,8 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
     };
     let a = st.project.analysis.clone().unwrap_or_default();
     let job = RepaintJob {
-        start: section.start,
-        end: section.end,
+        start,
+        end,
         margin: audio::TAKE_MARGIN_S,
         caption: text.to_string(),
         lyrics,
@@ -1114,7 +1186,7 @@ fn repaint_section(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, i: usize,
     }
     st.analysing = Some((format!("Take {n}"), 0.0));
     let _ = st.save();
-    format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", section.label, section.start, section.end)
+    format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", label, start, end)
 }
 
 /// Describe that names an installed plugin ("Raum on the vocals"): put it on
@@ -1613,6 +1685,14 @@ impl App {
             ui.label(cx, ids!(home_error)).set_text(cx, "Say first what the song should be.");
             return;
         }
+        // Claude writes the words: without it the ACE-Step download would be for nothing
+        if !agent::claude_installed() {
+            ui.label(cx, ids!(home_error)).set_text(cx, "New songs need Claude Code to write the words: install it and sign in, then make it again.");
+            return;
+        }
+        if self.needs_download(cx, "new-song", model_view::Resume::MakeSong(prompt.trim().to_string())) {
+            return;
+        }
         let job = Job::Song { prompt: prompt.trim().to_string(), dir: audio::songs_dir(), count: 3, sr: 48000 };
         let queued = self.jobs.as_ref().is_some_and(|j| j.submit(job));
         let line = if queued { "Claude is writing the song..." } else { "The job worker is not running" };
@@ -1654,7 +1734,9 @@ impl App {
         self.note_request(&bundle, 0, "remix", &prompt, None, None);
         let Some(st) = self.state.as_mut() else { return };
         st.pending_remix = Some(prompt.clone());
-        let status = match (&self.jobs, st.project.is_analysed()) {
+        // not analysed and not being analysed (its download was declined): remix as it is
+        let now = st.project.is_analysed() || st.analysing.is_none();
+        let status = match (&self.jobs, now) {
             (Some(jobs), true) => start_remix(st, jobs),
             _ => format!("Poing is listening to the song first; then it makes three remixes as \"{prompt}\""),
         };
@@ -1665,6 +1747,13 @@ impl App {
 
 /// Understand the song in the background; lanes fill in when it lands.
 fn analyse(jobs: Option<&Jobs>, st: &mut EditorState) {
+    if let Some(note) = model_view::gate(st, "analysis", model_view::Resume::Analyse(st.path.clone())) {
+        // a download on offer shows in the offer bar; a reason it can't run, here
+        if st.needs_download.is_none() {
+            st.notice = Some(note);
+        }
+        return;
+    }
     {
         let (Some(jobs), Some(source)) = (jobs, st.project.source.clone()) else { return };
         let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -2303,6 +2392,9 @@ impl App {
         if self.agent_rx.is_some() {
             return Some("Claude is working on a request".into());
         }
+        if self.downloads.busy() {
+            return Some("a download (it picks up where it was next time)".into());
+        }
         let running = self.jobs.as_ref().is_some_and(|j| j.last_seq() > self.jobs_done);
         if !running {
             return None;
@@ -2463,14 +2555,7 @@ impl App {
             "Plugin hosting is Windows-only for now.".to_string()
         };
         ui.label(cx, ids!(plugins_status)).set_text(cx, &ptext);
-        let ace = std::fs::canonicalize(audio::acestep_dir()).map(|p| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"))).unwrap_or_else(|_| audio::acestep_dir());
-        let models = format!(
-            "ACE-Step 1.5 (remix, repaint, new songs, added parts): {}.\nYuE2 (whole-song covers): {}.\nNew songs are saved in {}.",
-            if ace.join("pyproject.toml").exists() { format!("found in {}", ace.display()) } else { "not found (set POING_ACESTEP)".into() },
-            if audio::yue2_available() { "ready" } else { "not set up (remixes use ACE-Step instead)" },
-            audio::songs_dir().display()
-        );
-        ui.label(cx, ids!(models_status)).set_text(cx, &models);
+        self.refresh_models(cx);
     }
 }
 
@@ -2510,6 +2595,9 @@ impl MatchEvent for App {
             cx.set_key_focus(Area::Empty);
         }
         let buttons = [ids!(rec0), ids!(rec1), ids!(rec2), ids!(rec3), ids!(rec4), ids!(rec5), ids!(rec6), ids!(rec7)];
+        if self.model_actions(cx, actions) {
+            return;
+        }
         if let Some(i) = buttons.iter().position(|b| ui.button(cx, *b).clicked(actions)) {
             if let Some(p) = self.recent.get(i).cloned() {
                 self.open(cx, Open::Project(p));
@@ -2886,7 +2974,9 @@ impl AppMain for App {
                     }
                 }
             }
-        }        if let Event::Signal = event {
+        }
+        if let Event::Signal = event {
+            self.drain_downloads(cx);
             self.drain_jobs(cx);
             self.drain_agent(cx);
         }
@@ -2958,6 +3048,9 @@ impl AppMain for App {
             }
         }
         self.match_event(cx, event);
+        if let Some((feature, resume)) = self.state.as_mut().and_then(|st| st.needs_download.take()) {
+            self.offer_download(cx, feature, resume);
+        }
         match &mut self.state {
             Some(st) => {
                 st.collect_retired();

@@ -12,5 +12,5 @@ makepad-audio-decode.workspace = true
 makepad-ai-stems.workspace = true
 makepad-ai-beats.workspace = true
 makepad-ai-speech.workspace = true
-makepad-ai-hub.workspace = true
+makepad-ai-hub = { workspace = true, features = ["local"] }
 makepad-fast-inflate.workspace = true

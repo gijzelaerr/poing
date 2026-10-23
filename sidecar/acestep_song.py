@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+import poing_ace
+
 
 def emit(stage, progress, message, **extra):
     print(json.dumps({"stage": stage, "progress": round(progress, 3), "message": message, **extra}), flush=True)
@@ -29,8 +31,7 @@ def emit(stage, progress, message, **extra):
 
 def main():
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    root = os.environ.get("POING_ACESTEP") or os.getcwd()
-    sys.path.insert(0, root)
+    root = poing_ace.root()
     task = job.get("task", "text2music")
     count = max(1, int(job.get("count", 3)))
     out_dir = Path(job["out_dir"])
@@ -52,7 +53,7 @@ def main():
         emit("load", 0.1, "Loading the song planner")
         from acestep.llm_inference import LLMHandler
         llm = LLMHandler()
-        msg, ok = llm.initialize(checkpoint_dir=os.path.join(root, "checkpoints"),
+        msg, ok = llm.initialize(checkpoint_dir=poing_ace.lm_dir(root),
                                  lm_model_path=os.environ.get("LM", "acestep-5Hz-lm-1.7B"),
                                  backend="pt", device="cuda", offload_to_cpu=True)
         if not ok:
