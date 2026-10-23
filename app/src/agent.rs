@@ -22,6 +22,18 @@ pub fn manifest() -> ServiceManifest {
         Risk::Read,
     ))
     .with_tool(tool(
+        "listen",
+        "Hear a range of the song (seconds, at most 30; about a second to compute): the mix as it plays now, or with `lane` that lane alone (its level, takes and effects, before the master). Returns loudness (`lufs` integrated, `short_term_max_lufs`), `true_peak_dbtp`, `clipped_samples`, `crest_db` (peak over RMS: under ~8 dense or squashed, over ~14 punchy or spiky), stereo `correlation` (1 mono, 0 unrelated, below 0 phase trouble) and `width` (side over mid: 0 mono, ~1 very wide), and `band_db`, the level in each band: sub 20-60 Hz, bass 60-120, upper_bass 120-250, low_mid 250-500 (mud), mid 500-1k (boxy), upper_mid 1-2k (nasal), high_mid 2-4k (harsh, vocal clarity), presence 4-8k (bite, sibilance), air 8-20k. `notes` says what the measurement leaves out (VST3 plugins cannot be run a second time: their effects are measured dry, their instruments silent).",
+        r#"{"type":"object","properties":{"start":{"type":"number","minimum":0},"end":{"type":"number","minimum":0},"lane":{"type":"integer","minimum":0}},"required":["start","end"],"additionalProperties":false}"#,
+        Risk::Read,
+    ))
+    .with_tool(tool(
+        "compare",
+        "Hear each lane alone and the mix over one range (seconds, at most 30), in one call: per lane its loudness, true peak, crest, width and `band_db` (bands as in `listen`), and `band_leaders`, the loudest lanes in each band with their level: two lanes within a few dB in one band mask each other there. `lanes` picks lanes by index (all when absent).",
+        r#"{"type":"object","properties":{"start":{"type":"number","minimum":0},"end":{"type":"number","minimum":0},"lanes":{"type":"array","items":{"type":"integer","minimum":0}}},"required":["start","end"],"additionalProperties":false}"#,
+        Risk::Read,
+    ))
+    .with_tool(tool(
         "describe",
         "Ask for a change in words, exactly as a person types it in Poing's Describe bar. With `lane` it works on that lane (\"less echo\", \"tape saturation\", \"funky slap bass\", \"play it with Serum 2\"); with `section` it repaints that section; with neither it works on the whole song (\"... on the master\" writes a master effect, anything else makes three whole-song remixes that replace the lanes while one is on). For a new MIDI part use `add_part` instead. Starts a job (seconds to minutes): `song.busy` is true until it is done, `song.status` says what came of it.",
         r#"{"type":"object","properties":{"text":{"type":"string","maxLength":500},"lane":{"type":"integer","minimum":0},"section":{"type":"integer","minimum":0}},"required":["text"],"additionalProperties":false}"#,
@@ -235,9 +247,10 @@ pub fn unavailable() -> Option<String> {
 /// Words that ask to change the mix rather than make new music.
 pub fn is_mix_text(text: &str) -> bool {
     let t = text.to_lowercase();
-    const WORDS: [&str; 22] = [
+    const WORDS: [&str; 30] = [
         "louder", "quieter", "softer", "volume", "level", "balance", "mix", "punch", "up a bit", "down a bit", "turn up", "turn down",
-        "mute", "solo", "warmer", "brighter", "wider", "pan", "combine", "use remix", "chorus from", "verse from",
+        "mute", "solo", "warmer", "brighter", "wider", "pan", "combine", "use remix", "chorus from", "verse from", "muddy", "buried",
+        "harsh", "thin", "boomy", "boxy", "clarity", "clipping",
     ];
     WORDS.iter().any(|w| t.contains(w))
 }
@@ -245,11 +258,12 @@ pub fn is_mix_text(text: &str) -> bool {
 const BRIEF: &str = r#"You are the assistant inside Poing, a music workstation. The person typed a request in Poing's Describe bar about the song that is open. Do it with the poing tools:
 
 - Read `song` first. Lanes, sections and effects are addressed by their index there, takes by id.
-- Change the mix with set_lane (levels in dB: prefer small moves of 1-3 dB unless asked for more), effect (knobs by name, bypass), take, combine and transport.
+- Listen before you change the sound and again after: pick a representative range (a chorus, or the section the request is about; up to 30 s) and call `compare` (every lane and the mix, with which lanes lead each band) or `listen` (the mix, or one lane). Prefer a range where no section take plays (a result's `notes` say where one does): there the lanes are what you hear. Use the numbers to decide what to change and by how much: who is loud in low_mid when it is muddy, how far the vocals sit under the other lanes in high_mid and presence when they are buried, true peak and clipping before raising anything. Then measure the same range again to check the change did what was asked.
+- Change the mix with set_lane (levels in dB: prefer small moves of 1-3 dB unless the measurements call for more), effect (knobs by name, bypass), take, combine and transport.
 - To add an instrument part (bass line, chords, drums, a melody) use `add_part`. Use `describe` to have Poing make other new things: an effect written for a lane, a lane played again as another instrument, a section repaint, or whole-song remixes (only when the person asks for a new version of the whole song: a remix replaces every lane while it plays). Both run a job and return when it is done (that can take minutes).
 - `song.status` is the last message Poing showed, not a request.
 - Do not export unless asked. Do not undo the person's earlier choices unless the request says so.
-- Finish with one or two plain sentences saying what you changed (no markdown, no lists)."#;
+- Finish with at most two short plain sentences (about 40 words; Poing shows them in its status line): what you changed and what it measured before and after, for example "Bass -2 dB: low-mids -1.8 dB in the verse; vocals +2 dB, now 3 dB over the guitars at 2-4 kHz." Add a few words when something stands in the way (clipping, a plugin the measurement left out). No markdown, no lists."#;
 
 /// Run Claude Code on `request` with this Poing's tools (its own MCP bridge,
 /// tools only: no clicks or screenshots), on its own thread: the jobs it starts
@@ -329,6 +343,7 @@ mod tests {
     fn mixing_words_are_told_apart_from_new_music() {
         assert!(is_mix_text("vocals a bit louder, bass a bit quieter"));
         assert!(is_mix_text("make the mix punchier"));
+        assert!(is_mix_text("the bass is a bit muddy and the vocals are buried"));
         assert!(!is_mix_text("80s disco with Dutch female vocals"));
     }
 }

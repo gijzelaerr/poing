@@ -11,6 +11,7 @@ mod agent;
 mod audio;
 mod fx;
 mod fx_writer;
+mod listen;
 mod plugins;
 mod synth;
 mod midi_writer;
@@ -1890,6 +1891,27 @@ impl App {
                 }
                 st.sel_changed = true;
                 Ok(format!("{} at {:.1}s", if st.shared.playing() { "Playing" } else { "Paused" }, st.playhead()))
+            }
+            // read tools: they answer with measurements and leave the status line alone
+            "listen" | "compare" => {
+                let heard = listen::range(st, get(&a, "start").and_then(num), get(&a, "end").and_then(num)).and_then(|(start, end)| {
+                    if call.tool == "listen" {
+                        match index(&a, "lane") {
+                            Some(l) if l >= lanes => Err("no such lane".into()),
+                            lane => listen::listen(st, start, end, lane),
+                        }
+                    } else {
+                        let picked: Vec<usize> = get(&a, "lanes").and_then(|v| v.as_arr()).unwrap_or_default().iter().filter_map(|v| v.as_u64()).map(|i| i as usize).collect();
+                        match picked.iter().find(|&&l| l >= lanes) {
+                            Some(l) => Err(format!("no lane {l}")),
+                            None => listen::compare(st, start, end, &picked),
+                        }
+                    }
+                });
+                return match heard {
+                    Ok((line, data)) => ToolResult::ok(&id, line, "").with_data(data.to_json()),
+                    Err(e) => ToolResult::failed(&id, e),
+                };
             }
             "export" => {
                 let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
