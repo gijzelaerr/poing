@@ -1,0 +1,16 @@
+[package]
+name = "poing-engine"
+description = "Poing's native model engine: stems, beats and lyrics without Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+poing-model.workspace = true
+makepad-micro-serde.workspace = true
+makepad-audio-decode.workspace = true
+makepad-ai-stems.workspace = true
+makepad-ai-beats.workspace = true
+makepad-ai-speech.workspace = true
+makepad-ai-hub.workspace = true
+makepad-fast-inflate.workspace = true

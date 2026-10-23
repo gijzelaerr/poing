@@ -11,6 +11,8 @@ lyrics.txt (songs Poing made, or corrected words) those lines are timed to the s
 instead, and sheet.json's "language" is passed to Whisper (otherwise it is detected).
 
     ... poing_analyze.py --only lyrics|structure <audio> <bundle>   redo one part (stems must exist)
+The app runs `--only structure` after the native poing-engine has written stems, beats and
+lyrics: SheetSage2 then adds key, chords and sections, and the engine's beats and tempo stay.
 Streams one JSON object per line on stdout:
     {"stage": "...", "progress": 0..1, "message": "..."}   and finally {"stage": "done", ...}
 Errors: {"stage": "error", "message": "..."} and a non-zero exit.
@@ -25,6 +27,7 @@ from pathlib import Path
 
 # (stage, share of the total time) for one overall progress number
 STAGES = [("stems", 0.45), ("structure", 0.25), ("lyrics", 0.30)]
+RUN = [name for name, _ in STAGES]  # the stages this run does (--only)
 
 
 def emit(stage, progress, message="", **extra):
@@ -32,12 +35,14 @@ def emit(stage, progress, message="", **extra):
 
 
 def overall(stage, within):
+    stages = [(name, share) for name, share in STAGES if name in RUN]
+    total = sum(share for _, share in stages)
     done = 0.0
-    for name, share in STAGES:
+    for name, share in stages:
         if name == stage:
-            return done + share * within
+            return (done + share * within) / total
         done += share
-    return done
+    return done / total
 
 
 def separate(audio: Path, out: Path, device: str):
@@ -459,12 +464,14 @@ def lyrics(vocals: Path, bundle: Path, device: str):
 
 
 def main():
+    global RUN
     args = sys.argv[1:]
     # --only lyrics|structure: redo one part on a bundle that already has stems and analysis.json
     only = args[args.index("--only") + 1] if "--only" in args else None
     if only:
         i = args.index("--only")
         args = args[:i] + args[i + 2:]
+        RUN = [only]
     audio, bundle = Path(args[0]).resolve(), Path(args[1]).resolve()
     began = time.time()
     try:
@@ -476,7 +483,15 @@ def main():
         else:
             separate(audio, bundle, device)
         if only in (None, "structure"):
-            result = {**(result if only else {}), **structure(audio, bundle, device)}
+            found = structure(audio, bundle, device)
+            if only:
+                # Beats and tempo the native engine found stay; SheetSage2's fill in.
+                for k in ("tempo", "beats", "downbeats"):
+                    if result.get(k):
+                        found.pop(k)
+                result.update(found)
+            else:
+                result = found
         if only in (None, "lyrics"):
             result["lyrics"] = lyrics(bundle / "stems" / "vocals.wav", bundle, device)
         result["stems"] = {s: f"stems/{s}.wav" for s in ("vocals", "drums", "bass", "other")}

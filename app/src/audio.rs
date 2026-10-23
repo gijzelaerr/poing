@@ -889,63 +889,53 @@ struct SidecarLine {
     path: Option<String>,
 }
 
-/// Run the sidecar on `audio` into `bundle`, relaying its progress, then decode
-/// the stems it wrote. Its stderr goes to `bundle/analysis.log`.
+/// Understand `audio` into `bundle`, then decode the stems. Stems, beats and
+/// lyrics come from the native `poing-engine` when it can run here (its models
+/// installed, a GPU store); the Python sidecar then adds only key, chords and
+/// sections. Without the engine, the sidecar does it all. Both write their
+/// stderr to `bundle/analysis.log`.
 fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
-    use makepad_micro_serde::DeJson;
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-
     let progress =
         |message: &str, progress: f32| send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: message.into(), progress });
     let fail = |message: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message });
     progress("Starting analysis", 0.0);
-    let dir = sidecar_dir();
-    let log = match std::fs::File::create(bundle.join("analysis.log")) {
+    let log_path = bundle.join("analysis.log");
+    let log = match std::fs::File::create(&log_path) {
         Ok(f) => f,
         Err(e) => return fail(format!("Analysis failed: {e}")),
     };
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("--project").arg(&dir).arg("python").arg(dir.join("poing_analyze.py")).arg(audio).arg(bundle)
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUNBUFFERED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(log));
-    // SheetSage2 decodes audio with the ffmpeg CLI; put the one we found on PATH.
-    if let Some(ff) = ffmpeg().and_then(|f| f.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()) {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![ff];
-        paths.extend(std::env::split_paths(&path));
-        if let Ok(joined) = std::env::join_paths(paths) {
-            cmd.env("PATH", joined);
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return fail(format!("Analysis needs `uv` on PATH ({e})")),
+    let note = |text: &str| {
+        use std::io::Write;
+        let _ = writeln!(&log, "poing: {text}");
     };
-    let mut error = None;
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
-            let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
-            let message = l.message.unwrap_or_default();
-            if l.stage == "error" {
-                error = Some(message);
-            } else {
-                progress(&message, l.progress.unwrap_or(0.0) as f32);
-            }
+    // Native stems, beats and lyrics take the first 70% of the bar.
+    let native = match engine_command() {
+        Some(mut cmd) => {
+            cmd.arg("analyze").arg(audio).arg(bundle);
+            run_lines(cmd, &log, (0.0, 0.7), &progress)
         }
-    }
-    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    if !ok || error.is_some() {
-        let why = error.unwrap_or_else(|| "the sidecar exited with an error".into());
-        return fail(format!("Analysis failed: {why} (see {})", bundle.join("analysis.log").display()));
+        None => Ok(LinesOutcome::Unavailable("poing-engine not found".into())),
+    };
+    let full_sidecar = |why: String| {
+        note(&format!("native analysis: {why}; using the Python sidecar for all of it"));
+        run_lines(sidecar_command(audio, bundle), &log, (0.0, 1.0), &progress).and_then(LinesOutcome::done)
+    };
+    let result = match native {
+        Ok(LinesOutcome::Done) => {
+            let mut cmd = sidecar_command(audio, bundle);
+            cmd.arg("--only").arg("structure");
+            // The native half stands on its own: a song with stems, beats and
+            // lyrics but no sections is better than no analysis.
+            if let Err(why) = run_lines(cmd, &log, (0.7, 1.0), &progress).and_then(LinesOutcome::done) {
+                note(&format!("sections, key and chords skipped: {why}"));
+            }
+            Ok(())
+        }
+        Ok(LinesOutcome::Unavailable(why)) => full_sidecar(why),
+        Err(why) => full_sidecar(format!("failed ({why})")),
+    };
+    if let Err(why) = result {
+        return fail(format!("Analysis failed: {why} (see {})", log_path.display()));
     }
     progress("Loading stems", 1.0);
     let mut stems = Vec::new();
@@ -957,6 +947,108 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
         }
     }
     send(tx, JobUpdate::Analyzed { bundle: bundle.to_path_buf(), stems });
+}
+
+/// `uv run … poing_analyze.py <audio> <bundle>` in the sidecar project.
+fn sidecar_command(audio: &Path, bundle: &Path) -> Command {
+    let dir = sidecar_dir();
+    let mut cmd = Command::new("uv");
+    cmd.arg("run").arg("--project").arg(&dir).arg("python").arg(dir.join("poing_analyze.py")).arg(audio).arg(bundle)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1");
+    // SheetSage2 decodes audio with the ffmpeg CLI; put the one we found on PATH.
+    if let Some(ff) = ffmpeg().and_then(|f| f.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![ff];
+        paths.extend(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    cmd
+}
+
+/// The native engine (`poing-engine`, built next to poing): `POING_ENGINE`,
+/// else beside this exe. None when it isn't there or `POING_NATIVE=0`.
+fn engine_command() -> Option<Command> {
+    if std::env::var("POING_NATIVE").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let exe = std::env::var_os("POING_ENGINE").map(PathBuf::from).or_else(|| {
+        let name = if cfg!(windows) { "poing-engine.exe" } else { "poing-engine" };
+        Some(std::env::current_exe().ok()?.parent()?.join(name))
+    })?;
+    if !exe.is_file() {
+        return None;
+    }
+    let mut cmd = Command::new(exe);
+    // The CUDA runtime DLLs live in the toolkit's bin\x64 since CUDA 13.
+    #[cfg(windows)]
+    if let Some(cuda) = cuda_root() {
+        let mut paths = vec![cuda.join("bin").join("x64"), cuda.join("bin")];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    Some(cmd)
+}
+
+/// How a progress-line process ended, when it didn't fail.
+enum LinesOutcome {
+    Done,
+    /// It can't run here (the engine's `unavailable` stage, or it didn't start).
+    Unavailable(String),
+}
+
+impl LinesOutcome {
+    fn done(self) -> Result<(), String> {
+        match self {
+            LinesOutcome::Done => Ok(()),
+            LinesOutcome::Unavailable(why) => Err(why),
+        }
+    }
+}
+
+/// Run a process that prints sidecar progress lines, relaying them scaled into
+/// `band` of the job's bar, with its stderr appended to `log`. It has exited
+/// when this returns, so the next process gets the whole GPU.
+fn run_lines(mut cmd: Command, log: &std::fs::File, band: (f32, f32), progress: &dyn Fn(&str, f32)) -> Result<LinesOutcome, String> {
+    use makepad_micro_serde::DeJson;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let stderr = log.try_clone().map_err(|e| e.to_string())?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Ok(LinesOutcome::Unavailable(format!("{program} could not start ({e})"))),
+    };
+    let (mut error, mut unavailable) = (None, None);
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
+            let message = l.message.unwrap_or_default();
+            match l.stage.as_str() {
+                "error" => error = Some(message),
+                "unavailable" => unavailable = Some(message),
+                _ => progress(&message, band.0 + (band.1 - band.0) * l.progress.unwrap_or(0.0) as f32),
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if let Some(why) = unavailable {
+        return Ok(LinesOutcome::Unavailable(why));
+    }
+    if !ok || error.is_some() {
+        return Err(error.unwrap_or_else(|| format!("{program} exited with an error")));
+    }
+    Ok(LinesOutcome::Done)
 }
 
 /// A Hugging Face model's local snapshot: `HF_HUB_CACHE`, `HF_HOME/hub`, else

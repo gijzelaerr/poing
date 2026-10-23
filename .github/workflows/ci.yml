@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, name: macOS-arm64, exe: poing }
-          - { os: windows-latest, name: Windows-x86_64, exe: poing.exe }
-          - { os: ubuntu-latest, name: Linux-x86_64, exe: poing }
+          - { os: macos-latest, name: macOS-arm64, exe: poing, engine: poing-engine }
+          - { os: windows-latest, name: Windows-x86_64, exe: poing.exe, engine: poing-engine.exe }
+          - { os: ubuntu-latest, name: Linux-x86_64, exe: poing, engine: poing-engine }
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -54,5 +54,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: poing-${{ matrix.name }}
-          path: target/release/${{ matrix.exe }}
+          # The runners have no CUDA toolkit: this poing-engine is the CPU-only
+          # stub on Windows and Linux (analysis falls back to Python); Metal on macOS.
+          path: |
+            target/release/${{ matrix.exe }}
+            target/release/${{ matrix.engine }}
           if-no-files-found: error
