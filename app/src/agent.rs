@@ -320,7 +320,8 @@ fn run_claude(request: &str, work: &std::path::Path) -> Result<String, String> {
         .env("MCP_TOOL_TIMEOUT", "900000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // to a file: stdout is read to its end first, so a full stderr pipe would hang both
+        .stderr(std::fs::File::create(work.join("claude-stderr.log")).map(Stdio::from).unwrap_or_else(|_| Stdio::null()));
     if let Ok(model) = std::env::var("POING_CLAUDE_MODEL") {
         cmd.arg("--model").arg(model);
     }
@@ -350,9 +351,10 @@ fn run_claude(request: &str, work: &std::path::Path) -> Result<String, String> {
             _ => {}
         }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("Claude Code stopped: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        let err = std::fs::read_to_string(work.join("claude-stderr.log")).unwrap_or_default();
+        return Err(format!("Claude Code stopped: {}", err.trim()));
     }
     Ok(answer)
 }

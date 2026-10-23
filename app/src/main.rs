@@ -1094,7 +1094,7 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     if st.sel == Selection::None && st.agent_ok {
         match agent::unavailable() {
             None => {
-                if let Some(note) = llm::feature().and_then(|f| model_view::gate(st, f, model_view::Resume::Describe(st.path.clone(), text.to_string()))) {
+                if let Some(note) = llm::feature().and_then(|f| model_view::gate(st, f, model_view::Resume::Ask(st.path.clone(), text.to_string()))) {
                     return note;
                 }
                 st.ask_agent = Some(text.to_string());
@@ -1277,6 +1277,17 @@ fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option
     }
     st.analysing = Some(("Effect".into(), 0.0));
     format!("{} is writing \"{text}\" for {place}; Poing checks it before you hear it (under a minute)...", llm::name())
+}
+
+/// Start the assistant on `request` (one undo step for the whole pass); its
+/// answer arrives on the receiver.
+fn start_agent(st: &mut EditorState, request: String) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    st.checkpoint();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let work = st.path.parent().map(|p| p.join("agent").join(stamp.to_string())).unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    agent::run(request, work, tx);
+    rx
 }
 
 /// Describe on a lane (or a region of it): less echo, or a new part added.
@@ -2813,13 +2824,7 @@ impl MatchEvent for App {
                 note_request_in(&mut self.requests, self.jobs.as_ref(), &bundle, before, "describe", text.trim(), lane, section);
                 ui.text_input(cx, ids!(describe_input)).set_text(cx, "");
                 if let Some(request) = st.ask_agent.take() {
-                    // one undo step for the whole pass
-                    st.checkpoint();
-                    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    let work = st.path.parent().map(|p| p.join("agent").join(stamp.to_string())).unwrap_or_default();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    agent::run(request, work, tx);
-                    self.agent_rx = Some(rx);
+                    self.agent_rx = Some(start_agent(st, request));
                 }
                 // back to the song: shortcuts work again
                 cx.set_key_focus(Area::Empty);
