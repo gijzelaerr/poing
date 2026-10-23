@@ -1,6 +1,6 @@
 # Installing Poing: a small app, models on demand
 
-Status: design, 2026-10-23. No code yet. Related: [PLAN.md](PLAN.md) (M8 signing, "model weights never in git, downloaded on first use", `xtask` model download).
+Status: design 2026-10-23; I1 (Windows) built, see §4. Related: [PLAN.md](PLAN.md) (M8 signing, "model weights never in git, downloaded on first use", `xtask` model download).
 
 **Goal.** One small installer per OS. Poing opens and plays, mixes and hosts plugins with nothing else installed. Each AI feature downloads what it needs the first time you use it, after you say yes, and can be removed again.
 
@@ -176,3 +176,26 @@ Go native in the order above: YuE2 packaging and Whisper are cheap, ACE-Step's s
 - Model manager: disk, GPU and driver checks; resumable download; licence prompt; Settings → Models with Remove.
 - The repaint and new-song actions show "Needs download (6.0 GB)" and prompt on first use.
 - **Done when:** on a second Windows PC (or a clean user account) with an NVIDIA GPU and no Python, uv, git checkouts or env vars, you install Poing and open a song. Analysis offers its own download; "Not now" leaves the song playable. You mark a range, repaint it, and the take plays. Then you remove the pack and the disk space comes back.
+
+## 4. I1 as built (2026-10-23)
+
+**Installer.** `cargo packager -p poing --release` (config in `app/Cargo.toml`) makes `poing_<version>_x64-setup.exe`, a per-user NSIS installer (`%LOCALAPPDATA%\Programs\Poing`, no admin), unsigned. CI builds it on a `v*` tag or by hand (`.github/workflows/release.yml`), fails above 50 MB and attaches it to a pre-release. Contents: `poing.exe` (34 MB), `poing-engine.exe` (the CPU stub from the runners, 2.8 MB), `sidecar/*.py` with `pyproject.toml` and `uv.lock`, `uv.exe` 0.13.1 (checksum-pinned), `LICENSE`, `NOTICE.md` and `licences/`. **21 MB download, 70 MB installed.** The uninstaller offers (default off) to delete `%LOCALAPPDATA%\Poing`, models included.
+
+**One resolver** (`app/src/paths.rs`). Dev overrides (`POING_SIDECAR`, `POING_ACESTEP`, `POING_UV`), then `sidecar/` and `uv.exe` beside an installed `poing.exe`, then the packs. A build run from the repository still finds the repository's `sidecar/` and `../ACE-Step-1.5`, so development works as before. An installed Poing never looks there.
+
+**Registry** (`app/models.json`, compiled in; JSON rather than TOML because Poing already parses JSON with Makepad's micro-serde, so no new dependency). Every URL pins a commit and every file has a size and sha256 (non-LFS files were hashed after checking their git blob ids against the Hub):
+
+| Pack | What | Size | Licence |
+| --- | --- | --- | --- |
+| `py-acestep` | ACE-Step 1.5 source at `ca1e85f` (GitHub zip, sha256-pinned), then `uv sync --frozen` on its own `uv.lock` | 9 MB + ~6.2 GB env | MIT |
+| `acestep-turbo` | turbo DiT, VAE, Qwen3-Embedding-0.6B from `ACE-Step/Ace-Step1.5@19671f4` | 6.3 GB | MIT (Qwen3 Apache-2.0) |
+| `acestep-lm` | the 1.7B song planner (optional for new songs: without it they are sung unplanned) | 3.8 GB | MIT |
+| `py-analysis` | `uv sync --frozen` on the installed `sidecar/`; its scripts fetch Demucs, SheetSage2, MERT and Whisper into the pack on the first analysis | ~6.7 GB env + ~5.8 GB weights | CC BY-NC 4.0 (SheetSage2, MERT) |
+
+Features: `analysis` → py-analysis; `repaint`, `remix` → py-acestep + acestep-turbo; `new-song` → the same, plus acestep-lm optional.
+
+**Model manager** (`app/src/models.rs`). One pack is one folder in `%LOCALAPPDATA%\Poing\models` (`POING_MODELS` moves it). Downloads use Makepad's hub downloader (`.part` + Range resume, size and sha256 check, atomic rename) on their own thread, not the jobs worker. Before downloading it checks the GPU, VRAM and driver through `nvidia-smi` (driver ≥ 528.33, CUDA 12 minor-version compatibility for the cu128 wheels) and free disk (pack + 10 %). A runtime pack then runs the bundled uv with `UV_PROJECT_ENVIRONMENT`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` and `UV_PYTHON_PREFERENCE=only-managed` all inside the pack, plus `--no-config`. It smoke-imports the env (`torch.cuda.is_available()` for ACE-Step) and deletes uv's cache. `pack.json` (registry version, file hashes, accepted licence and time) is written last. Remove deletes the folder: env, Python and weights. At run time Poing calls the env's `python.exe` directly, with `ACESTEP_CHECKPOINTS_DIR` on the pack. `POING_NO_AUTO_DOWNLOAD` makes `sidecar/poing_ace.py` stop ACE-Step from fetching weights itself: when the LM is missing it would otherwise pull the whole 10 GB repository unasked.
+
+**UI.** No dialogs. An action that needs a pack shows a bar under the top bar: "Repainting a range needs a download: ACE-Step runtime + ACE-Step 1.5 turbo (12.5 GB, MIT licence). Download?" with Download and Not now. The bar then shows progress with Stop, which keeps the `.part` files for resuming. When the download is done, the request that asked for it runs. A song opens playable without analysis. A range marked on the original lane can be repainted without sections. Settings → Models lists each pack with what it is, its licence, its size or size on disk, and Download / Remove / Stop. Closing Poing during a download warns, like a running job.
+
+**Not in I1:** Add a part (needs `acestep-base` and Demucs), Less echo and YuE2 stay development-only. A clean PC has no ffmpeg, which SheetSage2 uses to decode audio, so the analysis pack's first run still needs it (an `ffmpeg` pack is next). macOS and Linux installers are not built yet (the resolver and model manager already have their folders). Signing is M8.

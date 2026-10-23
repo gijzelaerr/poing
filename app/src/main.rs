@@ -394,7 +394,7 @@ script_mod! {
                     }
 
                     // Settings: what Poing plays through, where its AI runs, what it found.
-                    settings := View{
+                    settings := ScrollYView{
                         visible: false
                         width: Fill height: Fill flow: Down spacing: 18
                         padding: Inset{left: 60 right: 60 top: 36 bottom: 24}
