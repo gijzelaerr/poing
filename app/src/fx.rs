@@ -189,6 +189,9 @@ pub struct FxRack {
     pub master: Vec<FxUnit>,
     /// MIDI lanes' instruments and notes.
     pub midi: Vec<crate::synth::MidiLane>,
+    /// The song this rack plays (0: none): state and plugin instances only
+    /// carry over between racks of one song.
+    pub song: u64,
     pub(crate) lane_l: Vec<f32>,
     pub(crate) lane_r: Vec<f32>,
     tmp_l: Vec<f32>,
@@ -198,7 +201,7 @@ pub struct FxRack {
 impl FxRack {
     pub fn new(lanes: Vec<Vec<FxUnit>>, master: Vec<FxUnit>) -> Self {
         let tmp = aot::MAX_FRAMES as usize;
-        FxRack { lanes, master, midi: Vec::new(), lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
+        FxRack { lanes, master, midi: Vec::new(), song: 0, lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
     }
 
     pub fn empty() -> Self {
@@ -230,6 +233,10 @@ impl FxRack {
     /// Carry every kept effect over from the rack this one replaces: shader
     /// state, and plugin instances (moved, not reloaded). No allocation.
     pub fn adopt(&mut self, old: &mut FxRack) {
+        // another song's `fx1` or `midi1` is a different effect or instrument
+        if self.song != old.song {
+            return;
+        }
         for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
             if let Some(o) = old.lanes.iter_mut().flatten().chain(old.master.iter_mut()).find(|o| o.id == unit.id) {
                 unit.carry_from(o);

@@ -99,6 +99,13 @@ pub struct EditorState {
     /// selected may go to Claude, which then sets `ask_agent`.
     pub agent_ok: bool,
     pub ask_agent: Option<String>,
+    /// The song in front (its tab is selected): only it talks to the audio thread.
+    is_current: bool,
+    /// Where a song in a background tab was, to come back to.
+    saved_pos: f64,
+    /// Tags this song's effect racks: a rack only carries effect state and
+    /// plugin instances over from a rack of the same song.
+    pub song_tag: u64,
 }
 
 impl EditorState {
@@ -124,6 +131,12 @@ impl EditorState {
                 s
             }
             None => Arc::new(Shared::new(mix, stems.clone())),
+        };
+        let song_tag = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            h.finish() | 1
         };
         let next_region = project
             .regions()
@@ -178,6 +191,9 @@ impl EditorState {
             pending_remix: None,
             agent_ok: false,
             ask_agent: None,
+            is_current: true,
+            saved_pos: 0.0,
+            song_tag,
         }
         .with_fx()
     }
@@ -236,6 +252,7 @@ impl EditorState {
     /// A rack for the song as it is now (fresh effect state).
     pub fn make_rack(&self) -> FxRack {
         let mut rack = fx::build_rack(&self.project, &|id| self.fx_shaders.get(id).cloned(), &|id| self.fx_controls.get(id).cloned());
+        rack.song = self.song_tag;
         // MIDI lanes: their notes on the song's beat grid, played by their instruments
         let grid = poing_model::BeatGrid::of(&self.project);
         let sr = self.sr();
@@ -334,10 +351,14 @@ impl EditorState {
     /// Hand the audio thread a rack for the current effects (it carries
     /// over the state of every effect it keeps).
     pub fn publish_fx(&mut self) {
+        if !self.is_current {
+            return; // built when its tab comes to the front
+        }
         #[cfg(windows)]
         {
-            // A rack the audio thread never picked up gives its plugins back.
-            if let Some(mut stale) = self.shared.fx_in.lock().ok().and_then(|mut s| s.take()) {
+            // A rack the audio thread never picked up gives its plugins back
+            // (only to its own song: another song's ids mean other plugins).
+            if let Some(mut stale) = self.shared.fx_in.lock().ok().and_then(|mut s| s.take()).filter(|r| r.song == self.song_tag) {
                 self.pending_runners.extend(stale.take_runners());
                 self.pending_insts.extend(stale.take_instruments());
             }
@@ -655,12 +676,62 @@ impl EditorState {
         Some(notes.join("  ·  "))
     }
 
-    /// This song's stem sets the audio thread may still hold: its current one
-    /// and any not yet collected. For the next song to keep until it moved on.
-    pub fn into_retired(self) -> Vec<Stems> {
-        let mut sets = self.retired;
-        sets.push(self.stems);
+
+    pub fn is_current(&self) -> bool {
+        self.is_current
+    }
+
+    /// Its tab goes to the back: remember where it was, stop talking to the
+    /// audio thread, and hand over what the next song must keep alive (the
+    /// plugin handles, the stem sets the audio thread may still hold).
+    /// Its plugins are loaded again when it comes back.
+    #[cfg(windows)]
+    pub fn deactivate(&mut self) -> (Vec<vst3_host::realtime::RtControl>, Vec<Stems>) {
+        let controls = self.take_plugin_controls();
+        (controls, self.go_back())
+    }
+    #[cfg(not(windows))]
+    pub fn deactivate(&mut self) -> ((), Vec<Stems>) {
+        ((), self.go_back())
+    }
+
+    fn go_back(&mut self) -> Vec<Stems> {
+        self.saved_pos = self.playhead();
+        self.is_current = false;
+        self.plugin_params.retain(|_, _| false);
+        self.inst_plugins.clear();
+        #[cfg(windows)]
+        {
+            self.pending_runners.clear();
+            self.pending_insts.clear();
+        }
+        let mut sets = std::mem::take(&mut self.retired);
+        sets.push(self.stems.clone());
         sets
+    }
+
+    /// Its tab comes to the front: its stems, mix, effects (plugins load
+    /// again) and loop go to the audio thread. Playing on, it keeps the time
+    /// (`at`, clamped to its length) so songs compare at the same moment;
+    /// stopped, it goes back to where it was.
+    pub fn activate(&mut self, at: Option<f64>) {
+        self.is_current = true;
+        // past the version the audio thread has, so this mix is taken
+        let shared_version = self.shared.mix.lock().ok().map(|m| m.version).unwrap_or(0);
+        self.mix_version = self.mix_version.max(shared_version) + 1;
+        let stems = self.stems.clone();
+        if let Ok(mut s) = self.shared.stems.lock() {
+            *s = stems;
+        }
+        self.shared.stems_gen.fetch_add(1, Ordering::AcqRel);
+        self.push_mix();
+        self.sync_plugins();
+        self.compile_instruments();
+        self.publish_fx();
+        self.set_loop(self.loop_range);
+        let t = at.unwrap_or(self.saved_pos).min(self.duration());
+        self.seek(t);
+        self.sel_changed = true;
     }
 
     /// Keep a stem set alive until the audio thread has let go of it.
@@ -698,6 +769,11 @@ impl EditorState {
 
     /// Hand the audio thread a new stem set; keep the old one until it switched.
     fn publish_stems(&mut self, stems: Stems) {
+        if !self.is_current {
+            // the audio thread never saw this song's stems: nothing to retire
+            self.stems = stems;
+            return;
+        }
         let old = std::mem::replace(&mut self.stems, stems.clone());
         if let Ok(mut s) = self.shared.stems.lock() {
             *s = stems;
@@ -1020,6 +1096,9 @@ impl EditorState {
     pub fn set_loop(&mut self, range: Option<(f64, f64)>) {
         let sr = self.sr() as f64;
         self.loop_range = range;
+        if !self.is_current {
+            return;
+        }
         if let Some((a, b)) = range {
             self.shared.loop_a.store((a.max(0.0) * sr) as u64, Ordering::Relaxed);
             self.shared.loop_b.store((b * sr) as u64, Ordering::Relaxed);
@@ -1057,9 +1136,15 @@ impl EditorState {
         }
     }
     pub fn playhead(&self) -> f64 {
+        if !self.is_current {
+            return self.saved_pos;
+        }
         self.shared.pos() as f64 / self.sr() as f64
     }
     pub fn seek(&self, t: f64) {
+        if !self.is_current {
+            return;
+        }
         self.shared.seek((t.clamp(0.0, self.duration()) * self.sr() as f64) as usize)
     }
     pub fn toggle_play(&mut self) {
@@ -1076,6 +1161,10 @@ impl EditorState {
     pub fn push_mix(&mut self) {
         self.mix_version += 1;
         let mix = MixParams::from_project(&self.project, self.mix_version, &self.active);
+        if !self.is_current {
+            self.dirty = true;
+            return;
+        }
         if let Ok(mut m) = self.shared.mix.lock() {
             *m = mix;
         }

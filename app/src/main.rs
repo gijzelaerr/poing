@@ -84,6 +84,63 @@ script_mod! {
         draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9}}
     }
 
+    // A song tab: its name, a close cross, an accent line when it is in front.
+    let SongTab = View{
+        visible: false
+        width: Fit height: Fill flow: Down
+    }
+    let TabRow = View{
+        width: Fit height: 30 flow: Right
+        align: Align{y: 0.5}
+    }
+    let TabButton = ButtonFlatter{
+        height: 30
+        grab_key_focus: false
+        padding: Inset{left: 12 right: 28 top: 0 bottom: 0}
+        align: Align{x: 0.5 y: 0.5}
+        draw_text +: {
+            color: TEXT_2
+            color_hover: #xffffff
+            text_style: theme.font_regular{font_size: 9.5}
+        }
+        draw_bg +: {
+            border_radius: 6.0
+            border_size: 0.0
+            color: #00000000
+            color_hover: #x1f2229
+            color_down: #x272b33
+            color_focus: #00000000
+        }
+    }
+    let TabClose = ButtonFlatter{
+        width: 20 height: 20
+        margin: Inset{left: -26 right: 6 top: 5 bottom: 0}
+        grab_key_focus: false
+        padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
+        align: Align{x: 0.5 y: 0.5}
+        text: "×"
+        draw_text +: {
+            color: #x6b717c
+            color_hover: #xffffff
+            text_style: theme.font_regular{font_size: 11}
+        }
+        draw_bg +: {
+            border_radius: 10.0
+            border_size: 0.0
+            color: #00000000
+            color_hover: #x30353f
+            color_down: #x3a3f49
+            color_focus: #00000000
+        }
+    }
+    let TabLine = SolidView{
+        visible: false
+        width: 28 height: 2
+        margin: Inset{left: 12 right: 0 top: 0 bottom: 0}
+        show_bg: true
+        draw_bg +: {color: ACCENT}
+    }
+
     // The start screen's three ways in.
     let HomeCard = RoundedView{
         width: 300 height: 240 flow: Down spacing: 10
@@ -139,7 +196,7 @@ script_mod! {
                     show_bg: true
                     draw_bg +: {color: #x0f1013}
 
-                    topbar := View{
+                    topbar := SolidView{
                         width: Fill height: 56 flow: Right spacing: 14
                         padding: Inset{left: 14 right: 14 top: 11 bottom: 11}
                         show_bg: true
@@ -194,16 +251,27 @@ script_mod! {
                                 }
                             }
                         }
-                        songs_btn := PillButton{
-                            margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
-                            text: "Songs"
-                        }
                         render_btn := PillButton{
                             margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
                             text: "Export"
                         }
                     }
-                    View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
+                    // Open songs, one tab each: click to switch (playing on, at the same time), x to close.
+                    tab_strip := SolidView{
+                        visible: false
+                        width: Fill height: 32 flow: Right spacing: 2
+                        padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                        show_bg: true
+                        draw_bg +: {color: #x121317}
+                        tab0 := SongTab{TabRow{tab0_btn := TabButton{} tab0_x := TabClose{}} tab0_line := TabLine{}}
+                        tab1 := SongTab{TabRow{tab1_btn := TabButton{} tab1_x := TabClose{}} tab1_line := TabLine{}}
+                        tab2 := SongTab{TabRow{tab2_btn := TabButton{} tab2_x := TabClose{}} tab2_line := TabLine{}}
+                        tab3 := SongTab{TabRow{tab3_btn := TabButton{} tab3_x := TabClose{}} tab3_line := TabLine{}}
+                        tab4 := SongTab{TabRow{tab4_btn := TabButton{} tab4_x := TabClose{}} tab4_line := TabLine{}}
+                        tab5 := SongTab{TabRow{tab5_btn := TabButton{} tab5_x := TabClose{}} tab5_line := TabLine{}}
+                        new_tab_btn := TabButton{text: "+"}
+                    }
+                    SolidView{width: Fill height: 1 draw_bg +: {color: HAIRLINE}}
 
                     // The start screen: shown until a song is open.
                     home := View{
@@ -272,8 +340,8 @@ script_mod! {
 
                     inspector_box := View{
                     width: Fill height: Fit flow: Down
-                    View{width: Fill height: 1 show_bg: true draw_bg +: {color: HAIRLINE}}
-                    inspector := View{
+                    SolidView{width: Fill height: 1 draw_bg +: {color: HAIRLINE}}
+                    inspector := SolidView{
                         width: Fill height: Fit flow: Down spacing: 10
                         padding: Inset{left: 18 right: 18 top: 12 bottom: 12}
                         show_bg: true
@@ -360,6 +428,49 @@ pub struct App {
     /// Claude working on a request from the Describe bar: its answer arrives here.
     #[rust]
     agent_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Songs open in background tabs (the one in front is `state`).
+    #[rust]
+    others: Vec<EditorState>,
+    /// Tab order: project files.
+    #[rust]
+    tabs: Vec<PathBuf>,
+    /// The audio output's state, shared by every song (made with the first).
+    #[rust]
+    shared: Option<std::sync::Arc<audio::Shared>>,
+}
+
+/// The song a job belongs to, in front or in a background tab.
+fn song_in<'a>(front: &'a mut Option<EditorState>, others: &'a mut [EditorState], bundle: &Path) -> Option<&'a mut EditorState> {
+    if front.as_ref().is_some_and(|st| st.path.parent() == Some(bundle)) {
+        return front.as_mut();
+    }
+    others.iter_mut().find(|st| st.path.parent() == Some(bundle))
+}
+
+/// The song (bundle folder) a job update is about.
+fn update_bundle(u: &JobUpdate) -> Option<PathBuf> {
+    match u {
+        JobUpdate::Progress { bundle, .. }
+        | JobUpdate::Failed { bundle, .. }
+        | JobUpdate::Analyzed { bundle, .. }
+        | JobUpdate::TakeReady { bundle, .. }
+        | JobUpdate::MidiReady { bundle, .. }
+        | JobUpdate::FxReady { bundle, .. }
+        | JobUpdate::Finished { bundle, .. } => Some(bundle.clone()),
+        _ => None,
+    }
+}
+
+/// Songs open at once (each keeps its stems and takes decoded in memory).
+const MAX_TABS: usize = 6;
+
+/// One spelling of a project path, to tell whether a song is already open.
+fn same_song(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| {
+        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        c.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase()
+    };
+    canon(a) == canon(b)
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -963,9 +1074,7 @@ impl App {
         ui.view(cx, ids!(home)).set_visible(cx, !song);
         self.home_shown = !song;
         ui.view(cx, ids!(describe_frame)).set_visible(cx, song);
-        for b in [ids!(render_btn), ids!(songs_btn)] {
-            ui.button(cx, b).set_visible(cx, song);
-        }
+        ui.button(cx, ids!(render_btn)).set_visible(cx, song);
         if !song {
             ui.button(cx, ids!(play_btn)).set_visible(cx, false);
             ui.button(cx, ids!(pause_btn)).set_visible(cx, false);
@@ -975,18 +1084,35 @@ impl App {
         for id in [ids!(timeline_box), ids!(inspector_box)] {
             ui.view(cx, id).set_visible(cx, song);
         }
+        self.refresh_tabs(cx);
         ui.redraw(cx);
     }
 
     /// Open a project or import a song. The audio output is installed once;
     /// later songs reuse its Shared and swap their stems in by generation.
     fn open(&mut self, cx: &mut Cx, target: Open) {
-        let shared = self.state.as_ref().map(|st| st.shared.clone());
-        let result = (|| -> Result<(EditorState, bool), String> {
-            let path = match target {
-                Open::Project(path) => path,
-                Open::Audio(audio) => import(&audio, 48000)?.0,
-            };
+        let path = match target {
+            Open::Project(path) => Ok(path),
+            Open::Audio(audio) => import(&audio, 48000).map(|(p, _)| p),
+        };
+        let path = match path {
+            Ok(p) => p,
+            Err(e) => return self.open_failed(cx, &e),
+        };
+        // Already open: its tab comes to the front.
+        if self.state.as_ref().is_some_and(|st| same_song(&st.path, &path)) {
+            self.show_song_view(cx, true);
+            self.refresh_tabs(cx);
+            return;
+        }
+        if let Some(open) = self.others.iter().find(|st| same_song(&st.path, &path)).map(|st| st.path.clone()) {
+            self.switch_to(cx, &open);
+            return;
+        }
+        if self.agent_rx.is_some() {
+            return self.set_status(cx, "Claude is still working on this song; open the other one when it is done.");
+        }
+        let loaded = (|| -> Result<(Project, Vec<Stem>, bool), String> {
             let mut project = Project::load(&path)?;
             // a draft waits until one of its versions is picked
             let analyse = project.source.is_some() && !project.is_analysed() && !project.is_draft();
@@ -1005,52 +1131,150 @@ impl App {
             for t in project.takes() {
                 stems.push(audio::load_stem(&dir.join(&t.file), project.sr())?);
             }
-            let sr = project.sr();
-            let mut st = EditorState::new(project, path, stems, shared.clone());
-            st.restore_combined();
-            // Analysed while another song was open: apply it from disk, no second run.
-            let mut analyse = analyse;
-            if analyse {
-                if let Some((analysis, stems)) = finished_analysis(&dir, sr) {
-                    st.apply_analysis(analysis, stems)?;
+            Ok((project, stems, analyse))
+        })();
+        let (project, stems, mut analyse) = match loaded {
+            Ok(x) => x,
+            Err(e) => return self.open_failed(cx, &e),
+        };
+        // The song in front goes to a background tab first.
+        let handover = self.state.take().map(|mut old| {
+            let _ = old.save();
+            let given = old.deactivate();
+            self.others.push(old);
+            given
+        });
+        let first = self.shared.is_none();
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let sr = project.sr();
+        let mut st = EditorState::new(project, path.clone(), stems, self.shared.clone());
+        self.shared = Some(st.shared.clone());
+        if let Some((_controls, sets)) = handover {
+            // its plugins and stem sets may still be in the audio thread's hands
+            #[cfg(windows)]
+            st.adopt_plugin_controls(_controls);
+            for set in sets {
+                st.retire(set);
+            }
+        }
+        st.restore_combined();
+        // Analysed while another song was open: apply it from disk, no second run.
+        if analyse {
+            if let Some((analysis, stems)) = finished_analysis(&dir, sr) {
+                if st.apply_analysis(analysis, stems).is_ok() {
                     analyse = false;
                 }
             }
-            Ok((st, analyse))
-        })();
-        match result {
-            Ok((mut st, analyse)) => {
-                show_title(&self.ui, cx, &st.project);
-                remember_song(&st.path);
-                self.show_song_view(cx, true);
-                if shared.is_none() {
-                    audio::start_output(cx, st.shared.clone(), st.sr());
-                }
-                if analyse {
-                    self.start_analysis(&mut st);
-                }
-                if let Some(mut old) = self.state.replace(st) {
-                    // Its stem sets and plugins may still be in the audio thread's hands.
-                    #[cfg(windows)]
-                    let controls = old.take_plugin_controls();
-                    if let Some(st) = &mut self.state {
-                        #[cfg(windows)]
-                        st.adopt_plugin_controls(controls);
-                        for set in old.into_retired() {
-                            st.retire(set);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log!("poing: load failed: {e}");
-                if self.state.is_some() {
-                    self.set_status(cx, &format!("Could not open that: {e}"));
-                } else {
-                    self.show_home(cx, Some(&format!("Could not open that: {e}")));
-                }
+        }
+        show_title(&self.ui, cx, &st.project);
+        remember_song(&st.path);
+        if first {
+            audio::start_output(cx, st.shared.clone(), st.sr());
+        }
+        if analyse {
+            self.start_analysis(&mut st);
+        }
+        self.state = Some(st);
+        self.tabs.retain(|p| !same_song(p, &path));
+        self.tabs.push(path);
+        // too many open: the one longest in the background closes (it is saved)
+        while self.tabs.len() > MAX_TABS {
+            let Some(i) = self.tabs.iter().position(|p| self.others.iter().any(|o| same_song(&o.path, p))) else { break };
+            let p = self.tabs.remove(i);
+            if let Some(k) = self.others.iter().position(|o| same_song(&o.path, &p)) {
+                let mut gone = self.others.remove(k);
+                let _ = gone.save();
             }
         }
+        self.show_song_view(cx, true);
+        self.refresh_tabs(cx);
+    }
+
+    fn open_failed(&mut self, cx: &mut Cx, e: &str) {
+        log!("poing: load failed: {e}");
+        if self.state.is_some() && !self.home_shown {
+            self.set_status(cx, &format!("Could not open that: {e}"));
+        } else {
+            self.show_home(cx, Some(&format!("Could not open that: {e}")));
+        }
+    }
+
+    /// Bring a background song to the front. Playing on, it plays on at the
+    /// same time in the other song, so versions and songs compare by ear.
+    fn switch_to(&mut self, cx: &mut Cx, path: &Path) {
+        if self.agent_rx.is_some() {
+            return self.set_status(cx, "Claude is still working on this song; switch when it is done.");
+        }
+        let Some(i) = self.others.iter().position(|st| same_song(&st.path, path)) else { return };
+        let mut next = self.others.remove(i);
+        if let Some(mut cur) = self.state.take() {
+            let (playing, at) = (cur.shared.playing(), cur.playhead());
+            let _ = cur.save();
+            let (_controls, sets) = cur.deactivate();
+            #[cfg(windows)]
+            next.adopt_plugin_controls(_controls);
+            for set in sets {
+                next.retire(set);
+            }
+            next.activate(playing.then_some(at));
+            self.others.push(cur);
+        } else {
+            next.activate(None);
+        }
+        show_title(&self.ui, cx, &next.project);
+        self.state = Some(next);
+        self.show_song_view(cx, true);
+        self.refresh_tabs(cx);
+        self.refresh_inspector(cx);
+    }
+
+    /// Close a song's tab (it is saved). The one in front hands over to the
+    /// next tab; the last open song cannot close (Songs goes to the start screen).
+    fn close_tab(&mut self, cx: &mut Cx, path: &Path) {
+        let in_front = self.state.as_ref().is_some_and(|st| same_song(&st.path, path));
+        if in_front {
+            let Some(next) = self.tabs.iter().rev().find(|p| !same_song(p, path)).cloned() else {
+                return self.set_status(cx, "This is the only open song: Songs (+) goes to the start screen.");
+            };
+            self.switch_to(cx, &next);
+            if self.state.as_ref().is_some_and(|st| same_song(&st.path, path)) {
+                return; // the switch was refused
+            }
+        }
+        if let Some(k) = self.others.iter().position(|o| same_song(&o.path, path)) {
+            let mut gone = self.others.remove(k);
+            let _ = gone.save();
+        }
+        self.tabs.retain(|p| !same_song(p, path));
+        self.refresh_tabs(cx);
+    }
+
+    /// The tab strip: a tab per open song, the one in front underlined.
+    fn refresh_tabs(&mut self, cx: &mut Cx) {
+        let ui = self.ui.clone();
+        let front = self.state.as_ref().filter(|_| !self.home_shown).map(|st| st.path.clone());
+        let slots = [
+            (ids!(tab0), ids!(tab0_btn), ids!(tab0_line)),
+            (ids!(tab1), ids!(tab1_btn), ids!(tab1_line)),
+            (ids!(tab2), ids!(tab2_btn), ids!(tab2_line)),
+            (ids!(tab3), ids!(tab3_btn), ids!(tab3_line)),
+            (ids!(tab4), ids!(tab4_btn), ids!(tab4_line)),
+            (ids!(tab5), ids!(tab5_btn), ids!(tab5_line)),
+        ];
+        for (k, (tab, btn, line)) in slots.iter().enumerate() {
+            match self.tabs.get(k) {
+                Some(p) => {
+                    let name = self.state.iter().chain(self.others.iter()).find(|s| same_song(&s.path, p)).map(|s| s.project.name.clone()).unwrap_or_else(|| song_name(p));
+                    let busy = self.state.iter().chain(self.others.iter()).find(|s| same_song(&s.path, p)).is_some_and(|s| s.analysing.is_some());
+                    ui.button(cx, *btn).set_text(cx, &if busy { format!("{name}  …") } else { name });
+                    ui.view(cx, *line).set_visible(cx, front.as_deref().is_some_and(|f| same_song(f, p)));
+                    ui.view(cx, *tab).set_visible(cx, true);
+                }
+                None => ui.view(cx, *tab).set_visible(cx, false),
+            }
+        }
+        ui.view(cx, ids!(tab_strip)).set_visible(cx, !self.tabs.is_empty());
+        ui.view(cx, ids!(tab_strip)).redraw(cx);
     }
 
     /// Understand the song in the background; lanes fill in when it lands.
@@ -1269,10 +1493,13 @@ impl App {
                     port.progress(call_id, message, (progress * 1000.0) as u16);
                 }
             }
+            // a background song's news: its tab shows it is busy; results name the song
+            let background = update_bundle(&u).filter(|b| !b.as_os_str().is_empty() && !mine(b)).and_then(|b| self.others.iter().find(|st| st.path.parent() == Some(b.as_path())).map(|st| st.project.name.clone()));
+            let quiet = background.is_some() && matches!(u, JobUpdate::Progress { .. });
             let status = match u {
                 JobUpdate::Status(s) | JobUpdate::Done(s) => s,
                 JobUpdate::Failed { bundle, message } => {
-                    if let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) {
+                    if let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) {
                         st.analysing = None;
                     }
                     if self.home_shown {
@@ -1299,21 +1526,21 @@ impl App {
                     "Version 1 is here and playing is up to you (Space). The other versions follow; each shows up above the lanes.".into()
                 }
                 JobUpdate::Finished { bundle, message } => {
-                    if let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) {
+                    if let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) {
                         st.analysing = None;
                         st.sel_changed = true;
                     }
                     message
                 }
                 JobUpdate::Progress { bundle, message, progress } => {
-                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     let what = if ["Take", "Effect", "Part", "Remix", "Song"].iter().any(|p| message.starts_with(p)) { "" } else { "Analysing  ·  " };
                     let line = format!("{what}{message}  {:.0}%", progress * 100.0);
                     st.analysing = Some((message, progress));
                     line
                 }
                 JobUpdate::MidiReady { bundle, name, role, notes, request, note } => {
-                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     st.analysing = None;
                     let code = synth::BUILTIN.iter().find(|(r, _, _)| *r == role).map(|(_, _, c)| *c).unwrap_or(synth::BUILTIN[2].2);
                     match st.add_midi_track(&name, code, notes, Some(request)) {
@@ -1332,7 +1559,7 @@ impl App {
                     }
                 }
                 JobUpdate::FxReady { bundle, lane, name, code, request, note } => {
-                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     st.analysing = None;
                     let place = lane.map(|l| st.project.tracks[l].name.clone()).unwrap_or_else(|| "the master".into());
                     match st.add_fx(lane, &name, &code, Some(request)) {
@@ -1347,7 +1574,7 @@ impl App {
                 JobUpdate::TakeReady { bundle, mut take, stem } => {
                     let n = take.id.trim_start_matches('t').to_string();
                     take.end = take.start + stem.l.len() as f64 / stem_sr(&self.state) as f64;
-                    match self.state.as_mut().filter(|_| mine(&bundle)) {
+                    match song_in(&mut self.state, &mut self.others, &bundle) {
                         Some(st) => match st.add_take(take, stem) {
                             Ok(()) => format!("Take {n} is ready: playing it now. Click Original above the lanes to compare."),
                             Err(e) => format!("Take {n} could not be added: {e}"),
@@ -1360,7 +1587,7 @@ impl App {
                     }
                 }
                 JobUpdate::Analyzed { bundle, stems } => {
-                    let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
+                    let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     let file = bundle.join("analysis.json");
                     let result = std::fs::read_to_string(&file)
                         .map_err(|e| format!("read {}: {e}", file.display()))
@@ -1368,14 +1595,18 @@ impl App {
                         .and_then(|a| st.apply_analysis(a, stems));
                     match result {
                         Ok(()) if st.pending_remix.is_some() => {
-                            show_title(&self.ui, cx, &st.project);
+                            if st.is_current() {
+                                show_title(&self.ui, cx, &st.project);
+                            }
                             match &self.jobs {
                                 Some(jobs) => format!("Understood. {}", start_remix(st, jobs)),
                                 None => "The job worker is not running".into(),
                             }
                         }
                         Ok(()) => {
-                            show_title(&self.ui, cx, &st.project);
+                            if st.is_current() {
+                                show_title(&self.ui, cx, &st.project);
+                            }
                             let a = st.project.analysis.as_ref();
                             format!(
                                 "Understood: {} sections, {} chords, {} lyric lines",
@@ -1391,8 +1622,14 @@ impl App {
                     }
                 }
             };
-            self.set_status(cx, &status);
+            if !quiet {
+                match &background {
+                    Some(name) => self.set_status(cx, &format!("{name}: {status}")),
+                    None => self.set_status(cx, &status),
+                }
+            }
         }
+        self.refresh_tabs(cx);
         self.ui.widget(cx, ids!(timeline)).redraw(cx);
     }
 }
@@ -1697,7 +1934,34 @@ impl MatchEvent for App {
             self.make_song(cx, &prompt);
             return;
         }
-        if ui.button(cx, ids!(songs_btn)).clicked(actions) {
+        // tabs: a song to the front, or closed; + is the start screen
+        let tab_ids = [
+            (ids!(tab0_btn), ids!(tab0_x)),
+            (ids!(tab1_btn), ids!(tab1_x)),
+            (ids!(tab2_btn), ids!(tab2_x)),
+            (ids!(tab3_btn), ids!(tab3_x)),
+            (ids!(tab4_btn), ids!(tab4_x)),
+            (ids!(tab5_btn), ids!(tab5_x)),
+        ];
+        for (k, (btn, x)) in tab_ids.iter().enumerate() {
+            let Some(path) = self.tabs.get(k).cloned() else { continue };
+            if ui.button(cx, *x).clicked(actions) {
+                self.close_tab(cx, &path);
+                self.refresh_inspector(cx);
+                return;
+            }
+            if ui.button(cx, *btn).clicked(actions) {
+                if self.state.as_ref().is_some_and(|st| same_song(&st.path, &path)) {
+                    self.show_song_view(cx, true);
+                    self.refresh_tabs(cx);
+                } else {
+                    self.switch_to(cx, &path);
+                }
+                self.refresh_inspector(cx);
+                return;
+            }
+        }
+        if ui.button(cx, ids!(new_tab_btn)).clicked(actions) {
             if let Some(st) = self.state.as_mut() {
                 st.shared.set_playing(false);
                 st.sel_changed = true;
