@@ -139,6 +139,8 @@ impl App {
                     Err(e) => format!("Could not remove {}: {e}", packs[i].title),
                 };
                 ui.label(cx, ids!(models_note)).set_text(cx, &note);
+                self.set_status(cx, &note);
+                ui.label(cx, ids!(home_status)).set_text(cx, &note);
             } else if !self.downloads.busy() {
                 self.offer = None;
                 self.downloads.start(&id);
