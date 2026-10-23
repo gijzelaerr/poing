@@ -213,8 +213,31 @@ impl MixParams {
         Self { version, gains: p.track_gains(), regions, takes }
     }
 
-    fn song_take(&self) -> Option<MixTake> {
+    pub fn song_take(&self) -> Option<MixTake> {
         self.takes.iter().flatten().find(|k| k.kind == TakeKind::Song).copied()
+    }
+
+    /// The ranges of the section takes heard in [t0, t1) seconds.
+    pub fn section_takes_between(&self, t0: f64, t1: f64) -> Vec<(f64, f64)> {
+        self.takes.iter().flatten().filter(|k| k.kind == TakeKind::Section && k.touches(t0, t1)).map(|k| (k.start, k.end)).collect()
+    }
+
+    /// Lane `lane` alone as it sounds in this mix: its level (mute and solo
+    /// included), its lane takes and layers; no other lane, no section or
+    /// song take.
+    pub fn lane_alone(&self, lane: usize) -> MixParams {
+        let mut m = self.clone();
+        for (i, g) in m.gains.iter_mut().enumerate() {
+            if i != lane {
+                *g = 0.0;
+            }
+        }
+        for k in m.takes.iter_mut() {
+            if k.is_some_and(|k| take_lane(&k) != Some(lane)) {
+                *k = None;
+            }
+        }
+        m
     }
 
     /// Gain of one track at time t (seconds), with short linear ramps at region edges.
