@@ -159,6 +159,18 @@ pub struct DawTimeline {
     /// Effect chips as drawn: (rect, lane or master, index in its chain).
     #[rust]
     fx_chips: Vec<(Rect, Option<usize>, usize)>,
+    /// More lanes than fit: the first one shown (the wheel scrolls a lane at a time).
+    #[rust]
+    first_lane: usize,
+    /// Which lanes are drawn whole (only those are drawn and hit).
+    #[rust]
+    shown: Vec<bool>,
+    /// Wheel travel not yet turned into a lane step.
+    #[rust]
+    wheel_acc: f64,
+    /// Lanes hidden above and below.
+    #[rust]
+    hidden: (usize, usize),
 }
 
 fn rgba(hex: u32, a: f32) -> Vec4f {
@@ -261,7 +273,10 @@ impl DawTimeline {
         if y < self.geo.lanes_y {
             return None;
         }
-        (0..self.geo.n).find(|&i| y >= self.lane_y(i) && y < self.lane_y(i) + self.lane_hh(i))
+        (0..self.geo.n).find(|&i| self.lane_shown(i) && y >= self.lane_y(i) && y < self.lane_y(i) + self.lane_hh(i))
+    }
+    fn lane_shown(&self, i: usize) -> bool {
+        self.shown.get(i).copied().unwrap_or(true)
     }
     fn in_ruler(&self, y: f64) -> bool {
         y >= self.geo.rect.pos.y && y < self.geo.sect_y
@@ -566,13 +581,35 @@ impl DawTimeline {
             Some(_) if count > 1.0 => ((avail - open_h) / (count - 1.0)).clamp(36.0, 150.0),
             _ => (avail / count).clamp(44.0, 150.0),
         };
+        // More lanes than fit: show a run of whole lanes from `first_lane`
+        // (kept so an open piano roll is in view); the wheel scrolls it.
+        let total = n + layers.len();
+        let height = |i: usize| if open == Some(i) { open_h } else { lane_h };
+        let fits = |first: usize| (first..total).map(height).sum::<f64>() <= avail + 0.5;
+        let last_first = (0..total).find(|&f| fits(f)).unwrap_or(total.saturating_sub(1));
+        let mut first = self.first_lane.min(last_first);
+        if let Some(o) = open {
+            if o < first {
+                first = o;
+            } else {
+                while first < o && (first..=o).map(height).sum::<f64>() > avail + 0.5 {
+                    first += 1;
+                }
+            }
+        }
+        self.first_lane = first;
         self.tops.clear();
-        let mut y = lanes_y;
-        for i in 0..(n + layers.len()) {
+        self.shown.clear();
+        let mut y = lanes_y - (0..first).map(height).sum::<f64>();
+        for i in 0..total {
             self.tops.push(y);
-            y += if open == Some(i) { open_h } else { lane_h };
+            let h = height(i);
+            self.shown.push(i >= first && y + h <= lanes_y + avail + 0.5);
+            y += h;
         }
         self.tops.push(y);
+        let below = (first..total).filter(|&i| !self.shown[i]).count();
+        self.hidden = (first, below);
         let master_y = rect.pos.y + rect.size.y - MASTER_H;
         self.geo = Geo {
             rect,
@@ -749,6 +786,9 @@ impl DawTimeline {
         // lanes: a card each, header on the left
         let gains = st.project.track_gains();
         for i in 0..n {
+            if !self.lane_shown(i) {
+                continue;
+            }
             let ly = self.lane_y(i);
             let tr = st.project.tracks[i].clone();
             let col = rgba(track_color(&tr.id, &tr.name, i), 1.0);
@@ -805,6 +845,9 @@ impl DawTimeline {
 
         // layers: one lane each, at their blend
         for (j, (stem, t)) in layers.iter().enumerate() {
+            if !self.lane_shown(n + j) {
+                continue;
+            }
             let ly = self.lane_y(n + j);
             let lh = self.lane_hh(n + j) - LANE_GAP;
             self.shape(cx, Rect { pos: dvec2(left + 6.0, ly), size: dvec2(rect.size.x - 12.0, lh) }, 8.0, rgba(0x14202d, 1.0), rgba(0x121a24, 1.0));
@@ -817,7 +860,7 @@ impl DawTimeline {
         }
 
         // lyrics along the bottom of the vocals lane
-        if let Some(v) = st.project.track_index("vocals").filter(|&v| song_take.is_none() && v < n) {
+        if let Some(v) = st.project.track_index("vocals").filter(|&v| song_take.is_none() && v < n && self.lane_shown(v)) {
             let y = self.lane_y(v) + self.lane_hh(v) - LANE_GAP - 17.0;
             let mut right = f64::MIN;
             for l in &lyrics {
@@ -837,7 +880,7 @@ impl DawTimeline {
                 break;
             }
             let r = st.project.regions()[ri].clone();
-            let Some(lane) = st.project.track_index(&r.track) else { continue };
+            let Some(lane) = st.project.track_index(&r.track).filter(|&l| self.lane_shown(l)) else { continue };
             let ly = self.lane_y(lane);
             if let Some((x, rw)) = self.span(st, r.start, r.end) {
                 let c = rgba(region_color(&r.kind), 1.0);
@@ -864,9 +907,15 @@ impl DawTimeline {
             .filter(|t| t.scope == "section" || t.scope == "lane")
             .collect();
         for t in replacing.iter().filter(|_| n > 0) {
-            let (y, h) = match t.track.as_deref().and_then(|id| st.project.track_index(id)).filter(|_| t.scope == "lane") {
+            let lane = t.track.as_deref().and_then(|id| st.project.track_index(id)).filter(|_| t.scope == "lane");
+            if lane.is_some_and(|l| !self.lane_shown(l)) {
+                continue;
+            }
+            // over the lanes in view
+            let last_shown = (0..n).rev().find(|&i| self.lane_shown(i)).map_or(lanes_y, |i| self.lane_y(i + 1));
+            let (y, h) = match lane {
                 Some(lane) => (self.lane_y(lane), self.lane_hh(lane) - LANE_GAP),
-                None => (lanes_y, self.lane_y(n) - lanes_y - LANE_GAP),
+                None => (lanes_y, last_shown - lanes_y - LANE_GAP),
             };
             if let Some((x, tw)) = self.span(st, t.start, t.end) {
                 let r = Rect { pos: dvec2(x, y), size: dvec2(tw, h) };
@@ -885,6 +934,15 @@ impl DawTimeline {
         let level = st.meter_show[MASTER_METER];
         self.meter_bar(cx, left + 74.0, my + 12.0, HEADER_W - 92.0, level);
         self.fx_chips_row(cx, st, None, x0, my + 6.0, x0 + w);
+        // lanes out of view: say so, where the wheel brings them
+        if self.hidden.0 + self.hidden.1 > 0 {
+            let say = match self.hidden {
+                (0, b) => format!("{b} more lane{} below  ·  scroll", if b == 1 { "" } else { "s" }),
+                (a, 0) => format!("{a} more lane{} above  ·  scroll", if a == 1 { "" } else { "s" }),
+                (a, b) => format!("{a} lanes above, {b} below  ·  scroll"),
+            };
+            self.text(cx, x0 + w - 6.0 * say.chars().count() as f64 - 8.0, my + 9.0, dim, &say);
+        }
         if st.project.chain(None).is_empty() {
             self.text(cx, x0, my + 8.0, faint, "Select a lane and describe an effect (\"tape saturation\", \"a warm plate reverb\") to add one");
         }
@@ -1133,6 +1191,19 @@ impl Widget for DawTimeline {
                     let min_pps = self.geo.w / st.duration().max(1.0);
                     st.pps = (st.pps * (-delta * 0.004).exp()).clamp(min_pps, 400.0);
                     st.scroll_t = t - (se.abs.x - self.geo.x0) / st.pps;
+                } else if (self.hidden.0 > 0 || self.hidden.1 > 0) && se.scroll.y.abs() > se.scroll.x.abs() && !se.modifiers.shift && se.abs.y >= self.geo.lanes_y {
+                    // lanes that do not fit: the wheel moves a lane at a time
+                    self.wheel_acc += se.scroll.y;
+                    while self.wheel_acc >= 40.0 {
+                        self.wheel_acc -= 40.0;
+                        if self.hidden.1 > 0 {
+                            self.first_lane += 1;
+                        }
+                    }
+                    while self.wheel_acc <= -40.0 {
+                        self.wheel_acc += 40.0;
+                        self.first_lane = self.first_lane.saturating_sub(1);
+                    }
                 } else {
                     st.scroll_t += delta / st.pps;
                 }

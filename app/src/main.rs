@@ -43,6 +43,7 @@ script_mod! {
     // A round icon button (play/pause).
     let RoundIconButton = ButtonFlatterIcon{
         width: 34 height: 34
+        grab_key_focus: false
         padding: Inset{left: 0 right: 0 top: 0 bottom: 0}
         margin: Inset{left: 0 right: 0 top: 0 bottom: 0}
         align: Align{x: 0.5 y: 0.5}
@@ -61,6 +62,7 @@ script_mod! {
     // A quiet pill button with a label.
     let PillButton = ButtonFlatter{
         height: 28
+        grab_key_focus: false
         padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
         align: Align{x: 0.5 y: 0.5}
         draw_text +: {
@@ -289,7 +291,8 @@ script_mod! {
                                 CardTitle{text: "Split a song"}
                                 CardText{text: "Drop an MP3, WAV, FLAC or OGG on this card. Poing splits it into parts and finds its sections, chords and words."}
                                 View{width: Fill height: Fill}
-                                Caption{text: "Drop a song here"}
+                                pick_split_btn := PillButton{text: "Choose a song…"}
+                                Caption{text: "or drop one on this card"}
                             }
                             remix_card := HomeCard{
                                 CardTitle{text: "Remix a song"}
@@ -298,6 +301,7 @@ script_mod! {
                                 PromptFrame{
                                     remix_input := PromptInput{empty_text: "e.g. 80s disco, Dutch female vocals"}
                                 }
+                                pick_remix_btn := PillButton{text: "Choose the song…"}
                             }
                             new_card := HomeCard{
                                 CardTitle{text: "Make a new song"}
@@ -459,6 +463,18 @@ fn update_bundle(u: &JobUpdate) -> Option<PathBuf> {
         | JobUpdate::Finished { bundle, .. } => Some(bundle.clone()),
         _ => None,
     }
+}
+
+/// The start screen's file dialogs: a song to split, or to remix.
+const SPLIT_DIALOG: LiveId = live_id!(poing_split_song);
+const REMIX_DIALOG: LiveId = live_id!(poing_remix_song);
+
+fn choose_song(cx: &mut Cx, id: LiveId, title: &str) {
+    let dialog = FileDialog::new()
+        .set_id(id)
+        .set_title(title.to_string())
+        .add_filter("Songs".to_string(), AUDIO_EXT.iter().map(|e| e.to_string()).collect());
+    cx.open_select_file_dialog(dialog);
 }
 
 /// Songs open at once (each keeps its stems and takes decoded in memory).
@@ -1052,11 +1068,21 @@ impl App {
         let ui = self.ui.clone();
         let songs = recent_songs();
         let buttons = [ids!(rec0), ids!(rec1), ids!(rec2), ids!(rec3), ids!(rec4), ids!(rec5), ids!(rec6), ids!(rec7)];
+        // two songs with one name: say which folder each is in
+        let names: Vec<String> = songs.iter().map(|p| song_name(p)).collect();
+        let label = |i: usize| {
+            let twin = names.iter().filter(|n| **n == names[i]).count() > 1;
+            let folder = songs[i].parent().and_then(|b| b.parent()).and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned());
+            match (twin, folder) {
+                (true, Some(d)) => format!("{}  ·  {d}", names[i]),
+                _ => names[i].clone(),
+            }
+        };
         for (i, b) in buttons.iter().enumerate() {
             let btn = ui.button(cx, *b);
             match songs.get(i) {
-                Some(p) => {
-                    btn.set_text(cx, &song_name(p));
+                Some(_) => {
+                    btn.set_text(cx, &label(i));
                     btn.set_visible(cx, true);
                 }
                 None => btn.set_visible(cx, false),
@@ -1933,6 +1959,32 @@ impl MatchEvent for App {
             let prompt = new_prompt.unwrap_or_else(|| ui.text_input(cx, ids!(new_input)).text());
             self.make_song(cx, &prompt);
             return;
+        }
+        // the start screen's file pickers, and what they chose
+        if ui.button(cx, ids!(pick_split_btn)).clicked(actions) {
+            choose_song(cx, SPLIT_DIALOG, "Choose a song to split");
+        }
+        if ui.button(cx, ids!(pick_remix_btn)).clicked(actions) {
+            if ui.text_input(cx, ids!(remix_input)).text().trim().is_empty() {
+                ui.label(cx, ids!(home_error)).set_text(cx, "Say first how to remix it (the field on the Remix card).");
+            } else {
+                choose_song(cx, REMIX_DIALOG, "Choose the song to remix");
+            }
+        }
+        for action in actions {
+            if let Some(FileDialogAction::FileSelected { id, paths }) = action.downcast_ref::<FileDialogAction>() {
+                let Some(path) = paths.first().cloned() else { continue };
+                if *id == SPLIT_DIALOG {
+                    self.open(cx, Open::Audio(path));
+                    self.refresh_inspector(cx);
+                    return;
+                }
+                if *id == REMIX_DIALOG {
+                    self.remix_song(cx, path);
+                    self.refresh_inspector(cx);
+                    return;
+                }
+            }
         }
         // tabs: a song to the front, or closed; + is the start screen
         let tab_ids = [
