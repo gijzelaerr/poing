@@ -648,6 +648,9 @@ pub enum Job {
     /// A new song from a prompt: Claude writes its sheet, ACE-Step sings
     /// `count` versions into a new bundle in `dir`.
     Song { prompt: String, dir: PathBuf, count: usize, sr: u32 },
+    /// The singing half of `Song`: ACE-Step sings `count` versions of the
+    /// sheet.json already in `bundle` (what poing-node runs for a new song).
+    Sing { bundle: PathBuf, count: usize, seeds: Vec<u64>, sr: u32 },
     /// Remixes of the song in `bundle` (ACE-Step cover), one song take each.
     Remix { bundle: PathBuf, takes: Vec<Take>, job: SongJob, sr: u32 },
     /// Stems, MIDI files, a DAWproject or the DJ export (see `export`).
@@ -655,7 +658,7 @@ pub enum Job {
 }
 
 /// What `sidecar/acestep_song.py` reads.
-#[derive(SerJson, Clone, Default)]
+#[derive(SerJson, DeJson, Clone, Default)]
 pub struct SongJob {
     pub task: String,
     pub out_dir: String,
@@ -673,7 +676,7 @@ pub struct SongJob {
 }
 
 /// What `sidecar/acestep_repaint.py` reads (src, out, start and end are filled in by the job).
-#[derive(SerJson, Clone, Default)]
+#[derive(SerJson, DeJson, Clone, Default)]
 pub struct RepaintJob {
     pub src: String,
     pub out: String,
@@ -689,7 +692,7 @@ pub struct RepaintJob {
 
 /// What `yue2_render --fixture` reads: style, section-tagged lyrics, seed,
 /// chain of thought ("full" keeps the score's chords) and the ABC score.
-#[derive(SerJson, Clone)]
+#[derive(SerJson, DeJson, Clone)]
 pub struct Yue2Fixture {
     pub style: String,
     pub lyrics: String,
@@ -744,18 +747,9 @@ impl Jobs {
                 let mut seq = 0u64;
                 while let Ok(job) = job_rx.recv() {
                     seq += 1;
-                    match job {
-                        Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, &up_tx),
-                        Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, &up_tx),
-                        Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, &up_tx),
-                        Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, &up_tx),
-                        Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, &up_tx),
-                        Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, &up_tx),
-                        Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, &up_tx),
-                        Job::WriteMidi { bundle, request, role, sheet, bars, range } => write_midi(&bundle, request, &role, &sheet, bars, range, &up_tx),
-                        Job::Song { prompt, dir, count, sr } => make_song(&prompt, &dir, count, sr, &up_tx),
-                        Job::Remix { bundle, takes, job, sr } => remix(&bundle, takes, job, sr, &up_tx),
-                        Job::Export(job) => crate::export::run(*job, &up_tx),
+                    // GPU jobs go to the Windows PC when one is chosen (crate::remote)
+                    if let Some(job) = crate::remote::route(job, &up_tx) {
+                        run_job(job, &up_tx);
                     }
                     send(&up_tx, JobUpdate::JobDone { seq });
                 }
@@ -775,6 +769,24 @@ impl Jobs {
     /// The sequence number of the last job submitted.
     pub fn last_seq(&self) -> u64 {
         self.submitted.load(Ordering::SeqCst)
+    }
+}
+
+/// Run one job here, sending its updates to `tx` (the app's worker, or poing-node).
+pub fn run_job(job: Job, tx: &Sender<JobUpdate>) {
+    match job {
+        Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, tx),
+        Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, tx),
+        Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, tx),
+        Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, tx),
+        Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, tx),
+        Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, tx),
+        Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, tx),
+        Job::WriteMidi { bundle, request, role, sheet, bars, range } => write_midi(&bundle, request, &role, &sheet, bars, range, tx),
+        Job::Song { prompt, dir, count, sr } => make_song(&prompt, &dir, count, sr, tx),
+        Job::Sing { bundle, count, seeds, sr } => sing_song(&bundle, count, seeds, sr, tx),
+        Job::Remix { bundle, takes, job, sr } => remix(&bundle, takes, job, sr, tx),
+        Job::Export(job) => crate::export::run(*job, tx),
     }
 }
 
@@ -1324,7 +1336,7 @@ fn dereverb(bundle: &Path, take: Take, lane: &Path, sr: u32, tx: &Sender<JobUpda
 }
 
 /// What `sidecar/acestep_lego.py` reads.
-#[derive(SerJson, Clone, Default)]
+#[derive(SerJson, DeJson, Clone, Default)]
 pub struct LegoJob {
     pub src: String,
     pub out: String,
@@ -1336,7 +1348,7 @@ pub struct LegoJob {
 }
 
 /// What `sidecar/poing_layer.py` reads.
-#[derive(SerJson, Clone, Default)]
+#[derive(SerJson, DeJson, Clone, Default)]
 pub struct LayerJob {
     pub src: String,
     pub out: String,
@@ -1473,6 +1485,50 @@ fn run_song_job(job: &SongJob, progress: &dyn Fn(&str, f32), version: &dyn Fn(us
 /// `count` versions. The first becomes the song (a draft: nothing is
 /// analysed until a version is picked), the others its song takes.
 fn make_song(prompt: &str, dir: &Path, count: usize, sr: u32, tx: &Sender<JobUpdate>) {
+    if let Some((bundle, seeds)) = prepare_song(prompt, dir, count, tx) {
+        sing_song(&bundle, count, seeds, sr, tx);
+    }
+}
+
+/// The writing half of a new song: Claude writes the sheet into a new bundle
+/// in `dir` (sheet.json, lyrics.txt, prompt.txt). Returns the bundle and the
+/// versions' seeds; a failure is sent.
+pub fn prepare_song(prompt: &str, dir: &Path, count: usize, tx: &Sender<JobUpdate>) -> Option<(PathBuf, Vec<u64>)> {
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: PathBuf::new(), message: format!("The song could not be made: {why}") });
+    send(tx, JobUpdate::Starting { message: "Claude is writing the song".into(), progress: 0.0 });
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let sheet = match crate::song_writer::write_sheet(prompt, &dir.join(".drafts").join(stamp.to_string())) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(e);
+            return None;
+        }
+    };
+    let base = crate::song_writer::folder_name(&sheet.title);
+    let Some(bundle) = (1..1000)
+        .map(|n| dir.join(if n == 1 { format!("{base}.poing") } else { format!("{base} {n}.poing") }))
+        .find(|b| !b.exists())
+    else {
+        fail("no free folder name".into());
+        return None;
+    };
+    if let Err(e) = std::fs::create_dir_all(bundle.join("takes")) {
+        fail(format!("create {}: {e}", bundle.display()));
+        return None;
+    }
+    // the words are known: no transcription needed to describe the song later
+    if !sheet.lyrics.trim().is_empty() {
+        let _ = std::fs::write(bundle.join("lyrics.txt"), &sheet.lyrics);
+    }
+    let _ = std::fs::write(bundle.join("sheet.json"), sheet.serialize_json());
+    let _ = std::fs::write(bundle.join("prompt.txt"), prompt);
+    Some((bundle, (0..count as u64).map(|i| (stamp % 100_000) * 13 + i * 7919).collect()))
+}
+
+/// The singing half of a new song: ACE-Step sings `count` versions of the
+/// bundle's sheet.json. Version 1 becomes the song (SongReady), the others
+/// its song takes.
+fn sing_song(bundle: &Path, count: usize, seeds: Vec<u64>, sr: u32, tx: &Sender<JobUpdate>) {
     use std::cell::RefCell;
     let bundle_cell: RefCell<Option<PathBuf>> = RefCell::new(None);
     // once version 1 has opened the song, a failure belongs to it (it clears its busy state)
@@ -1484,29 +1540,17 @@ fn make_song(prompt: &str, dir: &Path, count: usize, sr: u32, tx: &Sender<JobUpd
         Some(bundle) => send(tx, JobUpdate::Progress { bundle, message: format!("Song  ·  {message}"), progress }),
         None => send(tx, JobUpdate::Starting { message: message.to_string(), progress }),
     };
-    progress("Claude is writing the song", 0.0);
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let sheet = match crate::song_writer::write_sheet(prompt, &dir.join(".drafts").join(stamp.to_string())) {
+    let sheet = match std::fs::read_to_string(bundle.join("sheet.json")).map_err(|e| e.to_string()).and_then(|t| {
+        crate::song_writer::Sheet::deserialize_json_lenient(&t).map_err(|e| format!("sheet.json: {e:?}"))
+    }) {
         Ok(s) => s,
         Err(e) => return fail(e),
     };
-    let base = crate::song_writer::folder_name(&sheet.title);
-    let Some(bundle) = (1..1000)
-        .map(|n| dir.join(if n == 1 { format!("{base}.poing") } else { format!("{base} {n}.poing") }))
-        .find(|b| !b.exists())
-    else {
-        return fail("no free folder name".into());
-    };
+    let bundle = bundle.to_path_buf();
+    // a mirrored bundle (poing-node) may come without the empty takes folder
     if let Err(e) = std::fs::create_dir_all(bundle.join("takes")) {
-        return fail(format!("create {}: {e}", bundle.display()));
+        return fail(e.to_string());
     }
-    // the words are known: no transcription needed to describe the song later
-    if !sheet.lyrics.trim().is_empty() {
-        let _ = std::fs::write(bundle.join("lyrics.txt"), &sheet.lyrics);
-    }
-    let _ = std::fs::write(bundle.join("sheet.json"), sheet.serialize_json());
-    let _ = std::fs::write(bundle.join("prompt.txt"), prompt);
-    let seeds: Vec<u64> = (0..count as u64).map(|i| (stamp % 100_000) * 13 + i * 7919).collect();
     let job = SongJob {
         task: "text2music".into(),
         out_dir: bundle.join("versions").to_string_lossy().into_owned(),

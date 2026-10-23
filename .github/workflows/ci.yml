@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, name: macOS-arm64, exe: poing, engine: poing-engine }
-          - { os: windows-latest, name: Windows-x86_64, exe: poing.exe, engine: poing-engine.exe }
-          - { os: ubuntu-latest, name: Linux-x86_64, exe: poing, engine: poing-engine }
+          - { os: macos-latest, name: macOS-arm64, exe: poing, engine: poing-engine, node: poing-node }
+          - { os: windows-latest, name: Windows-x86_64, exe: poing.exe, engine: poing-engine.exe, node: poing-node.exe }
+          - { os: ubuntu-latest, name: Linux-x86_64, exe: poing, engine: poing-engine, node: poing-node }
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -59,4 +59,5 @@ jobs:
           path: |
             target/release/${{ matrix.exe }}
             target/release/${{ matrix.engine }}
+            target/release/${{ matrix.node }}
           if-no-files-found: error

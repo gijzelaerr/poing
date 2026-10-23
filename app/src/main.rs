@@ -15,6 +15,7 @@ mod fx;
 mod fx_writer;
 mod listen;
 mod plugins;
+mod remote;
 mod synth;
 mod midi_writer;
 mod model_view;
@@ -24,6 +25,7 @@ mod song_writer;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
+mod wire;
 
 use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, SongJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
