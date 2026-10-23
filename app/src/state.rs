@@ -34,6 +34,18 @@ pub enum Selection {
     Fx(Option<usize>, usize),
 }
 
+/// A loaded plugin as it plays (see `EditorState::plugin_info`).
+pub struct PluginInfo {
+    /// Frames late (compensated), with the bridge's for one in its own process.
+    pub latency: u32,
+    pub isolated: bool,
+    /// poing-plughost's process id.
+    pub pid: Option<u32>,
+    pub recoveries: u32,
+    /// Its bridge's (blocks sent, slowest round trip in µs).
+    pub bridge: Option<(u64, u64)>,
+}
+
 pub struct EditorState {
     pub project: Project,
     pub path: PathBuf,
@@ -348,7 +360,7 @@ impl EditorState {
         let dir = self.dir();
         std::fs::create_dir_all(dir.join("instruments")).map_err(|e| e.to_string())?;
         std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
-        let instrument = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None };
+        let instrument = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None, isolate: None };
         let tracks = self.project.tracks.len();
         // heard at once: with other lanes soloed, the new one joins them
         let solo = self.project.tracks.iter().any(|t| t.solo == Some(true)).then_some(true);
@@ -411,6 +423,9 @@ impl EditorState {
         for (id, hosted) in std::mem::take(&mut self.pending_insts) {
             let _ = rack.install_instrument(&id, hosted);
         }
+        // lanes with latent plugins and the rest lined up
+        #[cfg(windows)]
+        rack.compensate(&|id| self.plugins.get(id).map_or(0, |h| h.latency()));
         if let Ok(mut slot) = self.shared.fx_in.lock() {
             *slot = Some(Box::new(rack));
         }
@@ -420,12 +435,20 @@ impl EditorState {
     fn load_plugin_fx(&mut self, fx: &Fx) -> bool {
         #[cfg(windows)]
         {
-            if self.plugins.contains_key(&fx.id) {
-                return true; // already playing: the rack keeps its instance
+            match self.plugins.get(&fx.id) {
+                // already playing: the rack keeps its instance
+                Some(h) if h.isolated == fx.isolated() => return true,
+                // in the other place (an undo past "Run in its own process"): moved, with its state
+                Some(_) => {
+                    self.save_plugin_states();
+                    self.retire_plugin(&fx.id);
+                }
+                None => {}
             }
             let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
             let state = self.plugin_state(&fx.id);
-            match crate::plugins::load(&path, self.sr(), Some(fx), state.as_deref(), false) {
+            let how = crate::plugins::LoadAs { instrument: false, isolated: fx.isolated(), realtime: true };
+            match crate::plugins::load(&path, self.sr(), Some(fx), state.as_deref(), how) {
                 Ok((handle, shared)) => {
                     self.fx_controls.insert(fx.id.clone(), FxControls::for_plugin(fx));
                     self.plugin_params.insert(fx.id.clone(), handle.params.clone());
@@ -469,11 +492,14 @@ impl EditorState {
 
     /// Write every loaded plugin's state next to the project (on each save):
     /// what is done in a plugin's own window survives reloads, undo, tabs and export.
-    fn save_plugin_states(&self) {
+    fn save_plugin_states(&mut self) {
         #[cfg(windows)]
-        for (id, h) in &self.plugins {
-            if let Some(bytes) = h.save_state() {
-                let file = self.plugin_state_file(id);
+        let dir = self.dir().join("plugins");
+        #[cfg(windows)]
+        for (id, h) in self.plugins.iter_mut() {
+            // (kept on the handle too: a crashed plugin comes back with it)
+            if let Some(bytes) = h.snapshot() {
+                let file = dir.join(format!("{id}.state"));
                 if let Some(dir) = file.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
@@ -505,16 +531,119 @@ impl EditorState {
     }
 
     /// Keep plugin windows and queued knob moves going (UI thread, often).
-    /// A window the user closed saves the plugin's state.
-    pub fn pump_plugins(&mut self) {
+    /// A window the user closed saves the plugin's state; a plugin whose
+    /// latency changed gets the lanes lined up again; one whose process died
+    /// comes back with its last state. Returns what is worth saying.
+    pub fn pump_plugins(&mut self) -> Option<String> {
         #[cfg(windows)]
         {
             crate::plugins::pump_window_messages();
-            let closed = self.plugins.values_mut().map(|h| h.pump()).fold(false, |a, b| a | b);
+            let (mut closed, mut relatch) = (false, false);
+            let mut crashed = Vec::new();
+            for (id, h) in self.plugins.iter_mut() {
+                let p = h.pump();
+                closed |= p.closed;
+                relatch |= p.latency;
+                if p.crashed {
+                    crashed.push(id.clone());
+                }
+            }
+            let mut said = None;
+            for id in crashed {
+                let saved = self.plugin_state(&id);
+                let Some(h) = self.plugins.get_mut(&id) else { continue };
+                let state = h.last_state.clone().or(saved);
+                said = Some(match h.recover(state.as_deref()) {
+                    Ok(()) => {
+                        relatch = true;
+                        format!("{} crashed in its own process; Poing reloaded it as it was.", h.name)
+                    }
+                    Err(e) => e,
+                });
+            }
             if closed {
                 self.save_plugin_states();
             }
+            if relatch {
+                self.publish_fx();
+            }
+            said
         }
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// A loaded plugin as it plays: its latency (compensated), whether it runs
+    /// in its own process (and that process's id), how often it came back.
+    pub fn plugin_info(&self, id: &str) -> Option<PluginInfo> {
+        #[cfg(windows)]
+        return self.plugins.get(id).map(|h| PluginInfo { latency: h.latency(), isolated: h.isolated, pid: h.helper_pid(), recoveries: h.recoveries, bridge: h.bridge_stats() });
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// The inspector's note on a plugin: how late it is, where it runs.
+    pub fn plugin_note(&self, id: &str) -> String {
+        let Some(i) = self.plugin_info(id) else { return String::new() };
+        let mut s = String::new();
+        if i.latency > 0 {
+            s += &format!("   ·   {:.0} ms latency, the other lanes wait for it", i.latency as f64 * 1000.0 / self.sr() as f64);
+        }
+        if i.isolated {
+            s += "   ·   in its own process";
+            if i.recoveries > 0 {
+                s += &format!(", reloaded after {} crash{}", i.recoveries, if i.recoveries == 1 { "" } else { "es" });
+            }
+        }
+        s
+    }
+
+    /// Any plugins loaded (they are watched for crashes and latency changes).
+    pub fn has_plugins(&self) -> bool {
+        #[cfg(windows)]
+        return !self.plugins.is_empty();
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// Run plugin effect or instrument `id` in a process of its own, or back
+    /// in Poing: it is loaded again there with its current state.
+    pub fn set_isolated(&mut self, id: &str, on: bool) -> Result<String, String> {
+        let lane_inst = self.project.track_index(id).filter(|&l| self.project.tracks[l].instrument.as_ref().is_some_and(|i| i.plugin.is_some()));
+        let fx = match lane_inst {
+            Some(l) => self.project.tracks[l].instrument.clone(),
+            None => self.fx(id).cloned(),
+        };
+        let Some(mut fx) = fx.filter(|f| f.plugin.is_some()) else { return Err("that is not a plugin".into()) };
+        if fx.isolated() == on {
+            return Ok(format!("{} already runs {}.", fx.name, if on { "in its own process" } else { "in Poing" }));
+        }
+        // its state as it sounds now goes with it (a setting: not an undo step)
+        self.save_plugin_states();
+        fx.isolate = on.then_some(true);
+        match lane_inst {
+            Some(l) => self.project.tracks[l].instrument = Some(fx.clone()),
+            None => {
+                if let Some((lane, i)) = self.project.find_fx(id) {
+                    self.project.chain_mut(lane)[i] = fx.clone();
+                }
+            }
+        }
+        // the loaders see it in the other place and move it
+        let loaded = match lane_inst {
+            Some(_) => self.load_plugin_instrument(id, fx.plugin.as_deref().unwrap_or_default(), &fx),
+            None => self.load_plugin_fx(&fx),
+        };
+        if !loaded {
+            return Err(self.fx_errors.get(id).cloned().unwrap_or_default());
+        }
+        // the new instance wins over the old one in the playing rack (adopt keeps an installed one)
+        self.publish_fx();
+        self.save()?;
+        Ok(format!("{} runs {}.", fx.name, if on { "in its own process: a crash there leaves Poing playing" } else { "in Poing again" }))
     }
 
     /// Plugins in the song are loaded, plugins no longer in it let go (after undo).
@@ -541,6 +670,7 @@ impl EditorState {
             bypass: None,
             prompt,
             plugin: Some(path.to_string_lossy().into_owned()),
+            isolate: None,
         };
         self.project.chain_mut(lane).push(fx.clone());
         if !self.load_plugin_fx(&fx) {
@@ -561,13 +691,18 @@ impl EditorState {
         let mut rack = self.make_rack();
         #[allow(unused_mut)]
         let mut missing = Vec::new();
+        // each render instance's latency, to line the lanes up with
+        #[cfg(windows)]
+        let mut late: HashMap<String, u32> = HashMap::new();
         #[cfg(windows)]
         for fx in self.all_fx().into_iter().filter(|f| f.plugin.is_some()) {
             let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
             // the state as it sounds now (unsaved edits too), else as saved
             let state = self.plugins.get(&fx.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&fx.id));
-            match crate::plugins::load(&path, self.sr(), Some(&fx), state.as_deref(), false) {
+            let how = crate::plugins::LoadAs { instrument: false, isolated: fx.isolated(), realtime: false };
+            match crate::plugins::load(&path, self.sr(), Some(&fx), state.as_deref(), how) {
                 Ok((handle, shared)) => {
+                    late.insert(fx.id.clone(), handle.latency());
                     let _ = rack.install(&fx.id, shared);
                     // the render lets go of it on the worker; it is destroyed here after
                     self.retiring.push(handle);
@@ -579,28 +714,41 @@ impl EditorState {
         for t in self.project.tracks.iter().filter(|t| t.is_midi()) {
             let Some(inst) = t.instrument.as_ref().filter(|f| f.plugin.is_some()) else { continue };
             let state = self.plugins.get(&t.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&t.id));
-            match crate::plugins::load(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst), state.as_deref(), true) {
+            let how = crate::plugins::LoadAs { instrument: true, isolated: inst.isolated(), realtime: false };
+            match crate::plugins::load(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst), state.as_deref(), how) {
                 Ok((handle, shared)) => {
+                    late.insert(t.id.clone(), handle.latency());
                     let _ = rack.install_instrument(&t.id, shared);
                     self.retiring.push(handle);
                 }
                 Err(_) => missing.push(inst.name.clone()),
             }
         }
+        #[cfg(windows)]
+        rack.compensate(&|id| late.get(id).copied().unwrap_or(0));
         (rack, missing)
     }
 
     /// Load the plugin at `path` to play MIDI lane `id` (UI thread), ready for the next rack.
     fn load_plugin_instrument(&mut self, id: &str, path: &str, inst: &Fx) -> bool {
-        if self.inst_plugins.get(id).is_some_and(|p| p == path) {
+        #[cfg(windows)]
+        let same_place = self.plugins.get(id).map_or(true, |h| h.isolated == inst.isolated());
+        #[cfg(not(windows))]
+        let same_place = true;
+        if same_place && self.inst_plugins.get(id).is_some_and(|p| p == path) {
             return true; // already playing: the rack keeps its instance
         }
         #[cfg(windows)]
         {
+            // its state goes with it when it moves (an undo past "Run in its own process")
+            if !same_place {
+                self.save_plugin_states();
+            }
             // another plugin was playing this lane: it goes
             self.retire_plugin(id);
             let state = self.plugin_state(id).filter(|_| self.project.track_index(id).and_then(|l| self.project.tracks[l].instrument.as_ref()).and_then(|i| i.plugin.as_deref()) == Some(path));
-            match crate::plugins::load(std::path::Path::new(path), self.sr(), Some(inst), state.as_deref(), true) {
+            let how = crate::plugins::LoadAs { instrument: true, isolated: inst.isolated(), realtime: true };
+            match crate::plugins::load(std::path::Path::new(path), self.sr(), Some(inst), state.as_deref(), how) {
                 Ok((handle, shared)) => {
                     self.plugin_params.insert(id.to_string(), handle.params.clone());
                     self.inst_plugins.insert(id.to_string(), path.to_string());
@@ -635,6 +783,7 @@ impl EditorState {
             bypass: None,
             prompt,
             plugin: Some(path.to_string_lossy().into_owned()),
+            isolate: None,
         };
         if !self.load_plugin_instrument(&t.id, &inst.plugin.clone().unwrap_or_default(), &inst) {
             return Err(self.fx_errors.remove(&t.id).unwrap_or_default());
@@ -673,7 +822,7 @@ impl EditorState {
         let dir = self.dir();
         std::fs::create_dir_all(dir.join("fx")).map_err(|e| e.to_string())?;
         std::fs::write(dir.join(&file), code).map_err(|e| e.to_string())?;
-        let fx = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None };
+        let fx = Fx { id: id.clone(), name: name.to_string(), file, params: None, bypass: None, prompt, plugin: None, isolate: None };
         self.project.chain_mut(lane).push(fx);
         self.compile_fx(&id);
         self.publish_fx();

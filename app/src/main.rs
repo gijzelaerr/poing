@@ -568,7 +568,7 @@ script_mod! {
                             delete_take_btn := PillButton{text: "Delete take"}
                         }
                         fx_row := View{
-                            visible: false width: Fill height: Fit flow: Right spacing: 12
+                            visible: false width: Fill height: Fit flow: Flow.Right{wrap: true, row_align: RowAlign.Center} spacing: 12
                             align: Align{y: 0.5}
                             fx_b0 := View{width: Fit height: Fit fx_k0 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_b1 := View{width: Fit height: Fit fx_k1 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
@@ -577,6 +577,7 @@ script_mod! {
                             fx_b4 := View{width: Fit height: Fit fx_k4 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_b5 := View{width: Fit height: Fit fx_k5 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_editor := PillButton{text: "Open its window"}
+                            fx_isolate := CheckBox{text: "Run in its own process"}
                             fx_bypass := CheckBox{text: "Bypass"}
                             fx_remove := PillButton{text: "Remove"}
                         }
@@ -667,6 +668,9 @@ pub struct App {
     piano_octave: Option<u8>,
     #[rust]
     piano_down: Vec<(KeyCode, u8)>,
+    /// Slower, always: plugins whose process died or whose latency changed.
+    #[rust]
+    plugin_watch: Timer,
     /// A remix waiting for the answer to "this song already has a project":
     /// (the song, the prompt, its existing project).
     #[rust]
@@ -1976,7 +1980,7 @@ impl App {
                 let t = st.project.tracks[i].clone();
                 let what = match &t.notes {
                     Some(n) => match t.instrument.as_ref().filter(|i| i.plugin.is_some()) {
-                        Some(i) => format!("MIDI, {} notes, played by {}", n.len(), i.name),
+                        Some(i) => format!("MIDI, {} notes, played by {}{}", n.len(), i.name, st.plugin_note(&t.id)),
                         None => format!("MIDI, {} notes", n.len()),
                     },
                     None => t.file.clone(),
@@ -2004,6 +2008,8 @@ impl App {
                     ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, false);
                     ui.button(cx, ids!(fx_remove)).set_visible(cx, false);
                     ui.button(cx, ids!(fx_editor)).set_visible(cx, plugin);
+                    ui.check_box(cx, ids!(fx_isolate)).set_visible(cx, plugin);
+                    ui.check_box(cx, ids!(fx_isolate)).set_active(cx, t.instrument.as_ref().is_some_and(|i| i.isolated()), Animate::No);
                     show_fx = true;
                 }
             }
@@ -2013,12 +2019,14 @@ impl App {
                 let state = match (st.fx_errors.get(&fx.id), fx.plugin.is_some()) {
                     (Some(e), true) => format!("   ·   {}", e.chars().take(120).collect::<String>()),
                     (Some(e), false) => format!("   ·   does not compile: {}", e.chars().take(120).collect::<String>()),
-                    (None, true) => "   ·   VST3 plugin, its main knobs".to_string(),
+                    (None, true) => format!("   ·   VST3 plugin, its main knobs{}", st.plugin_note(&fx.id)),
                     (None, false) => format!("   ·   edit {} to change it live", fx.file),
                 };
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
                 fill_knobs(&ui, cx, &st.fx_knobs(&fx.id));
                 ui.button(cx, ids!(fx_editor)).set_visible(cx, fx.plugin.is_some());
+                ui.check_box(cx, ids!(fx_isolate)).set_visible(cx, fx.plugin.is_some());
+                ui.check_box(cx, ids!(fx_isolate)).set_active(cx, fx.isolated(), Animate::No);
                 ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, true);
                 ui.button(cx, ids!(fx_remove)).set_visible(cx, true);
                 ui.check_box(cx, ids!(fx_bypass)).set_active(cx, fx.bypassed(), Animate::No);
@@ -2419,6 +2427,9 @@ impl App {
                         if let Some(b) = get(&a, "bypass").and_then(|v| v.as_bool()) {
                             st.set_fx_bypass(&fx.id, b);
                             done.push(if b { "bypassed".to_string() } else { "on".to_string() });
+                        }
+                        if let Some(b) = get(&a, "own_process").and_then(|v| v.as_bool()) {
+                            done.push(st.set_isolated(&fx.id, b).unwrap_or_else(|e| e));
                         }
                         let mut err = None;
                         if let (Some(knob), Some(v)) = (get(&a, "knob").and_then(|v| v.as_str()), get(&a, "value").and_then(num)) {
@@ -2827,6 +2838,7 @@ impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.jobs = Some(Jobs::start(cx));
         self.ai_port = makepad_ai_services::port::AiServicePort::open(cx, agent::manifest());
+        self.plugin_watch = cx.start_interval(0.25);
         self.load(cx);
     }
 
@@ -3069,6 +3081,17 @@ impl MatchEvent for App {
             }
         }
 
+        if let Some(on) = ui.check_box(cx, ids!(fx_isolate)).changed(actions) {
+            let id = match st.sel {
+                Selection::Track(l) => st.project.tracks.get(l).map(|t| t.id.clone()),
+                Selection::Fx(lane, i) => st.project.chain(lane).get(i).map(|f| f.id.clone()),
+                _ => None,
+            };
+            if let Some(id) = id {
+                status = Some(st.set_isolated(&id, on).unwrap_or_else(|e| e));
+                st.sel_changed = true;
+            }
+        }
         if ui.button(cx, ids!(fx_editor)).clicked(actions) {
             let id = match st.sel {
                 Selection::Track(l) => st.project.tracks.get(l).map(|t| t.id.clone()),
@@ -3274,10 +3297,22 @@ impl AppMain for App {
                 }
             }
         }
+        if self.plugin_watch.is_event(event).is_some() && self.plugin_pump.is_empty() {
+            if let Some(said) = self.state.as_mut().filter(|st| st.has_plugins()).and_then(|st| st.pump_plugins()) {
+                self.set_status(cx, &said);
+                if let Some(st) = self.state.as_mut() {
+                    st.sel_changed = true;
+                }
+            }
+        }
         if self.plugin_pump.is_event(event).is_some() {
             match self.state.as_mut() {
                 Some(st) => {
-                    st.pump_plugins();
+                    if let Some(said) = st.pump_plugins() {
+                        st.sel_changed = true;
+                        self.ui.label(cx, ids!(status_label)).set_text(cx, &said);
+                    }
+                    let Some(st) = self.state.as_mut() else { return };
                     if !st.editors_open() {
                         cx.stop_timer(self.plugin_pump);
                         self.plugin_pump = Timer::empty();

@@ -405,6 +405,9 @@ pub struct Fx {
     /// A VST3 plugin instead of a shader: its bundle path (then `file` is
     /// empty and `params` hold normalized values by parameter name).
     pub plugin: Option<String>,
+    /// The plugin runs in a process of its own (poing-plughost): it can crash
+    /// without taking Poing down ("Run in its own process").
+    pub isolate: Option<bool>,
 }
 
 #[derive(SerJson, DeJson, Clone, Debug)]
@@ -416,6 +419,9 @@ pub struct FxParam {
 impl Fx {
     pub fn bypassed(&self) -> bool {
         self.bypass.unwrap_or(false)
+    }
+    pub fn isolated(&self) -> bool {
+        self.isolate.unwrap_or(false)
     }
     pub fn param(&self, name: &str) -> Option<f64> {
         self.params.as_ref()?.iter().find(|p| p.name == name).map(|p| p.value)
@@ -749,6 +755,15 @@ mod tests {
         assert_eq!(midi_part("make a midi part for the bridge"), Some("lead"));
         assert_eq!(midi_part("1960s Beatles beat pop, warm tape"), None, "a style is a cover");
         assert_eq!(midi_part("tape saturation on the whole mix"), None);
+    }
+
+    #[test]
+    fn an_effect_saved_before_isolation_reads_in_process_and_round_trips() {
+        let old = r#"{"id":"fx1","name":"Pro-Q 3","file":"","params":null,"bypass":null,"prompt":null,"plugin":"C:/VST3/Pro-Q 3.vst3"}"#;
+        let mut fx = Fx::deserialize_json(old).unwrap();
+        assert!(!fx.isolated());
+        fx.isolate = Some(true);
+        assert!(Fx::deserialize_json(&fx.serialize_json()).unwrap().isolated());
     }
 
     #[test]

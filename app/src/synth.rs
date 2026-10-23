@@ -197,7 +197,15 @@ impl PluginSound {
     fn render(&mut self, l: &mut [f32], r: &mut [f32]) {
         use vst3_host::midi::{MidiChannel, MidiEvent};
         let Some(shared) = self.hosted.as_ref() else { return };
-        let Ok(mut plugin) = shared.try_lock() else {
+        // in its own process: notes and audio go through its bridge
+        if let Some(b) = &shared.bridge {
+            for (note, velocity, on) in self.queued.drain(..) {
+                b.note(note, velocity, on);
+            }
+            b.run(l, r, false);
+            return;
+        }
+        let Ok(mut plugin) = shared.plugin.try_lock() else {
             crate::plugins::MISSED_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
@@ -213,7 +221,7 @@ impl PluginSound {
         let mut done = 0;
         while done < n {
             let k = (n - done).min(crate::fx::PLUGIN_BLOCK);
-            self.buffers.block_size = k;
+            crate::fx::fit(&mut self.buffers, k);
             if plugin.process_audio(&mut self.buffers).is_ok() {
                 let outs = &self.buffers.outputs;
                 let (out_l, out_r) = (&outs[0], &outs[outs.len().min(2) - 1]);
@@ -276,6 +284,8 @@ pub struct MidiLane {
     pub track: usize,
     pub events: Vec<NoteEvent>,
     pub sound: Sound,
+    /// Frames its instrument's output comes late (a plugin's latency).
+    pub latency: u32,
     /// The frame the last block ended at (u64::MAX: nothing played yet).
     last_end: u64,
     cursor: usize,
@@ -285,7 +295,16 @@ pub struct MidiLane {
 
 impl MidiLane {
     pub fn new(track: usize, events: Vec<NoteEvent>, sound: Sound) -> Self {
-        MidiLane { track, events, sound, last_end: u64::MAX, cursor: 0, live: [false; 128] }
+        MidiLane { track, events, sound, latency: 0, last_end: u64::MAX, cursor: 0, live: [false; 128] }
+    }
+
+    /// The plugin playing it (its id is the lane's track id), if one does.
+    pub fn plugin_id(&self) -> Option<&str> {
+        match &self.sound {
+            #[cfg(windows)]
+            Sound::Plugin(p) => Some(&p.id),
+            _ => None,
+        }
     }
 
     /// Something other than the next block follows (a seek, a loop, a pause).
@@ -376,7 +395,7 @@ mod tests {
 
     fn synth(code: &str) -> Synth {
         let shader = crate::fx::compile_instrument(code).unwrap();
-        let fx = Fx { id: "i".into(), name: "i".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None };
+        let fx = Fx { id: "i".into(), name: "i".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None, isolate: None };
         Synth::new(shader.clone(), FxControls::new(&shader, &fx, None), 48000)
     }
 

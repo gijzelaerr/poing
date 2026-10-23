@@ -50,6 +50,72 @@ impl FxControls {
 /// blocks this long.
 pub const PLUGIN_BLOCK: usize = 1024;
 
+/// Size a plugin's buffers to `k` frames: vst3-host processes as many frames
+/// as the vectors hold (not `block_size`). Within their capacity
+/// (PLUGIN_BLOCK): no allocation.
+#[cfg(windows)]
+pub fn fit(buffers: &mut vst3_host::audio::AudioBuffers, k: usize) {
+    for v in buffers.inputs.iter_mut().chain(buffers.outputs.iter_mut()) {
+        v.resize(k, 0.0);
+    }
+    buffers.block_size = k;
+}
+
+/// A fixed stereo delay, its line allocated up front (on the UI thread).
+pub struct Delay {
+    l: Box<[f32]>,
+    r: Box<[f32]>,
+    pos: usize,
+}
+
+impl Delay {
+    pub fn new(frames: usize) -> Self {
+        Delay { l: vec![0.0; frames].into(), r: vec![0.0; frames].into(), pos: 0 }
+    }
+
+    pub fn frames(&self) -> usize {
+        self.l.len()
+    }
+
+    /// Delay l/r in place.
+    pub fn run(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let len = self.l.len();
+        if len == 0 {
+            return;
+        }
+        for i in 0..l.len().min(r.len()) {
+            std::mem::swap(&mut l[i], &mut self.l[self.pos]);
+            std::mem::swap(&mut r[i], &mut self.r[self.pos]);
+            self.pos = if self.pos + 1 == len { 0 } else { self.pos + 1 };
+        }
+    }
+
+    /// Take l/r in without giving anything back (the line stays current).
+    pub fn feed(&mut self, l: &[f32], r: &[f32]) {
+        let len = self.l.len();
+        if len == 0 {
+            return;
+        }
+        for i in 0..l.len().min(r.len()) {
+            self.l[self.pos] = l[i];
+            self.r[self.pos] = r[i];
+            self.pos = if self.pos + 1 == len { 0 } else { self.pos + 1 };
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.l.fill(0.0);
+        self.r.fill(0.0);
+    }
+
+    /// Take over `old`'s contents when it is as long (a rebuilt rack plays on). No allocation.
+    pub fn carry_from(&mut self, old: &mut Delay) {
+        if self.frames() == old.frames() {
+            std::mem::swap(self, old);
+        }
+    }
+}
+
 /// What makes a unit's sound.
 enum Engine {
     /// A Splash audio shader, with the state the audio thread owns.
@@ -74,6 +140,10 @@ pub struct FxUnit {
     pub id: String,
     pub controls: Arc<FxControls>,
     engine: Engine,
+    /// Frames its output comes late (a plugin's latency; see `FxRack::compensate`).
+    pub latency: u32,
+    /// Bypassed, a latent effect still delays its lane by its latency: the dry signal through this.
+    bypass_delay: Delay,
 }
 
 impl FxUnit {
@@ -92,6 +162,8 @@ impl FxUnit {
                 frame: 0,
                 shader,
             },
+            latency: 0,
+            bypass_delay: Delay::new(0),
         }
     }
 
@@ -99,13 +171,20 @@ impl FxUnit {
     #[cfg(windows)]
     pub fn plugin(id: &str, controls: Arc<FxControls>, sample_rate: u32) -> Self {
         let buffers = vst3_host::audio::AudioBuffers::new(2, 2, PLUGIN_BLOCK, sample_rate as f64);
-        FxUnit { id: id.to_string(), controls, engine: Engine::Plugin { plugin: None, buffers } }
+        FxUnit { id: id.to_string(), controls, engine: Engine::Plugin { plugin: None, buffers }, latency: 0, bypass_delay: Delay::new(0) }
     }
 
+    pub fn is_plugin(&self) -> bool {
+        #[cfg(windows)]
+        return matches!(self.engine, Engine::Plugin { .. });
+        #[cfg(not(windows))]
+        false
+    }
 
     /// Take over from the unit this one replaces: a shader's tails, delay lines
     /// and knob smoothing carry on; a plugin instance moves over. No allocation.
     pub fn carry_from(&mut self, old: &mut FxUnit) {
+        self.bypass_delay.carry_from(&mut old.bypass_delay);
         match (&mut self.engine, &mut old.engine) {
             (Engine::Shader { shader, state, frame, .. }, Engine::Shader { shader: old_shader, state: old_state, frame: old_frame, .. }) => {
                 shader.carry_state(state, old_shader, old_state);
@@ -125,8 +204,17 @@ impl FxUnit {
     /// Process l/r in place; `tmp` is scratch of at least MAX_FRAMES frames.
     fn process(&mut self, l: &mut [f32], r: &mut [f32], tmp_l: &mut [f32], tmp_r: &mut [f32]) {
         if self.controls.bypass.load(Ordering::Relaxed) {
+            // an isolated plugin keeps its place in time; the lane stays as late
+            #[cfg(windows)]
+            if let Engine::Plugin { plugin: Some(h), .. } = &self.engine {
+                if let Some(b) = &h.bridge {
+                    b.run(l, r, true);
+                }
+            }
+            self.bypass_delay.run(l, r);
             return;
         }
+        // (a latent plugin's bypass line is fed below, once it is known whether it plays)
         match &mut self.engine {
             Engine::Shader { shader, ctx, state, scratch, applied, frame } => {
                 for (k, target) in self.controls.params.iter().enumerate() {
@@ -155,17 +243,25 @@ impl FxUnit {
             }
             #[cfg(windows)]
             Engine::Plugin { plugin, buffers } => {
-                let Some(plugin) = plugin.as_ref() else { return };
-                // the UI has it (its editor, a knob): this block passes through
-                let Ok(mut runner) = plugin.try_lock() else {
+                let Some(hosted) = plugin.as_ref() else { return };
+                // in its own process: its worker has the answer, BRIDGE_DELAY late
+                if let Some(b) = &hosted.bridge {
+                    self.bypass_delay.feed(l, r);
+                    b.run(l, r, false);
+                    return;
+                }
+                // the UI has it (its editor, a knob): this block passes through, as late as the plugin would be
+                let Ok(mut runner) = hosted.plugin.try_lock() else {
                     crate::plugins::MISSED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    self.bypass_delay.run(l, r);
                     return;
                 };
+                self.bypass_delay.feed(l, r);
                 let n = l.len().min(r.len());
                 let mut done = 0;
                 while done < n {
                     let k = (n - done).min(PLUGIN_BLOCK);
-                    buffers.block_size = k;
+                    fit(buffers, k);
                     buffers.inputs[0][..k].copy_from_slice(&l[done..done + k]);
                     buffers.inputs[1][..k].copy_from_slice(&r[done..done + k]);
                     if runner.process_audio(buffers).is_ok() {
@@ -200,12 +296,113 @@ pub struct FxRack {
     pub(crate) lane_r: Vec<f32>,
     tmp_l: Vec<f32>,
     tmp_r: Vec<f32>,
+    /// Latency compensation (set by `compensate`): each lane's latency (its
+    /// instrument and effects), and the most of any lane, which every other
+    /// path is delayed to meet: lanes through the rack by the difference,
+    /// everything mixed straight in (lanes without effects, section takes) by
+    /// all of it.
+    pub lane_latency: Vec<u32>,
+    pub latency: u32,
+    lane_delay: Vec<Delay>,
+    dry_delay: Delay,
+    /// Lanes through the rack, summed, while the dry mix waits (latency > 0).
+    pub(crate) wet_l: Vec<f32>,
+    pub(crate) wet_r: Vec<f32>,
 }
 
 impl FxRack {
     pub fn new(lanes: Vec<Vec<FxUnit>>, master: Vec<FxUnit>) -> Self {
         let tmp = aot::MAX_FRAMES as usize;
-        FxRack { lanes, master, midi: Vec::new(), clicks: Vec::new(), song: 0, lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
+        FxRack {
+            lanes,
+            master,
+            midi: Vec::new(),
+            clicks: Vec::new(),
+            song: 0,
+            lane_l: vec![0.0; LANE_FRAMES],
+            lane_r: vec![0.0; LANE_FRAMES],
+            tmp_l: vec![0.0; tmp],
+            tmp_r: vec![0.0; tmp],
+            lane_latency: Vec::new(),
+            latency: 0,
+            lane_delay: Vec::new(),
+            dry_delay: Delay::new(0),
+            wet_l: Vec::new(),
+            wet_r: Vec::new(),
+        }
+    }
+
+    /// Set every plugin's latency (`latency` by effect id, or a MIDI lane's
+    /// track id) and line the lanes up: UI thread, before the rack plays (all
+    /// the delay lines are allocated here).
+    pub fn compensate(&mut self, latency: &dyn Fn(&str) -> u32) {
+        for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
+            unit.latency = if unit.is_plugin() { latency(&unit.id) } else { 0 };
+            unit.bypass_delay = Delay::new(unit.latency as usize);
+        }
+        for m in &mut self.midi {
+            m.latency = m.plugin_id().map_or(0, latency);
+        }
+        let n = self.lanes.len().max(self.midi.iter().map(|m| m.track + 1).max().unwrap_or(0));
+        self.lane_latency = (0..n)
+            .map(|i| {
+                let fx: u32 = self.lanes.get(i).map_or(0, |c| c.iter().map(|u| u.latency).sum());
+                fx + self.midi.iter().filter(|m| m.track == i).map(|m| m.latency).sum::<u32>()
+            })
+            .collect();
+        self.latency = self.lane_latency.iter().copied().max().unwrap_or(0);
+        let most = self.latency;
+        self.lane_delay = self.lane_latency.iter().map(|&l| Delay::new((most - l) as usize)).collect();
+        self.dry_delay = Delay::new(most as usize);
+        let wet = if most > 0 { LANE_FRAMES } else { 0 };
+        self.wet_l = vec![0.0; wet];
+        self.wet_r = vec![0.0; wet];
+    }
+
+    /// The master chain's latency (an offline render drops it from the front).
+    pub fn master_latency(&self) -> u32 {
+        self.master.iter().map(|u| u.latency).sum()
+    }
+
+    /// Playback jumped: what the delay lines hold is from elsewhere in the song.
+    pub fn clear_delays(&mut self) {
+        for d in self.lane_delay.iter_mut().chain(std::iter::once(&mut self.dry_delay)) {
+            d.clear();
+        }
+        for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
+            unit.bypass_delay.clear();
+        }
+    }
+
+    /// Lane `lane`'s first `n` frames (through its effects) into the mix: as
+    /// late as the latest lane, into the wet sum, or straight into out.
+    pub(crate) fn lane_out(&mut self, lane: usize, n: usize, out_l: &mut [f32], out_r: &mut [f32]) {
+        let (ll, lr) = (&mut self.lane_l[..n], &mut self.lane_r[..n]);
+        let (to_l, to_r) = if self.latency > 0 {
+            if let Some(d) = self.lane_delay.get_mut(lane) {
+                d.run(ll, lr);
+            }
+            (&mut self.wet_l[..n], &mut self.wet_r[..n])
+        } else {
+            (&mut out_l[..n], &mut out_r[..n])
+        };
+        for i in 0..n {
+            to_l[i] += ll[i];
+            to_r[i] += lr[i];
+        }
+    }
+
+    /// The dry mix in out, delayed to meet the lanes through the rack, plus them.
+    pub(crate) fn join_wet(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+        if self.latency == 0 {
+            return;
+        }
+        let n = out_l.len().min(out_r.len());
+        self.dry_delay.run(&mut out_l[..n], &mut out_r[..n]);
+        for i in 0..n {
+            out_l[i] += self.wet_l[i];
+            out_r[i] += self.wet_r[i];
+        }
     }
 
     pub fn empty() -> Self {
@@ -267,6 +464,11 @@ impl FxRack {
                 unit.carry_from(o);
             }
         }
+        // the lanes stay lined up through a rebuild (a note edit): no gap
+        for (d, o) in self.lane_delay.iter_mut().zip(old.lane_delay.iter_mut()) {
+            d.carry_from(o);
+        }
+        self.dry_delay.carry_from(&mut old.dry_delay);
         // plugin instruments move over with the notes they hold (the new lane releases them)
         #[cfg(windows)]
         for m in &mut self.midi {
@@ -417,7 +619,7 @@ mod tests {
 
     fn unit(code: &str) -> FxUnit {
         let shader = compile_source(code).unwrap();
-        let fx = Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None };
+        let fx = Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None, isolate: None };
         let controls = FxControls::new(&shader, &fx, None);
         FxUnit::new("fx1", shader, controls, 48000)
     }

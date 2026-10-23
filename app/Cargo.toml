@@ -29,10 +29,17 @@ crossbeam-queue = "0.3"
 name = "poing-node"
 path = "src/node_main.rs"
 
+# A VST3 plugin in a process of its own ("Run in its own process"; after a crash).
+[[bin]]
+name = "poing-plughost"
+path = "src/plughost_main.rs"
+
 # VST3 plugin hosting (M6): Windows first. No audio backend of its own (Poing's
 # engine drives it); process isolation runs a plugin in a helper process.
 [target.'cfg(windows)'.dependencies]
 vst3-host = { version = "0.10", default-features = false, features = ["process-isolation"] }
+# poing-plughost speaks vst3-host's isolation protocol: a JSON line each way.
+serde_json = "1"
 
 # The installer (docs/INSTALL.md I1): `cargo packager -p poing --release`, after
 # a release build of the workspace and with the pinned uv in target/packaging/uv
@@ -53,6 +60,8 @@ binaries = [
     { path = "poing-engine" },
     # Serves this PC's GPU jobs to a Poing on a Mac (docs/REMOTE.md).
     { path = "poing-node" },
+    # Plugins in a process of their own (crash isolation).
+    { path = "poing-plughost" },
 ]
 resources = [
     { src = "../sidecar/*.py", target = "sidecar" },
