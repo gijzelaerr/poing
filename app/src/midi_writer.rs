@@ -1,12 +1,24 @@
-//! Claude writes a MIDI part: "add a funky bassline" becomes notes on the
-//! song's own grid, fitted to its key, chords and sections. Claude Code runs
-//! headless (as for effects); its answer is checked and snapped to 1/16, and
-//! problems go back for another round, at most two.
+//! The language model writes a MIDI part: "add a funky bassline" becomes
+//! notes on the song's own grid, fitted to its key, chords and sections
+//! (`llm::ask`, as for effects); its answer is checked and snapped to 1/16,
+//! and problems go back for another round.
 
+use crate::llm;
 use poing_model::{BeatGrid, Note, Project};
 use std::path::Path;
 
-pub const MAX_ROUNDS: usize = 2;
+/// Rounds of write, check, fix.
+pub fn max_rounds() -> usize {
+    if let Some(n) = std::env::var("POING_LLM_ROUNDS").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    match llm::provider() {
+        llm::Provider::ClaudeCode => 2,
+        llm::Provider::Local => 2,
+    }
+}
+/// What one answer may run to: ~14 tokens a note, a busy whole-song part ~700 notes.
+const MAX_TOKENS: usize = 12_000;
 pub const MAX_NOTES: usize = 3000;
 
 /// The pitch range a part should stay in.
@@ -47,7 +59,7 @@ impl Bars {
     }
 }
 
-/// What Claude is told about the song: key, tempo, bars, sections, chords.
+/// What the model is told about the song: key, tempo, bars, sections, chords.
 pub fn song_sheet(p: &Project, bars: Bars) -> String {
     let g = BeatGrid::of(p);
     let a = p.analysis.clone().unwrap_or_default();
@@ -94,7 +106,7 @@ leave space where it suits the style, and keep to the requested bars and pitch
 range. For drums use General MIDI numbers: 36 kick, 38 snare, 39 clap,
 42 closed hi-hat, 46 open hi-hat, 49 crash, 45/47/50 toms."#;
 
-/// Read Claude's answer: the name and the notes (in grid beats), snapped to 1/16.
+/// Read the model's answer: the name and the notes (in grid beats), snapped to 1/16.
 pub fn parse_answer(text: &str, bars: Bars) -> Result<(String, Vec<Note>), String> {
     use makepad_micro_serde::DeJson;
     let name = text
@@ -133,8 +145,43 @@ pub fn fit(notes: &mut Vec<Note>, range: (f64, f64)) {
     notes.retain(|n| n.start >= range.0 - 0.01 && n.start < range.1);
 }
 
-/// What is wrong with a part, in words Claude can act on (empty: good).
-pub fn problems(notes: &[Note], role: &str, range: (f64, f64)) -> Vec<String> {
+/// Pitch classes of a key like "E minor" / "F# major" / "Bb major".
+pub fn scale(key: &str) -> Option<[bool; 12]> {
+    let mut parts = key.split_whitespace();
+    let tonic = parts.next()?;
+    let minor = parts.next().is_some_and(|m| m.starts_with("min"));
+    let sharps = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let flats = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+    let root = sharps.iter().position(|n| *n == tonic).or_else(|| flats.iter().position(|n| *n == tonic))?;
+    let steps: [usize; 7] = if minor { [0, 2, 3, 5, 7, 8, 10] } else { [0, 2, 4, 5, 7, 9, 11] };
+    let mut out = [false; 12];
+    for s in steps {
+        out[(root + s) % 12] = true;
+    }
+    Some(out)
+}
+
+/// The key named in a `song_sheet` ("Key: E minor.").
+pub fn key_of(sheet: &str) -> Option<String> {
+    let rest = sheet.split("Key: ").nth(1)?;
+    Some(rest[..rest.find('.')?].to_string()).filter(|k| k != "unknown")
+}
+
+/// The key's notes in a pitch range as MIDI numbers ("28 E, 30 F#, ..."):
+/// a model that knows the key by name can still miss its numbers.
+pub fn scale_pitches(key: &str, (lo, hi): (u8, u8)) -> Option<String> {
+    let sc = scale(key)?;
+    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    Some((lo..=hi).filter(|p| sc[*p as usize % 12]).map(|p| format!("{p} {}", names[p as usize % 12])).collect::<Vec<_>>().join(", "))
+}
+
+/// Share of a pitched part's notes in the key's scale under which it goes
+/// back (chromatic passing notes are fine; a part a third out of key is not).
+pub const MIN_IN_KEY: f64 = 0.6;
+
+/// What is wrong with a part, in words the model can act on (empty: good).
+/// `key` (e.g. "E minor") checks a pitched part keeps to its scale.
+pub fn problems(notes: &[Note], role: &str, range: (f64, f64), key: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     if notes.is_empty() {
         out.push("there are no notes".into());
@@ -151,6 +198,13 @@ pub fn problems(notes: &[Note], role: &str, range: (f64, f64)) -> Vec<String> {
     if off > 0 {
         out.push(format!("{off} notes fall outside the requested bars"));
     }
+    if let (Some(k), Some(sc), false, false) = (key, key.and_then(scale), role == "drums", notes.is_empty()) {
+        let share = notes.iter().filter(|n| sc[n.pitch as usize % 12]).count() as f64 / notes.len() as f64;
+        if share < MIN_IN_KEY {
+            let numbers = scale_pitches(k, range_of(role)).map(|s| format!(" (its notes: {s})")).unwrap_or_default();
+            out.push(format!("only {:.0}% of the notes are in {k}{numbers}: keep to its scale and the chords, with outside notes only as short passing notes", share * 100.0));
+        }
+    }
     out
 }
 
@@ -165,25 +219,30 @@ pub struct Written {
 /// Write `request` as a `role` part over grid beats `range` of a song described by `sheet`.
 pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f64, f64), work: &Path, progress: &dyn Fn(&str, f32)) -> Result<Written, String> {
     std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
-    let system_file = work.join("system.md");
-    std::fs::write(&system_file, BRIEF).map_err(|e| e.to_string())?;
+    let rounds = max_rounds();
+    let key = key_of(sheet);
     let (lo, hi) = range_of(role);
     let (b0, _) = bars.bar_beat(range.0);
     let (b1, beat1) = bars.bar_beat(range.1);
     let last = if beat1 <= 1.01 { b1.saturating_sub(1).max(b0) } else { b1 };
+    let in_key = match (role, key.as_deref().and_then(|k| Some((k, scale_pitches(k, (lo, hi))?)))) {
+        ("drums", _) | (_, None) => String::new(),
+        (_, Some((k, numbers))) => format!("\nThe notes of {k} in that range, as MIDI numbers: {numbers}."),
+    };
     let ask_for = format!(
-        "The song:\n{sheet}\nWrite a {role} part for bars {b0}-{last}, pitch range {lo}-{hi}: \"{request}\""
+        "The song:\n{sheet}\nWrite a {role} part for bars {b0}-{last}, pitch range {lo}-{hi}: \"{request}\"{in_key}"
     );
     let mut prompt = ask_for.clone();
     let mut last_written: Option<Written> = None;
-    for round in 1..=MAX_ROUNDS {
-        progress(if round == 1 { "Claude is writing the part" } else { "Claude is fixing the part" }, (round - 1) as f32 / MAX_ROUNDS as f32);
-        let answer = crate::fx_writer::ask(&system_file, &prompt, work)?;
+    for round in 1..=rounds {
+        let who = llm::name();
+        progress(&if round == 1 { format!("{who} is writing the part") } else { format!("{who} is fixing the part") }, (round - 1) as f32 / rounds as f32);
+        let answer = if round == 1 { llm::ask(BRIEF, &prompt, MAX_TOKENS, work)? } else { llm::ask_again(BRIEF, &prompt, MAX_TOKENS, work)? };
         let _ = std::fs::write(work.join(format!("answer-{round}.md")), &answer);
         match parse_answer(&answer, bars) {
             Ok((name, mut notes)) => {
                 fit(&mut notes, range);
-                let found = problems(&notes, role, range);
+                let found = problems(&notes, role, range, key.as_deref());
                 let w = Written { name, notes, problems: found, rounds: round };
                 if w.problems.is_empty() {
                     return Ok(w);
@@ -196,7 +255,7 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
             }
         }
     }
-    last_written.ok_or_else(|| "Claude did not return notes".into())
+    last_written.ok_or_else(|| format!("{} did not return notes", llm::name()))
 }
 
 #[cfg(test)]
@@ -219,9 +278,16 @@ mod tests {
     #[test]
     fn problems_are_named() {
         let n = |pitch| Note { start: 0.0, len: 1.0, pitch, vel: 0.8 };
-        assert!(problems(&[n(40)], "bass", (0.0, 8.0)).is_empty());
-        assert!(!problems(&[n(100)], "bass", (0.0, 8.0)).is_empty(), "out of range");
-        assert!(!problems(&[], "bass", (0.0, 8.0)).is_empty(), "empty");
+        assert!(problems(&[n(40)], "bass", (0.0, 8.0), None).is_empty());
+        assert!(!problems(&[n(100)], "bass", (0.0, 8.0), None).is_empty(), "out of range");
+        assert!(!problems(&[], "bass", (0.0, 8.0), None).is_empty(), "empty");
+        // E minor: E (40) is in it, F (41) is not
+        assert!(problems(&[n(40), n(40), n(41)], "bass", (0.0, 8.0), Some("E minor")).is_empty());
+        assert!(!problems(&[n(41), n(41), n(40)], "bass", (0.0, 8.0), Some("E minor")).is_empty(), "out of key");
+        assert!(problems(&[n(41)], "drums", (0.0, 8.0), Some("E minor")).is_empty(), "drums have no key");
+        assert_eq!(key_of("Key: E minor. Tempo: about 125 bpm."), Some("E minor".into()));
+        assert_eq!(scale_pitches("E minor", (28, 36)).unwrap(), "28 E, 30 F#, 31 G, 33 A, 35 B, 36 C");
+        assert!(scale("Bb major").unwrap()[10] && scale("E minor").unwrap()[7] && !scale("E minor").unwrap()[8]);
     }
 
     #[test]
@@ -230,6 +296,6 @@ mod tests {
         let mut notes = vec![n(-0.25, 1.0), n(2.0, 1.0), n(7.5, 2.0), n(8.0, 1.0)];
         fit(&mut notes, (0.0, 8.0));
         assert_eq!(notes, vec![n(0.0, 1.0), n(2.0, 1.0), n(7.5, 0.5)]);
-        assert!(problems(&notes, "bass", (0.0, 8.0)).is_empty());
+        assert!(problems(&notes, "bass", (0.0, 8.0), None).is_empty());
     }
 }

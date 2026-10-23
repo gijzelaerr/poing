@@ -1,4 +1,4 @@
-//! Claude writes a song sheet from a prompt ("a summer song about the farm,
+//! The language model (`llm::ask`) writes a song sheet from a prompt ("a summer song about the farm,
 //! in Dutch, acoustic"): a title, the style as ACE-Step caption tags, tempo,
 //! key, language, length and section-tagged lyrics. ACE-Step then sings it.
 
@@ -35,7 +35,7 @@ Reply with one fenced ```json block and nothing else:
   just the tag). Short lines that scan, 4-8 lines per section, a chorus that returns.
   Enough sections to fill the duration. Empty string "" for an instrumental."#;
 
-/// Read the sheet out of Claude's answer.
+/// Read the sheet out of the model's answer.
 pub fn parse_answer(text: &str) -> Result<Sheet, String> {
     let start = text.find('{').ok_or("no JSON in the answer")?;
     let end = text.rfind('}').ok_or("no JSON in the answer")?;
@@ -52,16 +52,17 @@ pub fn parse_answer(text: &str) -> Result<Sheet, String> {
     Ok(sheet)
 }
 
-/// Ask Claude for a sheet for `prompt` (one retry when the answer is unreadable).
+/// Ask the model for a sheet for `prompt` (one retry when the answer is unreadable).
 pub fn write_sheet(prompt: &str, work: &Path) -> Result<Sheet, String> {
     std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
-    let system_file = work.join("system.md");
-    std::fs::write(&system_file, BRIEF).map_err(|e| e.to_string())?;
-    let ask_for = format!("The song: \"{prompt}\"");
+    // (repeated from the brief: a small model forgets it there)
+    let ask_for = format!("The song: \"{prompt}\"
+
+Write the lyrics in the language the song asks for; if it names none, in the language its description above is written in.");
     let mut ask = ask_for.clone();
     let mut last_error = String::new();
     for round in 1..=2 {
-        let answer = crate::fx_writer::ask(&system_file, &ask, work)?;
+        let answer = crate::llm::ask(BRIEF, &ask, 3000, work)?;
         let _ = std::fs::write(work.join(format!("sheet-{round}.md")), &answer);
         match parse_answer(&answer) {
             Ok(sheet) => return Ok(sheet),

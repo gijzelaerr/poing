@@ -1,18 +1,28 @@
-//! Claude writes an effect: a Describe like "tape saturation" on a lane
-//! becomes a Splash audio shader. Claude Code runs headless (`claude -p`, no
-//! tools, the user's own login) with Makepad's shader guide, the prelude and
+//! The language model writes an effect: a Describe like "tape saturation"
+//! on a lane becomes a Splash audio shader. The model (`llm::ask`: Poing's
+//! local one, or Claude Code) gets Makepad's shader guide, the prelude and
 //! two example shaders as its system prompt. Every answer is compiled and
-//! auditioned (Makepad's `check`); problems go back for another round, at
-//! most three.
+//! auditioned (Makepad's `check`); problems go back for another round.
 
 use crate::fx;
+use crate::llm;
 use makepad_script_audio_aot as aot;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 /// Rounds of write, check, fix.
-pub const MAX_ROUNDS: usize = 3;
+pub fn max_rounds() -> usize {
+    if let Some(n) = std::env::var("POING_LLM_ROUNDS").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    // the local 4B passed 4/10 test effects in 3 greedy rounds, 6/10 in 5
+    // with sampled repairs; Claude passed 5/5 in at most 2
+    match llm::provider() {
+        llm::Provider::ClaudeCode => 3,
+        llm::Provider::Local => 5,
+    }
+}
+/// What one answer may run to (a shader with its comments is under ~1.6k tokens).
+const MAX_TOKENS: usize = 2500;
 /// What a lane effect may cost per sample (counted ops; Makepad calls 4096 expensive).
 pub const MAX_OPS: f64 = 2000.0;
 
@@ -64,7 +74,7 @@ pub fn parse_answer(text: &str) -> Option<(String, String)> {
     Some((name, code))
 }
 
-/// What is wrong with a shader, in words Claude can act on (empty: good).
+/// What is wrong with a shader, in words the model can act on (empty: good).
 pub fn problems(code: &str) -> Vec<String> {
     if let Err(e) = fx::compile_source(code) {
         return vec![format!("it does not compile: {e}")];
@@ -81,35 +91,6 @@ pub fn problems(code: &str) -> Vec<String> {
     }
 }
 
-/// Ask Claude Code once (headless, no tools); returns its text answer.
-pub(crate) fn ask(system_file: &Path, prompt: &str, work: &Path) -> Result<String, String> {
-    let mut cmd = Command::new("claude");
-    cmd.args(["-p", "--tools", "", "--no-session-persistence", "--output-format", "text", "--system-prompt-file"])
-        .arg(system_file)
-        .current_dir(work)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Ok(model) = std::env::var("POING_CLAUDE_MODEL") {
-        cmd.arg("--model").arg(model);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("Claude Code (`claude`) is not on PATH ({e})"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes()).map_err(|e| e.to_string())?;
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("claude exited with {}: {}", out.status, err.trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// The result of writing an effect.
 pub struct Written {
     pub name: String,
@@ -120,24 +101,25 @@ pub struct Written {
 }
 
 /// Write an effect for `request` on `context` (e.g. "the Bass lane of a song
-/// in F major at 122 bpm"), checking and fixing up to MAX_ROUNDS times.
+/// in F major at 122 bpm"), checking and fixing up to `max_rounds()` times.
 /// Drafts and answers are kept in `work` for inspection.
 pub fn write_effect(request: &str, context: &str, work: &Path, progress: &dyn Fn(&str, f32)) -> Result<Written, String> {
     std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
-    let system_file = work.join("system.md");
-    std::fs::write(&system_file, system_prompt()).map_err(|e| e.to_string())?;
+    let system = system_prompt();
+    let rounds = max_rounds();
     let ask_for = format!("Write this effect for {context}: \"{request}\"");
     let mut prompt = ask_for.clone();
     let mut last: Option<Written> = None;
-    for round in 1..=MAX_ROUNDS {
-        progress(if round == 1 { "Claude is writing the effect" } else { "Claude is fixing the effect" }, (round - 1) as f32 / MAX_ROUNDS as f32);
-        let answer = ask(&system_file, &prompt, work)?;
+    for round in 1..=rounds {
+        let who = llm::name();
+        progress(&if round == 1 { format!("{who} is writing the effect") } else { format!("{who} is fixing the effect") }, (round - 1) as f32 / rounds as f32);
+        let answer = if round == 1 { llm::ask(&system, &prompt, MAX_TOKENS, work)? } else { llm::ask_again(&system, &prompt, MAX_TOKENS, work)? };
         let _ = std::fs::write(work.join(format!("answer-{round}.md")), &answer);
         let Some((name, code)) = parse_answer(&answer) else {
             prompt = format!("{ask_for}\n\nYour last answer had no ```splash code block. Reply in the required format.");
             continue;
         };
-        progress("Checking it", (round as f32 - 0.3) / MAX_ROUNDS as f32);
+        progress("Checking it", (round as f32 - 0.3) / rounds as f32);
         let found = problems(&code);
         let written = Written { name, code, problems: found, rounds: round };
         if written.problems.is_empty() {
@@ -150,7 +132,7 @@ pub fn write_effect(request: &str, context: &str, work: &Path, progress: &dyn Fn
         );
         last = Some(written);
     }
-    last.ok_or_else(|| "Claude did not return a shader".into())
+    last.ok_or_else(|| format!("{} did not return a shader", llm::name()))
 }
 
 #[cfg(test)]

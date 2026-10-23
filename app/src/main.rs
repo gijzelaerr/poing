@@ -14,6 +14,7 @@ mod export;
 mod fx;
 mod fx_writer;
 mod listen;
+mod llm;
 mod plugins;
 mod remote;
 mod synth;
@@ -1088,15 +1089,18 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     if let Some((i, range)) = lane {
         return describe_lane(st, jobs, bundle, i, range, text);
     }
-    // With nothing selected, anything else goes to Claude (from the bar only):
+    // With nothing selected, anything else goes to the assistant (from the bar only):
     // it can change the mix with Poing's tools, or still ask for a remix.
     if st.sel == Selection::None && st.agent_ok {
         match agent::unavailable() {
             None => {
+                if let Some(note) = llm::feature().and_then(|f| model_view::gate(st, f, model_view::Resume::Describe(st.path.clone(), text.to_string()))) {
+                    return note;
+                }
                 st.ask_agent = Some(text.to_string());
-                return "Claude is working on it (it uses Poing's own tools; Ctrl+Z undoes the whole pass)...".into();
+                return format!("{} is working on it (it uses Poing's own tools; Ctrl+Z undoes the whole pass)...", llm::name());
             }
-            Some(why) if agent::is_mix_text(text) => return format!("Changing the mix in words needs Claude here, but {why}. Use the lane levels and chips meanwhile."),
+            Some(why) if agent::is_mix_text(text) => return format!("Changing the mix in words needs {} here, but {why}. Use the lane levels and chips meanwhile.", llm::name()),
             Some(_) => {}
         }
     }
@@ -1224,6 +1228,9 @@ fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Op
 
 /// Claude writes a MIDI part for the selected section (or the whole song).
 fn write_midi(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, role: &str, text: &str) -> String {
+    if let Some(note) = llm::feature().and_then(|f| model_view::gate(st, f, model_view::Resume::Describe(st.path.clone(), text.to_string()))) {
+        return note;
+    }
     let bars = midi_writer::Bars::of(&st.project);
     let grid = model::BeatGrid::of(&st.project);
     let (range, place) = match st.sel {
@@ -1239,11 +1246,14 @@ fn write_midi(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, role: &str, te
         return "The job worker is not running".into();
     }
     st.analysing = Some(("Part".into(), 0.0));
-    format!("Claude is writing a {role} part for {place} from the song's key, chords and sections (under a minute)...")
+    format!("{} is writing a {role} part for {place} from the song's key, chords and sections (under a minute)...", llm::name())
 }
 
 /// Claude writes an effect for a lane (or the master, `None`) from `text`.
 fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option<usize>, text: &str) -> String {
+    if let Some(note) = llm::feature().and_then(|f| model_view::gate(st, f, model_view::Resume::Describe(st.path.clone(), text.to_string()))) {
+        return note;
+    }
     let a = st.project.analysis.clone().unwrap_or_default();
     let song = match (a.key, a.tempo) {
         (Some(k), Some(bpm)) => format!("a song in {k} at {bpm:.0} bpm"),
@@ -1266,7 +1276,7 @@ fn write_effect(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: Option
         return "The job worker is not running".into();
     }
     st.analysing = Some(("Effect".into(), 0.0));
-    format!("Claude is writing \"{text}\" for {place}; Poing checks it before you hear it (under a minute)...")
+    format!("{} is writing \"{text}\" for {place}; Poing checks it before you hear it (under a minute)...", llm::name())
 }
 
 /// Describe on a lane (or a region of it): less echo, or a new part added.
@@ -1506,7 +1516,7 @@ impl App {
             return;
         }
         if self.agent_rx.is_some() {
-            return self.set_status(cx, "Claude is still working on this song; open the other one when it is done.");
+            return self.set_status(cx, "The assistant is still working on this song; open the other one when it is done.");
         }
         let loaded = (|| -> Result<(Project, Vec<Stem>, bool), String> {
             let mut project = Project::load(&path)?;
@@ -1600,7 +1610,7 @@ impl App {
     /// same time in the other song, so versions and songs compare by ear.
     fn switch_to(&mut self, cx: &mut Cx, path: &Path) {
         if self.agent_rx.is_some() {
-            return self.set_status(cx, "Claude is still working on this song; switch when it is done.");
+            return self.set_status(cx, "The assistant is still working on this song; switch when it is done.");
         }
         let Some(i) = self.others.iter().position(|st| same_song(&st.path, path)) else { return };
         let mut next = self.others.remove(i);
@@ -1687,18 +1697,23 @@ impl App {
             ui.label(cx, ids!(home_error)).set_text(cx, "Say first what the song should be.");
             return;
         }
-        // Claude writes the words: without it the ACE-Step download would be for nothing
-        if !agent::claude_installed() {
-            ui.label(cx, ids!(home_error)).set_text(cx, "New songs need Claude Code to write the words: install it and sign in, then make it again.");
+        // the language model writes the words: without it the ACE-Step download would be for nothing
+        if let Some(why) = llm::unavailable() {
+            ui.label(cx, ids!(home_error)).set_text(cx, &format!("New songs need {} to write the words, but {why}.", llm::name()));
             return;
+        }
+        if let Some(f) = llm::feature() {
+            if self.needs_download(cx, f, model_view::Resume::MakeSong(prompt.trim().to_string())) {
+                return;
+            }
         }
         if self.needs_download(cx, "new-song", model_view::Resume::MakeSong(prompt.trim().to_string())) {
             return;
         }
         let job = Job::Song { prompt: prompt.trim().to_string(), dir: audio::songs_dir(), count: 3, sr: 48000 };
         let queued = self.jobs.as_ref().is_some_and(|j| j.submit(job));
-        let line = if queued { "Claude is writing the song..." } else { "The job worker is not running" };
-        ui.label(cx, ids!(home_status)).set_text(cx, line);
+        let line = if queued { format!("{} is writing the song...", llm::name()) } else { "The job worker is not running".into() };
+        ui.label(cx, ids!(home_status)).set_text(cx, &line);
         cx.set_key_focus(Area::Empty);
     }
 
@@ -2189,8 +2204,12 @@ impl App {
                         st.checkpoint();
                     }
                     let t = &mut st.project.tracks[l];
+                    let was = t.gain();
                     if let Some(g) = get(&a, "gain_db").and_then(num) {
                         t.gain_db = Some(g.clamp(-36.0, 12.0));
+                    }
+                    if let Some(d) = get(&a, "change_db").and_then(num) {
+                        t.gain_db = Some((t.gain() + d).clamp(-36.0, 12.0));
                     }
                     if let Some(m) = get(&a, "mute").and_then(|v| v.as_bool()) {
                         t.mute = Some(m);
@@ -2198,7 +2217,7 @@ impl App {
                     if let Some(s) = get(&a, "solo").and_then(|v| v.as_bool()) {
                         t.solo = Some(s);
                     }
-                    let line = format!("{}: {:+.1} dB{}{}", t.name, t.gain(), if t.muted() { ", muted" } else { "" }, if t.soloed() { ", soloed" } else { "" });
+                    let line = format!("{}: {:+.1} dB (was {was:+.1}){}{}", t.name, t.gain(), if t.muted() { ", muted" } else { "" }, if t.soloed() { ", soloed" } else { "" });
                     st.push_mix();
                     st.sel_changed = true;
                     Ok(line)
@@ -2342,7 +2361,7 @@ impl App {
         let Some(rx) = &self.agent_rx else { return };
         let Ok(result) = rx.try_recv() else { return };
         self.agent_rx = None;
-        let line = result.unwrap_or_else(|e| format!("Claude could not do it: {e}"));
+        let line = result.unwrap_or_else(|e| format!("{} could not do it: {e}", llm::name()));
         if let Some(st) = self.state.as_mut() {
             st.sel_changed = true;
         }
@@ -2544,10 +2563,15 @@ impl App {
             (None, None) => "No sound output found.".into(),
         };
         ui.label(cx, ids!(out_status)).set_text(cx, &now);
-        let ai = match (agent::claude_installed(), agent::unavailable()) {
-            (true, None) => "Claude Code is installed: written effects, MIDI parts, new songs and free-form requests in the Describe bar can use it.".to_string(),
-            (true, Some(why)) => format!("Claude Code is installed: written effects, MIDI parts and new songs use it. Free-form requests in the Describe bar also need Makepad's makepad-remote: {why}."),
-            (false, _) => "Claude Code is not installed. Splitting, remixing, repainting and plugins work without it; a local model for the written parts is coming, so nothing needs a subscription.".to_string(),
+        let ai = match (llm::provider(), agent::claude_installed(), agent::unavailable()) {
+            (llm::Provider::Local, claude, why) => format!(
+                "Poing's own model (Qwen3.5 4B, on this PC's GPU) writes effects, MIDI parts and new songs and answers the Describe bar: no subscription needed.{}{}",
+                why.map(|w| format!(" Not now: {w}.")).unwrap_or_default(),
+                if claude { " Claude Code is installed too (POING_LLM=claude uses it)." } else { "" }
+            ),
+            (llm::Provider::ClaudeCode, true, None) => "Claude Code writes effects, MIDI parts and new songs and answers free-form requests in the Describe bar.".to_string(),
+            (llm::Provider::ClaudeCode, true, Some(why)) => format!("Claude Code writes effects, MIDI parts and new songs. Free-form requests in the Describe bar also need Makepad's makepad-remote: {why}."),
+            (llm::Provider::ClaudeCode, false, _) => "Claude Code was chosen but is not installed: written effects, MIDI parts and new songs need it (or Poing's own model).".to_string(),
         };
         ui.label(cx, ids!(ai_status)).set_text(cx, &ai);
         let plugins = self.state.as_ref().map(|st| st.plugin_library.len()).unwrap_or_else(|| plugins::library().len());
@@ -2773,7 +2797,7 @@ impl MatchEvent for App {
 
         if let Some((text, _)) = ui.text_input(cx, ids!(describe_input)).returned(actions) {
             if self.agent_rx.is_some() && !text.trim().is_empty() {
-                status = Some("Claude is still working on the last request.".into());
+                status = Some("The assistant is still working on the last request.".into());
             } else if !text.trim().is_empty() {
                 let before = self.jobs.as_ref().map_or(0, |j| j.last_seq());
                 let lane = match st.sel {

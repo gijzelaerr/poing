@@ -1196,6 +1196,7 @@ version = "0.1.0"
 dependencies = [
  "makepad-ai-beats",
  "makepad-ai-hub",
+ "makepad-ai-llm",
  "makepad-ai-speech",
  "makepad-ai-stems",
  "makepad-audio-decode",

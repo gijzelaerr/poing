@@ -16,6 +16,8 @@ mod export;
 mod fx;
 #[path = "fx_writer.rs"]
 mod fx_writer;
+#[path = "llm.rs"]
+mod llm;
 #[path = "midi_writer.rs"]
 mod midi_writer;
 /// The Models page is UI (it needs the App); state.rs only names its Resume.
