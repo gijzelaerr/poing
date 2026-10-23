@@ -75,3 +75,50 @@ Native ports live in Makepad `libs/ai/models`. The `poing-engine` crate is in PR
 | Language detection | Whisper | native Whisper detects the language |
 | Chords, key, sections, score | SheetSage2 | none yet. Notes → chords over Basic Pitch `notes/` runs natively but scores about 15 points lower (see above) |
 | Chord labels → symbols | Python logic | logic |
+
+## Native lyrics: which vocal Whisper hears
+
+The native engine's Whisper gave It's Autumn 17.6% WER, against 7.4–9.3% for Python. On the same vocal stem the two Whispers are about equal, so the gap was BS-RoFormer's vocal stem. Since this change the engine also runs Makepad's vocals-only Mel-Band RoFormer (KimberleyJSN's checkpoint), and Whisper hears **the mean of the two separators' vocals**. The mean is kept as `lyrics/vocals.wav` in the bundle, and `poing-engine lyrics <bundle>` uses it. The mix keeps BS-RoFormer's four lanes, which sum to the song. There is no separation reference to show that Mel-Band's vocal is a better lane, so the lanes don't change.
+
+Lyrics WER, all on copies of the bundles, measured 2026-10-23:
+
+| Song | Native before (BS-RoFormer vocal) | Mel-Band vocal alone | **Native now (mean of both)** | Python (Demucs) |
+|---|---|---|---|---|
+| It's Autumn | 17.6% | 16.7% | **11.1%** | 8.3% |
+| Mooie rijke vrouw | 13.2% | 18.5% | **13.2%** | 18.5% |
+| Zomer op de Farm, transcribed | 12.6% | 11.3% | **12.6%** | 12.6% |
+| Zomer op de Farm, `lyrics.txt` aligned | 2.0% | 4.0% | **4.0%** | 4.0% |
+
+Other Whisper inputs tried on It's Autumn:
+
+| Input | Native Whisper | Python Whisper |
+|---|---|---|
+| Demucs vocal | 10.2% | 8.3% |
+| 0.3 Mel-Band + 0.7 BS-RoFormer | 13.0% | |
+| 0.5 + 0.5 (the mean) | 11.1% | 23.1% |
+| 0.7 Mel-Band + 0.3 BS-RoFormer | 13.0% | |
+| Mel-Band + 10% of the other three BS-RoFormer stems | 16.7% | |
+
+On Mooie and Zomer, native Whisper on the Demucs vocal scores 19.0% and 16.9%, so Demucs is not the better stem everywhere.
+
+What this means:
+
+- Native lyrics are now no worse than Python on Mooie (better) and on Zomer (equal). **On It's Autumn native is still behind: 11.1% vs 8.3%, three words of 108.**
+- The rest of that gap is not one cause. Native Whisper on the Demucs vocal gets 10.2%, and Python Whisper on the mean gets 23.1%, so each decoder does best on a different stem. Python's Whisper also has temperature fallback and native's is greedy.
+- Treat single-word differences as noise: one word is 0.9% on It's Autumn and 0.5% on Mooie. Python's WER also moves between Demucs runs (7.4–9.3% on It's Autumn). Remember too that the It's Autumn reference started from Whisper output.
+- The weights 0.3 and 0.7 are both worse than the mean on It's Autumn, so the mean stays. It was not tuned further on these three songs.
+
+Time and memory on the RTX 4070 Ti (12 GB) are below. VRAM is the whole card, including about 0.3–0.6 GB for the desktop. Other sessions shared the GPU during some runs, so the numbers come from runs on an idle card, or from stages where nothing else ran.
+
+| Stage | Time (2:15–3:17 songs) | VRAM peak |
+|---|---|---|
+| BS-RoFormer stems | 35–45 s | 3.4 GB |
+| Mel-Band vocal (new) | 19–27 s | 2.9 GB |
+| Beat This! | < 1 s | 0.8 GB |
+| Whisper large-v3 Q8_0 | 37–58 s (78 s aligned) | 3.5 GB |
+| Whole native analysis | 93–137 s (was 73–131 s) | **3.5 GB** (was 6.9 GB) |
+| Python, Demucs + lyrics | 12–15 s + 23–39 s | 1.7 GB, then 7.7 GB |
+
+Each model is now dropped before the next one loads. Before this change the BS-RoFormer separator stayed loaded while Whisper ran, which made the peak 6.9 GB. So the native analysis now peaks at half the memory, even with the extra model.
+
+**Licence.** The Mel-Band weights repository (`KimberleyJSN/melbandroformer`, pinned at revision `ac9b061`, SHA-256 `87201f4d…559e`) has an MIT tag. Its training data is not disclosed, so Makepad records `VOCALS_MODEL_COMMERCIAL_USE = false`. `poing-engine install` asks for this licence the way it asks for BS-RoFormer's, and records the acceptance in Makepad's licence store. Without these weights, the engine feeds Whisper the BS-RoFormer vocal as before.

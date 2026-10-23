@@ -22,11 +22,11 @@ target/release/poing --remote …         # Makepad remote control: snap / click
 
 Layout: `app/` (Makepad app: arrangement timeline, inspector, live mix, render), `model/` (`poing-model`: project.json types + tests), `engine/` (`poing-engine`: native models in a helper process, so poing never links CUDA).
 
-**Native analysis.** `poing-engine` runs stems (BS-RoFormer), beats (Beat This!) and lyrics (Whisper large-v3, Q8_0) on Makepad's ggml runtime; the app starts it from next to `poing.exe` and then runs only SheetSage2 (`poing_analyze.py --only structure`) in Python. Without the engine, its models or a GPU it falls back to the full Python analysis (`POING_NATIVE=0` forces that). Setup on the CUDA PC:
+**Native analysis.** `poing-engine` runs stems (BS-RoFormer, plus a Mel-Band RoFormer vocal for the lyrics), beats (Beat This!) and lyrics (Whisper large-v3, Q8_0) on Makepad's ggml runtime; the app starts it from next to `poing.exe` and then runs only SheetSage2 (`poing_analyze.py --only structure`) in Python. Without the engine, its models or a GPU it falls back to the full Python analysis (`POING_NATIVE=0` forces that). Setup on the CUDA PC:
 
 ```sh
 MAKEPAD_CUDA_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4" cargo build --release -p poing-engine   # without it: CPU-only stub, analysis falls back to Python
-target/release/poing-engine install --accept-licence   # ~2.3 GB into ~/.makepad/weights; BS-RoFormer weights are academic-use only
+target/release/poing-engine install --accept-licence   # ~3.2 GB into ~/.makepad/weights; BS-RoFormer weights are academic-use only, Mel-Band vocals not cleared for commercial use
 target/release/poing-engine status
 ``` A `project.json` comes from the Python prep step in claude-space `projects/music-gen/build_project.py` until M2 brings import into the app.
 
