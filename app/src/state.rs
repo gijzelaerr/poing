@@ -643,6 +643,33 @@ impl EditorState {
             .collect()
     }
 
+    /// The knobs of MIDI lane `lane`'s built-in instrument: (name, value, min, max).
+    pub fn inst_knobs(&self, lane: usize) -> Vec<(String, f64, f64, f64)> {
+        let Some(t) = self.project.tracks.get(lane) else { return Vec::new() };
+        let (Some(shader), Some(inst)) = (self.inst_shaders.get(&t.id), t.instrument.as_ref().filter(|i| i.plugin.is_none())) else { return Vec::new() };
+        shader
+            .params()
+            .iter()
+            .filter(|p| p.name != "bpm")
+            .take(6)
+            .map(|p| (p.name.clone(), inst.param(&p.name).unwrap_or(p.default as f64), p.min as f64, p.max as f64))
+            .collect()
+    }
+
+    /// Turn knob `knob` of lane `lane`'s instrument: heard at once, saved with the song.
+    pub fn set_inst_knob(&mut self, lane: usize, knob: usize, value: f64) {
+        let Some(id) = self.project.tracks.get(lane).map(|t| t.id.clone()) else { return };
+        let Some(shader) = self.inst_shaders.get(&id) else { return };
+        let Some((index, name)) = shader.params().iter().enumerate().filter(|(_, p)| p.name != "bpm").nth(knob).map(|(i, p)| (i, p.name.clone())) else { return };
+        if let Some(c) = self.inst_controls.get(&id) {
+            c.set(index, value as f32);
+        }
+        if let Some(inst) = self.project.tracks[lane].instrument.as_mut() {
+            inst.set_param(&name, value);
+            self.dirty = true;
+        }
+    }
+
     /// Live coding: recompile effects whose file changed (at most once a
     /// second). Returns what happened, for the status line.
     pub fn reload_changed_fx(&mut self) -> Option<String> {

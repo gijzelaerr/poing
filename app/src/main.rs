@@ -465,6 +465,21 @@ fn update_bundle(u: &JobUpdate) -> Option<PathBuf> {
     }
 }
 
+/// The inspector's six knob sliders, set to these (name, value, min, max).
+fn fill_knobs(ui: &WidgetRef, cx: &mut Cx, knobs: &[(String, f64, f64, f64)]) {
+    let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+    let boxes = [ids!(fx_b0), ids!(fx_b1), ids!(fx_b2), ids!(fx_b3), ids!(fx_b4), ids!(fx_b5)];
+    for (k, id) in sliders.iter().enumerate() {
+        ui.view(cx, boxes[k]).set_visible(cx, k < knobs.len());
+        let mut w = ui.widget(cx, *id);
+        if let Some((name, value, min, max)) = knobs.get(k) {
+            let (name, min, max) = (name.replace('_', " "), *min, *max);
+            script_apply_eval!(cx, w, {text: #(name) min: #(min) max: #(max)});
+            ui.slider(cx, *id).set_value(cx, *value);
+        }
+    }
+}
+
 /// The start screen's file dialogs: a song to split, or to remix.
 const SPLIT_DIALOG: LiveId = live_id!(poing_split_song);
 const REMIX_DIALOG: LiveId = live_id!(poing_remix_song);
@@ -1395,6 +1410,14 @@ impl App {
                 ui.check_box(cx, ids!(mute_cb)).set_active(cx, t.muted(), Animate::No);
                 ui.check_box(cx, ids!(solo_cb)).set_active(cx, t.soloed(), Animate::No);
                 show_track = true;
+                // a built-in instrument's knobs, under the lane's level
+                let knobs = st.inst_knobs(i);
+                if !knobs.is_empty() {
+                    fill_knobs(&ui, cx, &knobs);
+                    ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, false);
+                    ui.button(cx, ids!(fx_remove)).set_visible(cx, false);
+                    show_fx = true;
+                }
             }
             Selection::Fx(lane, i) if i < st.project.chain(lane).len() => {
                 let fx = st.project.chain(lane)[i].clone();
@@ -1406,21 +1429,9 @@ impl App {
                     (None, false) => format!("   ·   edit {} to change it live", fx.file),
                 };
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
-                let knobs = st.fx_knobs(&fx.id);
-                let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
-                let boxes = [ids!(fx_b0), ids!(fx_b1), ids!(fx_b2), ids!(fx_b3), ids!(fx_b4), ids!(fx_b5)];
-                for (k, id) in sliders.iter().enumerate() {
-                    ui.view(cx, boxes[k]).set_visible(cx, k < knobs.len());
-                    let mut w = ui.widget(cx, *id);
-                    match knobs.get(k) {
-                        Some((name, value, min, max)) => {
-                            let (name, min, max) = (name.replace('_', " "), *min, *max);
-                            script_apply_eval!(cx, w, {text: #(name) min: #(min) max: #(max)});
-                            ui.slider(cx, *id).set_value(cx, *value);
-                        }
-                        None => {}
-                    }
-                }
+                fill_knobs(&ui, cx, &st.fx_knobs(&fx.id));
+                ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, true);
+                ui.button(cx, ids!(fx_remove)).set_visible(cx, true);
                 ui.check_box(cx, ids!(fx_bypass)).set_active(cx, fx.bypassed(), Animate::No);
                 show_fx = true;
             }
@@ -2095,6 +2106,14 @@ impl MatchEvent for App {
             }
         }
 
+        if let Selection::Track(lane) = st.sel {
+            let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
+            for (k, s) in sliders.iter().enumerate() {
+                if let Some(v) = ui.slider(cx, *s).slided(actions) {
+                    st.set_inst_knob(lane, k, v);
+                }
+            }
+        }
         if let Selection::Fx(lane, i) = st.sel {
             if let Some(id) = st.project.chain(lane).get(i).map(|f| f.id.clone()) {
                 let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
