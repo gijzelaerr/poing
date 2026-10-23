@@ -314,6 +314,18 @@ script_mod! {
                                 make_btn := PillButton{text: "Make it"}
                             }
                         }
+                        // a song to remix that already has a project: add to it, or start over
+                        remix_choice := View{
+                            visible: false
+                            width: Fit height: Fit flow: Right spacing: 10
+                            align: Align{y: 0.5}
+                            remix_choice_label := Label{
+                                text: ""
+                                draw_text +: {color: TEXT text_style: theme.font_regular{font_size: 10}}
+                            }
+                            remix_add_btn := PillButton{text: "Add the remixes to it"}
+                            remix_new_btn := PillButton{text: "Start a new project"}
+                        }
                         home_status := Label{
                             text: ""
                             draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9.5}}
@@ -446,6 +458,10 @@ pub struct App {
     /// Services open plugin windows (and knob moves waiting for a busy plugin).
     #[rust]
     plugin_pump: Timer,
+    /// A remix waiting for the answer to "this song already has a project":
+    /// (the song, the prompt, its existing project).
+    #[rust]
+    remix_choice: Option<(PathBuf, String, PathBuf)>,
 }
 
 /// The song a job belongs to, in front or in a background tab.
@@ -577,12 +593,19 @@ fn recent_songs() -> Vec<PathBuf> {
         .lines()
         .map(PathBuf::from)
         .filter(|p| p.exists())
+        // copies made by test runs live in the temp folder
+        .filter(|p| !p.starts_with(std::env::temp_dir()) && !p.to_string_lossy().to_lowercase().contains("\\appdata\\local\\temp\\"))
         .take(8)
         .collect()
 }
 
 fn remember_song(project: &Path) {
     let Some(dir) = config_dir() else { return };
+    // test runs (scratch copies in the temp folder) are not songs to come back to
+    let temp = std::env::temp_dir();
+    if project.starts_with(&temp) || std::fs::canonicalize(project).ok().zip(std::fs::canonicalize(&temp).ok()).is_some_and(|(p, t)| p.starts_with(t)) {
+        return;
+    }
     let plain = |p: PathBuf| match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
         // Windows canonical paths carry a verbatim prefix; keep the plain form
         Some(s) => PathBuf::from(s),
@@ -637,6 +660,32 @@ fn import(audio: &Path, sr: u32) -> Result<(PathBuf, bool), String> {
     Ok((project_file, true))
 }
 
+/// The project a song was imported into before, if any.
+fn existing_project(audio: &Path) -> Option<PathBuf> {
+    let name = audio.file_stem()?.to_str()?;
+    Some(audio.with_file_name(format!("{name}.poing")).join("project.json")).filter(|p| p.exists())
+}
+
+/// Import a song into a new project next to it even when one exists
+/// (`<song> 2.poing`, `<song> 3.poing`, ...). Returns the project file.
+fn import_new(audio: &Path, sr: u32) -> Result<PathBuf, String> {
+    let name = audio.file_stem().and_then(|s| s.to_str()).ok_or("bad file name")?.to_string();
+    let bundle = (2..1000)
+        .map(|n| audio.with_file_name(format!("{name} {n}.poing")))
+        .find(|b| !b.exists())
+        .ok_or("no free project name")?;
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("create {}: {e}", bundle.display()))?;
+    let ext = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav").to_ascii_lowercase();
+    let source = format!("original.{ext}");
+    std::fs::copy(audio, bundle.join(&source)).map_err(|e| format!("copy {}: {e}", audio.display()))?;
+    let original = audio::load_stem(&bundle.join(&source), sr)?;
+    let duration = original.l.len() as f64 / sr as f64;
+    let project_file = bundle.join("project.json");
+    let title = bundle.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(name);
+    Project::import(&title, &source, duration, sr).save(&project_file)?;
+    Ok(project_file)
+}
+
 /// "E minor · 125 bpm · 2:14": what the analysis found, under the title.
 fn song_meta(p: &Project) -> String {
     let mut parts = Vec::new();
@@ -657,6 +706,12 @@ fn show_title(ui: &WidgetRef, cx: &mut Cx, p: &Project) {
     ui.label(cx, ids!(project_meta)).set_text(cx, &song_meta(p));
 }
 
+/// A remix prompt cut to a chip's length ("80s disco techno, femal…").
+fn short_prompt(prompt: &str) -> String {
+    let p = prompt.trim();
+    if p.chars().count() <= 24 { p.to_string() } else { format!("{}…", p.chars().take(23).collect::<String>().trim_end()) }
+}
+
 /// The remix asked for when the song was dropped (once it is understood):
 /// three ACE-Step covers, close to free, each a song take.
 fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
@@ -666,10 +721,8 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
     let a = st.project.analysis.clone().unwrap_or_default();
     let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
     let how = [(0.6, "close"), (0.45, "looser"), (0.3, "free")];
-    // numbered on from earlier remixes of this song
-    let before = st.project.takes().iter().filter(|t| t.engine == "acestep-cover").count();
     let mut takes = Vec::new();
-    for (k, (_, name)) in how.iter().enumerate() {
+    for (_, name) in how.iter() {
         let (id, seed) = st.project.next_take();
         takes.push(Take {
             file: format!("takes/{id}.wav"),
@@ -678,7 +731,8 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
             start: 0.0,
             end: 0.0,
             engine: "acestep-cover".into(),
-            prompt: format!("Remix {} · {name}", before + k + 1),
+            // the prompt names the batch: several remix batches stay apart
+            prompt: format!("{} · {name}", short_prompt(&prompt)),
             seed,
             track: None,
             blend: None,
@@ -1351,12 +1405,33 @@ impl App {
             ui.label(cx, ids!(home_error)).set_text(cx, "Say first how to remix it (the field on the Remix card), then drop the song again.");
             return;
         }
-        self.open(cx, Open::Audio(audio));
+        // made before: ask whether these remixes join that project or start a new one
+        if let Some(project) = existing_project(&audio) {
+            let takes = Project::load(&project).map(|p| p.takes().len()).unwrap_or(0);
+            let what = match takes {
+                0 => "a project".to_string(),
+                1 => "a project with 1 take".to_string(),
+                n => format!("a project with {n} takes"),
+            };
+            ui.label(cx, ids!(remix_choice_label)).set_text(cx, &format!("{} already has {what}.", song_name(&project)));
+            ui.view(cx, ids!(remix_choice)).set_visible(cx, true);
+            ui.label(cx, ids!(home_error)).set_text(cx, "");
+            self.remix_choice = Some((audio, prompt.trim().to_string(), project));
+            ui.redraw(cx);
+            return;
+        }
+        self.start_remix_of(cx, Open::Audio(audio), prompt.trim().to_string());
+    }
+
+    /// Open the song (`target`) and make its remixes once it is understood.
+    fn start_remix_of(&mut self, cx: &mut Cx, target: Open, prompt: String) {
+        self.ui.view(cx, ids!(remix_choice)).set_visible(cx, false);
+        self.open(cx, target);
         let Some(st) = self.state.as_mut() else { return };
-        st.pending_remix = Some(prompt.trim().to_string());
+        st.pending_remix = Some(prompt.clone());
         let status = match (&self.jobs, st.project.is_analysed()) {
             (Some(jobs), true) => start_remix(st, jobs),
-            _ => format!("Poing is listening to the song first; then it makes three remixes as \"{}\"", prompt.trim()),
+            _ => format!("Poing is listening to the song first; then it makes three remixes as \"{prompt}\""),
         };
         self.set_status(cx, &status);
     }
@@ -1999,6 +2074,24 @@ impl MatchEvent for App {
             let prompt = new_prompt.unwrap_or_else(|| ui.text_input(cx, ids!(new_input)).text());
             self.make_song(cx, &prompt);
             return;
+        }
+        // a remix of a song that already has a project: the answer
+        if ui.button(cx, ids!(remix_add_btn)).clicked(actions) {
+            if let Some((_, prompt, project)) = self.remix_choice.take() {
+                self.start_remix_of(cx, Open::Project(project), prompt);
+                self.refresh_inspector(cx);
+                return;
+            }
+        }
+        if ui.button(cx, ids!(remix_new_btn)).clicked(actions) {
+            if let Some((audio, prompt, _)) = self.remix_choice.take() {
+                match import_new(&audio, 48000) {
+                    Ok(project) => self.start_remix_of(cx, Open::Project(project), prompt),
+                    Err(e) => ui.label(cx, ids!(home_error)).set_text(cx, &format!("Could not start a new project: {e}")),
+                }
+                self.refresh_inspector(cx);
+                return;
+            }
         }
         // the start screen's file pickers, and what they chose
         if ui.button(cx, ids!(pick_split_btn)).clicked(actions) {
