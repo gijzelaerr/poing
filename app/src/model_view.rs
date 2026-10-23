@@ -19,6 +19,8 @@ pub enum Resume {
     Remix(PathBuf),
     /// Make a new song from this prompt.
     MakeSong(String),
+    /// Hand this free-form request to the assistant (it waited for its model).
+    Ask(PathBuf, String),
 }
 
 pub struct Offer {
@@ -190,6 +192,16 @@ impl App {
                 return;
             }
             Resume::Describe(p, text) if same_song(&st.path, &p) => describe(st, jobs, &text),
+            // as the Describe bar does it: describe() may hand it to the assistant
+            Resume::Ask(p, text) if same_song(&st.path, &p) && self.agent_rx.is_none() => {
+                st.agent_ok = true;
+                let note = describe(st, jobs, &text);
+                st.agent_ok = false;
+                if let Some(request) = st.ask_agent.take() {
+                    self.agent_rx = Some(crate::start_agent(st, request));
+                }
+                note
+            }
             Resume::Remix(p) if same_song(&st.path, &p) => match jobs {
                 Some(jobs) => start_remix(st, jobs),
                 None => return,

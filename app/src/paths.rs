@@ -72,6 +72,7 @@ pub fn dev_ready(feature: &str) -> bool {
     match feature {
         "analysis" => dev_sidecar(),
         "repaint" | "remix" | "new-song" => dev_acestep().is_some(),
+        "llm" => crate::llm::dev_model().is_some(),
         _ => false,
     }
 }

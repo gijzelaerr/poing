@@ -4,6 +4,8 @@
 //!     poing-engine install [--accept-licence]     download the analysis models (asks for licences first)
 //!     poing-engine analyze <audio> <bundle_dir>   stems, beats and lyrics
 //!     poing-engine lyrics <bundle_dir|vocals>      lyrics only, as JSON on stdout
+//!     poing-engine chat [model id | file.gguf]     the language model, JSON lines on stdin/stdout (chat.rs)
+//!     poing-engine llm-install [model id]          download a language model
 //!
 //! `analyze` writes `<bundle>/stems/{vocals,drums,bass,other}.wav` (BS-RoFormer)
 //! and `<bundle>/analysis.json` with tempo, beats and downbeats (Beat This!)
@@ -26,6 +28,7 @@
 //! It is a separate process so that poing itself never links CUDA, a model
 //! crash doesn't take the mix down, and the GPU memory is free again when it exits.
 
+mod chat;
 mod lyrics;
 mod models;
 
@@ -103,6 +106,23 @@ fn main() -> ExitCode {
         Some("install") => install(args.iter().any(|a| a == "--accept-licence" || a == "--accept-license")),
         Some("analyze") if args.len() == 3 => analyze(Path::new(&args[1]), Path::new(&args[2])),
         Some("lyrics") if args.len() == 2 => lyrics_only(Path::new(&args[1])),
+        Some("chat") => match chat::serve(args.get(1).map(String::as_str)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                emit("error", 0.0, &e);
+                ExitCode::FAILURE
+            }
+        },
+        Some("llm-install") => match Models::open().and_then(|m| m.llm_path(args.get(1).map(String::as_str), true)) {
+            Ok(path) => {
+                emit("done", 1.0, &path.display().to_string());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                emit("error", 0.0, &e);
+                ExitCode::FAILURE
+            }
+        },
         Some("quantize") if args.len() == 3 => match models::quantize_q8(Path::new(&args[1]), Path::new(&args[2])) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -111,7 +131,7 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: poing-engine status | install [--accept-licence] | analyze <audio> <bundle_dir> | lyrics <bundle_dir|vocals>");
+            eprintln!("usage: poing-engine status | install [--accept-licence] | analyze <audio> <bundle_dir> | lyrics <bundle_dir|vocals> | chat [model] | llm-install [model]");
             ExitCode::from(64)
         }
     }

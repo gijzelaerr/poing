@@ -29,6 +29,12 @@ const TURBO_ID: &str = "whisper-large-v3-turbo";
 const TURBO_FILE: &str = "ggml-large-v3-turbo.bin";
 const WHISPER_Q8: [&str; 2] = ["stt", "ggml-large-v3-q8_0.bin"];
 const VOCALS_ID: &str = makepad_ai_stems::VOCALS_MODEL_ID;
+/// Poing's language model (song sheets, MIDI parts, effects, the assistant)
+/// when none is named: a Qwen3.5 GGUF from the registry (Apache-2.0).
+pub const LLM_DEFAULT: &str = "qwen3.5-4b";
+/// The models Poing offers. Not the registry's qwen3.5-9b: its UD-Q4_K_XL
+/// file writes word salad on this Makepad pin's CUDA path.
+pub const LLM_MODELS: [&str; 1] = ["qwen3.5-4b"];
 
 /// Whisper large-v3 in ggml form, at the whisper.cpp commit the registry pins for turbo.
 fn whisper_v3() -> FileSpec {
@@ -121,6 +127,17 @@ struct Status {
     /// The second vocal separator for the lyrics (none: BS-RoFormer's vocal stem only).
     lyrics_vocals: Option<String>,
     licences: Vec<String>,
+    /// The language models, and which of them are on disk.
+    llm: Vec<LlmStatus>,
+}
+
+#[derive(SerJson)]
+struct LlmStatus {
+    id: String,
+    path: Option<String>,
+    bytes: u64,
+    vram_gb: f64,
+    default: bool,
 }
 
 fn env_path(var: &str) -> Option<Option<PathBuf>> {
@@ -216,8 +233,42 @@ impl Models {
                 WHISPER_V3_LICENCE.into(),
                 format!("{} ({})", vocals_licence(), if self.vocals_licence_accepted() { "accepted" } else { "not accepted" }),
             ],
+            llm: LLM_MODELS
+                .iter()
+                .filter_map(|id| {
+                    let (file, spec) = llm_file(id)?;
+                    Some(LlmStatus {
+                        id: id.to_string(),
+                        path: self.llm_installed(&file).map(|p| p.display().to_string()),
+                        bytes: file.size.unwrap_or(0),
+                        vram_gb: spec.vram_gb.unwrap_or(0.0),
+                        default: *id == LLM_DEFAULT,
+                    })
+                })
+                .collect(),
         }
         .serialize_json()
+    }
+
+    fn llm_installed(&self, file: &FileSpec) -> Option<PathBuf> {
+        let dest = file.dest_path(&self.weights);
+        content_is_verified(&dest, file.sha256.as_deref().unwrap_or_default(), file.size.unwrap_or_default()).then_some(dest)
+    }
+
+    /// The GGUF of language model `id` (the default when None):
+    /// `POING_LLM_MODEL` when it names a file, else the registry's file,
+    /// downloaded first when `download` is set (and it isn't there yet).
+    pub fn llm_path(&self, id: Option<&str>, download: bool) -> Result<PathBuf, String> {
+        if let Some(Some(p)) = env_path("POING_LLM_MODEL") {
+            return Ok(p);
+        }
+        let id = id.unwrap_or(LLM_DEFAULT);
+        let (file, _) = llm_file(id).ok_or_else(|| format!("{id}: not a language model in the registry"))?;
+        match self.llm_installed(&file) {
+            Some(p) => Ok(p),
+            None if download => self.download(&file),
+            None => Err(format!("{id} is not downloaded yet")),
+        }
     }
 
     /// Download whatever analysis model is missing. The licences of the
@@ -324,6 +375,14 @@ impl Models {
             .ensure_file(file, &self.weights, &mut |p: DownloadProgress| download_progress(&p.file, p.done, p.total.unwrap_or(0)), &CancelToken::new())
             .map_err(|e| e.to_string())
     }
+}
+
+/// The registry's GGUF of a text model (only that file: the vision
+/// projector next to it is not needed for text).
+fn llm_file(id: &str) -> Option<(FileSpec, makepad_ai_hub::registry::ModelSpec)> {
+    let spec = makepad_ai_hub::registry::embedded_registry().find(id)?.clone();
+    let file = spec.file_by_role("llm-gguf")?.clone();
+    Some((file, spec))
 }
 
 fn download_progress(file: &str, done: u64, total: u64) {

@@ -639,13 +639,13 @@ pub enum Job {
     Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
     /// Split `lane` into dry voice and echo; the dry voice is the take.
     Dereverb { bundle: PathBuf, take: Take, lane: PathBuf, sr: u32 },
-    /// Claude writes a MIDI part (its role) over a range of grid beats of the song.
+    /// The language model writes a MIDI part (its role) over a range of grid beats of the song.
     WriteMidi { bundle: PathBuf, request: String, role: String, sheet: String, bars: crate::midi_writer::Bars, range: (f64, f64) },
-    /// Claude writes an effect for a lane (None: the master).
+    /// The language model writes an effect for a lane (None: the master).
     WriteFx { bundle: PathBuf, lane: Option<usize>, request: String, context: String },
     /// A new part: lego plays it, then it is cleaned and fitted into the gaps.
     Layer { bundle: PathBuf, take: Take, lego: LegoJob, clean: LayerJob, sr: u32 },
-    /// A new song from a prompt: Claude writes its sheet, ACE-Step sings
+    /// A new song from a prompt: the language model writes its sheet, ACE-Step sings
     /// `count` versions into a new bundle in `dir`.
     Song { prompt: String, dir: PathBuf, count: usize, sr: u32 },
     /// The singing half of `Song`: ACE-Step sings `count` versions of the
@@ -774,6 +774,11 @@ impl Jobs {
 
 /// Run one job here, sending its updates to `tx` (the app's worker, or poing-node).
 pub fn run_job(job: Job, tx: &Sender<JobUpdate>) {
+    // ACE-Step, YuE2 and the analysis want the whole GPU: the language model
+    // is loaded again when it is next asked (Song releases it after its sheet)
+    if !matches!(job, Job::Render { .. } | Job::WriteFx { .. } | Job::WriteMidi { .. } | Job::Song { .. } | Job::Export(_)) {
+        crate::llm::release();
+    }
     match job {
         Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, tx),
         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, tx),
@@ -1015,6 +1020,12 @@ fn engine_command() -> Option<Command> {
     if std::env::var("POING_NATIVE").is_ok_and(|v| v == "0") {
         return None;
     }
+    engine_exe()
+}
+
+/// `poing-engine` whatever `POING_NATIVE` says (the language model has no
+/// Python fallback).
+pub(crate) fn engine_exe() -> Option<Command> {
     let exe = std::env::var_os("POING_ENGINE").map(PathBuf::from).or_else(|| {
         let name = if cfg!(windows) { "poing-engine.exe" } else { "poing-engine" };
         Some(std::env::current_exe().ok()?.parent()?.join(name))
@@ -1481,21 +1492,22 @@ fn run_song_job(job: &SongJob, progress: &dyn Fn(&str, f32), version: &dyn Fn(us
     run_uv_script(run, progress, 0.0, 1.0).map(|_| ())
 }
 
-/// A new song from a prompt: Claude writes the sheet, ACE-Step sings
+/// A new song from a prompt: the language model writes the sheet, ACE-Step sings
 /// `count` versions. The first becomes the song (a draft: nothing is
 /// analysed until a version is picked), the others its song takes.
 fn make_song(prompt: &str, dir: &Path, count: usize, sr: u32, tx: &Sender<JobUpdate>) {
     if let Some((bundle, seeds)) = prepare_song(prompt, dir, count, tx) {
+        crate::llm::release();
         sing_song(&bundle, count, seeds, sr, tx);
     }
 }
 
-/// The writing half of a new song: Claude writes the sheet into a new bundle
+/// The writing half of a new song: the language model writes the sheet into a new bundle
 /// in `dir` (sheet.json, lyrics.txt, prompt.txt). Returns the bundle and the
 /// versions' seeds; a failure is sent.
 pub fn prepare_song(prompt: &str, dir: &Path, count: usize, tx: &Sender<JobUpdate>) -> Option<(PathBuf, Vec<u64>)> {
     let fail = |why: String| send(tx, JobUpdate::Failed { bundle: PathBuf::new(), message: format!("The song could not be made: {why}") });
-    send(tx, JobUpdate::Starting { message: "Claude is writing the song".into(), progress: 0.0 });
+    send(tx, JobUpdate::Starting { message: format!("{} is writing the song", crate::llm::name()), progress: 0.0 });
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let sheet = match crate::song_writer::write_sheet(prompt, &dir.join(".drafts").join(stamp.to_string())) {
         Ok(s) => s,
