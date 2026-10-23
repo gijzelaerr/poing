@@ -509,6 +509,8 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
     let a = st.project.analysis.clone().unwrap_or_default();
     let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
     let how = [(0.6, "close"), (0.45, "looser"), (0.3, "free")];
+    // numbered on from earlier remixes of this song
+    let before = st.project.takes().iter().filter(|t| t.engine == "acestep-cover").count();
     let mut takes = Vec::new();
     for (k, (_, name)) in how.iter().enumerate() {
         let (id, seed) = st.project.next_take();
@@ -519,7 +521,7 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
             start: 0.0,
             end: 0.0,
             engine: "acestep-cover".into(),
-            prompt: format!("Remix {} · {name}", k + 1),
+            prompt: format!("Remix {} · {name}", before + k + 1),
             seed,
             track: None,
             blend: None,
@@ -588,6 +590,11 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     };
     if let Some((i, range)) = lane {
         return describe_lane(st, jobs, bundle, i, range, text);
+    }
+    // Without native YuE2 here, the whole song is remixed with ACE-Step instead.
+    if !audio::yue2_available() {
+        st.pending_remix = Some(text.to_string());
+        return start_remix(st, jobs);
     }
     // Key and tempo anchor the style, as in the cover that worked.
     let mut style = text.to_string();
@@ -978,6 +985,7 @@ impl App {
             }
             let sr = project.sr();
             let mut st = EditorState::new(project, path, stems, shared.clone());
+            st.restore_combined();
             // Analysed while another song was open: apply it from disk, no second run.
             let mut analyse = analyse;
             if analyse {

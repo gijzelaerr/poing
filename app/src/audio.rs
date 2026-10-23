@@ -955,6 +955,21 @@ fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     dirs.first().map(|e| e.path())
 }
 
+/// Can whole-song YuE2 covers run here: is `yue2_render` there (the named
+/// file, or on PATH) and are its weights in place? Otherwise Describe on the
+/// whole song uses ACE-Step.
+pub fn yue2_available() -> bool {
+    let exe_ok = match std::env::var_os("POING_YUE2_RENDER") {
+        Some(p) => Path::new(&p).is_file(),
+        None => {
+            let names: &[&str] = if cfg!(windows) { &["yue2_render.exe"] } else { &["yue2_render"] };
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| names.iter().any(|n| d.join(n).is_file()))
+        }
+    };
+    let weights = |var: &str, repo: &str| std::env::var_os(var).is_some() || hf_snapshot(repo).is_some();
+    exe_ok && weights("POING_YUE2_MODEL", "m-a-p/YuE2-3B") && weights("POING_YUE2_VAE", "m-a-p/YuE2-Vae")
+}
+
 /// Native YuE2 (Makepad's `yue2_render`): `POING_YUE2_RENDER`, else on PATH.
 /// Weights: `POING_YUE2_MODEL` / `POING_YUE2_VAE`, else the Hugging Face cache.
 fn yue2_command() -> Result<(Command, PathBuf, PathBuf), String> {
@@ -1340,8 +1355,12 @@ fn run_song_job(job: &SongJob, progress: &dyn Fn(&str, f32), version: &dyn Fn(us
 /// analysed until a version is picked), the others its song takes.
 fn make_song(prompt: &str, dir: &Path, count: usize, sr: u32, tx: &Sender<JobUpdate>) {
     use std::cell::RefCell;
-    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: PathBuf::new(), message: format!("The song could not be made: {why}") });
     let bundle_cell: RefCell<Option<PathBuf>> = RefCell::new(None);
+    // once version 1 has opened the song, a failure belongs to it (it clears its busy state)
+    let fail = |why: String| {
+        let bundle = bundle_cell.borrow().clone().unwrap_or_default();
+        send(tx, JobUpdate::Failed { bundle, message: format!("The song could not be made: {why}") })
+    };
     let progress = |message: &str, progress: f32| match bundle_cell.borrow().clone() {
         Some(bundle) => send(tx, JobUpdate::Progress { bundle, message: format!("Song  ·  {message}"), progress }),
         None => send(tx, JobUpdate::Starting { message: message.to_string(), progress }),

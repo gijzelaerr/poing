@@ -923,6 +923,17 @@ impl EditorState {
         Ok(name)
     }
 
+    /// Sections combined from remixes play again when the song is reopened
+    /// (the newest one per section wins, as when they were made).
+    pub fn restore_combined(&mut self) {
+        let picked: Vec<String> = self.project.takes().iter().filter(|t| t.engine == "copy").map(|t| t.id.clone()).collect();
+        for id in picked {
+            if !self.take_on(&id) {
+                self.toggle_take(&id);
+            }
+        }
+    }
+
     /// Copy the remix that is playing over section `i` into a section take:
     /// remixes line up with the song, so each section can come from another.
     pub fn use_remix_here(&mut self, i: usize) -> Result<String, String> {
@@ -958,12 +969,8 @@ impl EditorState {
         let what = take.prompt.clone();
         self.add_take(take, stem)?;
         // every section picked so far plays together (a song take would hide them)
-        let picked: Vec<String> = self.project.takes().iter().filter(|t| t.engine == "copy").map(|t| t.id.clone()).collect();
-        for id in picked {
-            if !self.take_on(&id) {
-                self.toggle_take(&id);
-            }
-        }
+        self.restore_combined();
+
         self.sel = Selection::Section(i);
         Ok(format!("{what}: the rest of the song plays as before. Pick another remix and section to combine more."))
     }
