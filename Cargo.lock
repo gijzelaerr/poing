@@ -137,6 +137,87 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "makepad-ai-beats"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-common",
+ "makepad-ai-loader",
+]
+
+[[package]]
+name = "makepad-ai-common"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-cuda",
+ "makepad-ai-llm",
+ "makepad-ai-loader",
+ "makepad-ai-metal",
+]
+
+[[package]]
+name = "makepad-ai-cuda"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-loader",
+ "makepad-windows-sys",
+]
+
+[[package]]
+name = "makepad-ai-hub"
+version = "0.3.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-common",
+ "makepad-audio-decode",
+ "makepad-base64",
+ "makepad-core-util",
+ "makepad-micro-serde",
+ "makepad-network",
+ "makepad-strict-json",
+ "makepad-video-flow",
+ "makepad-windows-sys",
+ "makepad-zip-file",
+ "makepad-zune-core",
+ "makepad-zune-jpeg",
+ "makepad-zune-png",
+]
+
+[[package]]
+name = "makepad-ai-llm"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-cuda",
+ "makepad-ai-loader",
+ "makepad-ai-metal",
+ "makepad-ai-vulkan",
+ "makepad-zune-png",
+]
+
+[[package]]
+name = "makepad-ai-loader"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-micro-serde",
+ "makepad-windows-sys",
+]
+
+[[package]]
+name = "makepad-ai-metal"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-cuda",
+ "makepad-ai-loader",
+ "makepad-objc-sys",
+ "smallvec 1.15.1",
+]
+
+[[package]]
 name = "makepad-ai-services"
 version = "0.1.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
@@ -145,6 +226,36 @@ dependencies = [
  "makepad-platform",
  "makepad-remote",
  "makepad-strict-json",
+]
+
+[[package]]
+name = "makepad-ai-speech"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-common",
+ "makepad-ai-cuda",
+ "makepad-ai-loader",
+ "makepad-ai-vulkan",
+ "makepad-objc-sys",
+]
+
+[[package]]
+name = "makepad-ai-stems"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-ai-common",
+ "makepad-ai-loader",
+]
+
+[[package]]
+name = "makepad-ai-vulkan"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-script",
+ "makepad-vulkan",
 ]
 
 [[package]]
@@ -188,6 +299,11 @@ source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9
 
 [[package]]
 name = "makepad-byteorder-lite"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+
+[[package]]
+name = "makepad-core-util"
 version = "0.1.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
 
@@ -670,6 +786,11 @@ version = "0.1.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
 
 [[package]]
+name = "makepad-video-flow"
+version = "0.1.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+
+[[package]]
 name = "makepad-vulkan"
 version = "0.1.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
@@ -826,6 +947,14 @@ dependencies = [
 name = "makepad-windows-sys"
 version = "0.1.0"
 source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+
+[[package]]
+name = "makepad-zip-file"
+version = "1.0.0"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9b4def65ecf273d2aaa0b98a10bb60ff8348d26f"
+dependencies = [
+ "makepad-fast-inflate",
+]
 
 [[package]]
 name = "makepad-zune-bmp"
@@ -1055,6 +1184,19 @@ dependencies = [
  "makepad-widgets",
  "poing-model",
  "vst3-host",
+]
+
+[[package]]
+name = "poing-engine"
+version = "0.1.0"
+dependencies = [
+ "makepad-ai-beats",
+ "makepad-ai-hub",
+ "makepad-ai-speech",
+ "makepad-ai-stems",
+ "makepad-audio-decode",
+ "makepad-micro-serde",
+ "poing-model",
 ]
 
 [[package]]

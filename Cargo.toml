@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "model"]
+members = ["app", "model", "engine"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,12 @@ makepad-micro-serde = { git = "https://github.com/gijzelaerr/makepad.git", tag =
 makepad-script-audio-aot = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 # Poing as an AI service: tools an agent calls (makepad-remote mcp poing).
 makepad-ai-services = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+# poing-engine: native models (stems, beats, Whisper) on Makepad's ggml/CUDA/Metal
+# runtime, in a helper process so poing itself never links CUDA.
+makepad-ai-stems = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-ai-beats = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
+makepad-ai-speech = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021", default-features = false, features = ["whisper"] }
+makepad-ai-hub = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021", default-features = false, features = ["local"] }
 makepad-strict-json = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 
 # Makepad's own profiles: line tables for printf debugging, incremental release.
