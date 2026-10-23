@@ -1619,6 +1619,11 @@ impl App {
             ui.label(cx, ids!(home_error)).set_text(cx, "Say first what the song should be.");
             return;
         }
+        // Claude writes the words: without it the ACE-Step download would be for nothing
+        if !agent::claude_installed() {
+            ui.label(cx, ids!(home_error)).set_text(cx, "New songs need Claude Code to write the words: install it and sign in, then make it again.");
+            return;
+        }
         if self.needs_download(cx, "new-song", model_view::Resume::MakeSong(prompt.trim().to_string())) {
             return;
         }
@@ -1663,7 +1668,9 @@ impl App {
         self.note_request(&bundle, 0, "remix", &prompt, None, None);
         let Some(st) = self.state.as_mut() else { return };
         st.pending_remix = Some(prompt.clone());
-        let status = match (&self.jobs, st.project.is_analysed()) {
+        // not analysed and not being analysed (its download was declined): remix as it is
+        let now = st.project.is_analysed() || st.analysing.is_none();
+        let status = match (&self.jobs, now) {
             (Some(jobs), true) => start_remix(st, jobs),
             _ => format!("Poing is listening to the song first; then it makes three remixes as \"{prompt}\""),
         };

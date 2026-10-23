@@ -263,7 +263,9 @@ pub fn offer_text(feature_id: &str) -> Option<String> {
     let mut licences: Vec<&str> = packs.iter().map(|p| p.licence.as_str()).collect();
     licences.dedup();
     let nc = if packs.iter().any(|p| !p.commercial) { "; personal, non-commercial use only" } else { "" };
-    Some(format!("{title} needs a download: {} ({}, {} licence{nc}). Download?", names.join(" + "), gb(bytes), licences.join(", ")))
+    // SheetSage2 and Demucs decode with the ffmpeg CLI, which no pack brings yet
+    let ffmpeg = if feature_id == "analysis" && crate::audio::ffmpeg().is_none() { " It also needs ffmpeg on PATH for now." } else { "" };
+    Some(format!("{title} needs a download: {} ({}, {} licence{nc}).{ffmpeg} Download?", names.join(" + "), gb(bytes), licences.join(", ")))
 }
 
 // ------------------------------------------------------------- downloading

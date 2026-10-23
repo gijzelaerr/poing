@@ -777,7 +777,7 @@ fn send(tx: &Sender<JobUpdate>, u: JobUpdate) {
     SignalToUI::set_ui_signal();
 }
 
-fn ffmpeg() -> Option<PathBuf> {
+pub(crate) fn ffmpeg() -> Option<PathBuf> {
     let mut candidates = vec![PathBuf::from("ffmpeg")];
     if let Ok(p) = std::env::var("FFMPEG") {
         candidates.insert(0, PathBuf::from(p));
