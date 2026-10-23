@@ -7,8 +7,13 @@
 //!
 //! `analyze` writes `<bundle>/stems/{vocals,drums,bass,other}.wav` (BS-RoFormer)
 //! and `<bundle>/analysis.json` with tempo, beats and downbeats (Beat This!)
-//! and lyrics (Whisper on the vocal stem, see `lyrics.rs`: timed to the
-//! bundle's lyrics.txt when it has one). Sections, key and chords are not
+//! and lyrics (Whisper, see `lyrics.rs`: timed to the bundle's lyrics.txt when
+//! it has one). Whisper hears the average of two separators' vocals,
+//! BS-RoFormer's stem and a vocals-only Mel-Band RoFormer's, kept as
+//! `<bundle>/lyrics/vocals.wav`: on It's Autumn that is 11% WER against 18%
+//! (BS-RoFormer) and 17% (Mel-Band) alone, see docs/ANALYSIS.md. The mix keeps
+//! BS-RoFormer's four lanes, which sum to the song. Without the Mel-Band
+//! weights, Whisper hears BS-RoFormer's vocal stem. Sections, key and chords are not
 //! native yet: the app runs `sidecar/poing_analyze.py --only structure` after
 //! this, which adds them to the same analysis.json.
 //!
@@ -25,7 +30,7 @@ mod lyrics;
 mod models;
 
 use makepad_ai_beats::BeatsModel;
-use makepad_ai_stems::{demix_all, StemsModel, StereoBuf, SAMPLE_RATE, STEM_NAMES};
+use makepad_ai_stems::{demix_all, demix_all_lanes, StemsModel, StereoBuf, VocalsModel, SAMPLE_RATE, STEM_NAMES};
 use makepad_micro_serde::*;
 use models::Models;
 use poing_model::LyricLine;
@@ -47,7 +52,7 @@ pub fn emit(stage: &str, progress: f64, message: &str) {
 }
 
 /// (stage, share of the native run's time) for one overall progress number.
-const STAGES: [(&str, f64); 3] = [("stems", 0.6), ("beats", 0.05), ("lyrics", 0.35)];
+const STAGES: [(&str, f64); 4] = [("stems", 0.45), ("vocals", 0.2), ("beats", 0.05), ("lyrics", 0.3)];
 
 fn overall(stage: &str, within: f64) -> f64 {
     let mut done = 0.0;
@@ -85,6 +90,8 @@ struct Provenance {
     stems: String,
     beats: String,
     lyrics: String,
+    /// The separator(s) whose vocal Whisper heard.
+    lyrics_vocals: String,
     language: Option<String>,
     seconds: f64,
 }
@@ -149,10 +156,16 @@ struct LyricsOnly {
     lyrics: Vec<LyricLine>,
 }
 
-/// Lyrics of a bundle that already has stems (its `stems/vocals.wav`, with its
-/// sheet.json and lyrics.txt), or of one vocal file, as JSON on stdout.
+/// Lyrics of a bundle that already has stems (its `lyrics/vocals.wav`, else
+/// `stems/vocals.wav`, with its sheet.json and lyrics.txt), or of one vocal
+/// file, as JSON on stdout.
 fn lyrics_only(path: &Path) -> ExitCode {
-    let (vocals, bundle) = if path.is_dir() { (path.join("stems").join("vocals.wav"), Some(path)) } else { (path.to_path_buf(), None) };
+    let (vocals, bundle) = if path.is_dir() {
+        let heard = path.join(LYRICS_VOCALS);
+        (if heard.is_file() { heard } else { path.join("stems").join("vocals.wav") }, Some(path))
+    } else {
+        (path.to_path_buf(), None)
+    };
     let result = Models::open().and_then(|m| m.analysis_paths()).and_then(|paths| {
         let track = decode(&vocals)?;
         let (lyrics, language) = lyrics::transcribe(&paths.whisper, &mono_at(&track.left, &track.right, SAMPLE_RATE, 16_000), bundle)?;
@@ -183,11 +196,11 @@ fn analyze(audio: &Path, bundle: &Path) -> ExitCode {
     // Load the separator first: it fails when there is no GPU store, before
     // anything is written.
     emit("start", 0.0, "Loading the stem separator");
-    let mut separator = match StemsModel::load(&paths.stems) {
+    let separator = match StemsModel::load(&paths.stems) {
         Ok(m) => m,
         Err(e) => return unavailable(format!("stems model: {e}")),
     };
-    match run(audio, bundle, &paths, &mut separator, began) {
+    match run(audio, bundle, &paths, separator, began) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             emit("error", 0.0, &e);
@@ -196,12 +209,17 @@ fn analyze(audio: &Path, bundle: &Path) -> ExitCode {
     }
 }
 
-fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, separator: &mut StemsModel, began: Instant) -> Result<(), String> {
+/// Where `analyze` keeps the vocal Whisper heard, when it is not a stem.
+const LYRICS_VOCALS: &str = "lyrics/vocals.wav";
+
+/// The models run one after the other and each is dropped before the next
+/// loads: on a 12 GB card they don't fit side by side.
+fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, mut separator: StemsModel, began: Instant) -> Result<(), String> {
     let track = decode(audio)?;
     let seconds = track.left.len() as f64 / SAMPLE_RATE as f64;
 
     emit("stems", overall("stems", 0.0), "Separating vocals, drums, bass and other");
-    let stems = demix_all(separator, &track, |done, total| {
+    let stems = demix_all(&mut separator, &track, |done, total| {
         emit("stems", overall("stems", done as f64 / total.max(1) as f64), &format!("Separating ({done}/{total})"));
     })
     .map_err(|e| format!("stems: {e}"))?;
@@ -210,10 +228,40 @@ fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, separator: &m
         let path = bundle.join("stems").join(format!("{name}.wav"));
         write_wav(&path, &stem.left, &stem.right, SAMPLE_RATE).map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    let vocals = &stems[STEM_NAMES.iter().position(|n| *n == "vocals").unwrap()];
-    let vocals_16k = mono_at(&vocals.left, &vocals.right, SAMPLE_RATE, 16_000);
-    drop(stems);
+    let stem_vocals = stems.into_iter().nth(STEM_NAMES.iter().position(|n| *n == "vocals").unwrap()).unwrap();
+    let mut vocals_16k = mono_at(&stem_vocals.left, &stem_vocals.right, SAMPLE_RATE, 16_000);
+    drop(separator);
     emit("stems", overall("stems", 1.0), "Stems ready");
+
+    let model_name = |p: &Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut lyrics_vocals = model_name(&paths.stems);
+    let heard = bundle.join(LYRICS_VOCALS);
+    let _ = std::fs::remove_file(&heard);
+    if let Some(checkpoint) = &paths.vocals {
+        emit("vocals", overall("vocals", 0.0), "Separating the voice for the lyrics");
+        // A failure here costs lyric quality, not the analysis: Whisper then hears the stem.
+        let separated = VocalsModel::load(checkpoint).and_then(|mut model| {
+            demix_all_lanes(&mut model, &track, |done, total| {
+                emit("vocals", overall("vocals", done as f64 / total.max(1) as f64), &format!("Separating the voice ({done}/{total})"));
+            })
+        });
+        match separated {
+            Ok(mut lanes) => {
+                // The two separators err differently; Whisper does best on their average.
+                let mel = lanes.remove(0);
+                let mean = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| 0.5 * (a + b)).collect::<Vec<f32>>();
+                let voice = StereoBuf { left: mean(&stem_vocals.left, &mel.left), right: mean(&stem_vocals.right, &mel.right) };
+                vocals_16k = mono_at(&voice.left, &voice.right, SAMPLE_RATE, 16_000);
+                lyrics_vocals = format!("mean of {lyrics_vocals} and {}", model_name(checkpoint));
+                if let Some(dir) = heard.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                write_wav(&heard, &voice.left, &voice.right, SAMPLE_RATE).map_err(|e| format!("{}: {e}", heard.display()))?;
+            }
+            Err(e) => emit("vocals", overall("vocals", 1.0), &format!("Voice separation failed ({e}); lyrics from the vocal stem")),
+        }
+    }
+    emit("vocals", overall("vocals", 1.0), "Voice ready");
 
     emit("beats", overall("beats", 0.0), "Finding beats and downbeats");
     let mono_22k = mono_at(&track.left, &track.right, SAMPLE_RATE, makepad_ai_beats::SAMPLE_RATE);
@@ -232,7 +280,6 @@ fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, separator: &m
     let (lines, language) = lyrics::transcribe(&paths.whisper, &vocals_16k, Some(bundle))?;
     emit("lyrics", overall("lyrics", 1.0), &format!("{} lyric lines", lines.len()));
 
-    let model_name = |p: &Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let analysis = NativeAnalysis {
         tempo,
         beats: beat_times,
@@ -248,6 +295,7 @@ fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, separator: &m
             stems: model_name(&paths.stems),
             beats: model_name(&paths.beats),
             lyrics: model_name(&paths.whisper),
+            lyrics_vocals,
             language,
             seconds: (seconds * 10.0).round() / 10.0,
         },

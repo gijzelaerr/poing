@@ -56,6 +56,7 @@ Checked in `libs/ai/models` (fork `gijzelaerr/makepad`, `work` checkout at `2877
 - **Clean for a product:** ACE-Step 1.5 (MIT), Qwen3-Embedding (Apache), Whisper (Apache), Demucs (MIT), Basic Pitch (Apache).
 - **Non-commercial:** YuE2, SheetSage2, MERT. So today's "Understand" (sections, key, chords, score) is non-commercial, not just YuE2.
 - **Academic only:** BS-RoFormer 4-stem weights.
+- **Not cleared:** Mel-Band RoFormer vocals (KimberleyJSN), which the native engine uses for lyrics. The weights repository is tagged MIT, but its training data is undisclosed, so Makepad marks it not for commercial use.
 - **GPL-3.0 weights:** the de-reverb roformer. Downloading it at runtime is fine; bundling it would put GPL terms on the bundle.
 
 Personal use is fine for all of them. The default feature set must be the clean list; the rest is opt-in with a notice.

@@ -3,17 +3,20 @@
 //! shared `~/.makepad/weights` folder (`MAKEPAD_ASSET_AI_CACHE` moves it).
 //! Each model can also be pointed at a file directly with an env var.
 //!
-//! Two files are pinned here rather than in Makepad's registry: Whisper
+//! Three files are pinned here rather than in Makepad's registry: Whisper
 //! large-v3 (the registry has only turbo, which gets three times the lyric
-//! errors on sung vocals), and a Hugging Face mirror of the Beat This!
-//! checkpoint for when its home server is down. Both carry the size and
-//! SHA-256 the downloader checks. large-v3 is then converted to Q8_0 here
+//! errors on sung vocals), the vocals-only Mel-Band RoFormer whose vocal,
+//! averaged with BS-RoFormer's, is what Whisper hears (fewer lyric errors
+//! than either alone), and a Hugging Face mirror of the Beat This! checkpoint for
+//! when its home server is down. All carry the size and SHA-256 the
+//! downloader checks. large-v3 is then converted to Q8_0 here
 //! (`stt/ggml-large-v3-q8_0.bin`, same lyrics on the test songs in about
 //! half the time) and the f16 download is removed.
 
 use crate::emit;
 use makepad_ai_hub::backend::CancelToken;
 use makepad_ai_hub::download::{content_is_verified, DownloadProgress, Downloader};
+use makepad_ai_hub::license::LicenseStore;
 use makepad_ai_hub::local::{GraphDevice, InstallMsg, InstallState, LocalModels};
 use makepad_ai_hub::registry::FileSpec;
 use makepad_micro_serde::*;
@@ -25,6 +28,7 @@ const BEATS_ID: &str = "beat-this";
 const TURBO_ID: &str = "whisper-large-v3-turbo";
 const TURBO_FILE: &str = "ggml-large-v3-turbo.bin";
 const WHISPER_Q8: [&str; 2] = ["stt", "ggml-large-v3-q8_0.bin"];
+const VOCALS_ID: &str = makepad_ai_stems::VOCALS_MODEL_ID;
 
 /// Whisper large-v3 in ggml form, at the whisper.cpp commit the registry pins for turbo.
 fn whisper_v3() -> FileSpec {
@@ -52,6 +56,29 @@ fn beats_mirror() -> FileSpec {
     )
 }
 
+/// KimberleyJSN's vocals-only Mel-Band RoFormer, the checkpoint Makepad's
+/// `melband::VocalsModel` was ported against.
+fn melband_vocals() -> FileSpec {
+    pinned(
+        "KimberleyJSN/melbandroformer",
+        "MelBandRoformer.ckpt",
+        "ac9b0614ab3cd7f77219e18ba494dfd93956c348",
+        "stems/MelBandRoformer.ckpt",
+        makepad_ai_stems::VOCALS_MODEL_BYTES,
+        makepad_ai_stems::VOCALS_MODEL_SHA256,
+    )
+}
+/// Not in the registry, so its licence is accepted in the registry's licence
+/// store under this text: a new checkpoint or licence line asks again.
+fn vocals_licence() -> String {
+    format!(
+        "{VOCALS_ID}: {} ({}), sha256 {}",
+        makepad_ai_stems::VOCALS_MODEL_LICENSE,
+        if makepad_ai_stems::VOCALS_MODEL_COMMERCIAL_USE { "commercial use allowed" } else { "not cleared for commercial use" },
+        makepad_ai_stems::VOCALS_MODEL_SHA256
+    )
+}
+
 fn pinned(repo: &str, path: &str, revision: &str, cache_as: &str, size: u64, sha256: &str) -> FileSpec {
     FileSpec {
         role: None,
@@ -72,6 +99,8 @@ pub struct AnalysisPaths {
     pub stems: PathBuf,
     pub beats: PathBuf,
     pub whisper: PathBuf,
+    /// The second vocal separator for the lyrics. Without it, Whisper hears BS-RoFormer's vocal stem.
+    pub vocals: Option<PathBuf>,
 }
 
 pub struct Models {
@@ -89,6 +118,8 @@ struct Status {
     stems: Option<String>,
     beats: Option<String>,
     lyrics: Option<String>,
+    /// The second vocal separator for the lyrics (none: BS-RoFormer's vocal stem only).
+    lyrics_vocals: Option<String>,
     licences: Vec<String>,
 }
 
@@ -111,6 +142,18 @@ impl Models {
 
     fn beats(&self) -> Option<PathBuf> {
         env_path("POING_BEATS_MODEL").unwrap_or_else(|| self.local.installed_path(BEATS_ID, "weights"))
+    }
+
+    fn vocals(&self) -> Option<PathBuf> {
+        env_path("POING_VOCALS_MODEL").unwrap_or_else(|| {
+            let spec = melband_vocals();
+            let dest = spec.dest_path(&self.weights);
+            content_is_verified(&dest, spec.sha256.as_deref().unwrap_or_default(), spec.size.unwrap_or_default()).then_some(dest)
+        })
+    }
+
+    fn vocals_licence_accepted(&self) -> bool {
+        LicenseStore::open().is_ok_and(|store| store.acknowledged(VOCALS_ID, &vocals_licence()))
     }
 
     fn whisper_v3(&self) -> Option<PathBuf> {
@@ -142,7 +185,7 @@ impl Models {
             .map(|(_, task)| *task)
             .collect();
         match (stems, beats, whisper) {
-            (Some(stems), Some(beats), Some(whisper)) => Ok(AnalysisPaths { stems, beats, whisper }),
+            (Some(stems), Some(beats), Some(whisper)) => Ok(AnalysisPaths { stems, beats, whisper, vocals: self.vocals() }),
             _ => Err(format!("native models not installed for {} (run `poing-engine install`)", missing.join(", "))),
         }
     }
@@ -166,14 +209,21 @@ impl Models {
             stems: show(self.stems()),
             beats: show(self.beats()),
             lyrics: show(self.whisper()),
-            licences: vec![licence(STEMS_ID), licence(BEATS_ID), WHISPER_V3_LICENCE.into()],
+            lyrics_vocals: show(self.vocals()),
+            licences: vec![
+                licence(STEMS_ID),
+                licence(BEATS_ID),
+                WHISPER_V3_LICENCE.into(),
+                format!("{} ({})", vocals_licence(), if self.vocals_licence_accepted() { "accepted" } else { "not accepted" }),
+            ],
         }
         .serialize_json()
     }
 
-    /// Download whatever analysis model is missing. The registry models'
-    /// licences must be accepted first: the BS-RoFormer checkpoint is for
-    /// academic use only.
+    /// Download whatever analysis model is missing. The licences of the
+    /// separators must be accepted first: the BS-RoFormer checkpoint is for
+    /// academic use only, and the Mel-Band RoFormer's training data is not
+    /// disclosed.
     pub fn install(&mut self, accept: bool) -> Result<(), String> {
         let mut todo = Vec::new();
         if self.stems().is_none() {
@@ -193,6 +243,16 @@ impl Models {
             }
             self.local.acknowledge_license(id).map_err(|e| format!("{id}: {e}"))?;
         }
+        let want_vocals = self.vocals().is_none();
+        if want_vocals && !self.vocals_licence_accepted() {
+            eprintln!("{}
+  {}", vocals_licence(), makepad_ai_stems::VOCALS_MODEL_SOURCE);
+            if !accept {
+                return Err(format!("{VOCALS_ID} needs its licence accepted: read it above, then run `poing-engine install --accept-licence`"));
+            }
+            let mut store = LicenseStore::open().map_err(|e| format!("{VOCALS_ID}: {e}"))?;
+            store.acknowledge(VOCALS_ID, &vocals_licence()).map_err(|e| format!("{VOCALS_ID}: {e}"))?;
+        }
         let mut errors = Vec::new();
         for id in todo {
             if let Err(e) = self.install_registry(id) {
@@ -202,6 +262,11 @@ impl Models {
                     emit("install", 0.0, &format!("{id} failed: {e}"));
                     errors.push(format!("{id}: {e}"));
                 }
+            }
+        }
+        if want_vocals {
+            if let Err(e) = self.download(&melband_vocals()) {
+                errors.push(format!("{VOCALS_ID}: {e}"));
             }
         }
         if self.whisper_q8().is_none() {
