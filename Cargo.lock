@@ -1195,6 +1195,7 @@ dependencies = [
  "makepad-ai-speech",
  "makepad-ai-stems",
  "makepad-audio-decode",
+ "makepad-fast-inflate",
  "makepad-micro-serde",
  "poing-model",
 ]

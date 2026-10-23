@@ -24,6 +24,8 @@ makepad-ai-services = { git = "https://github.com/gijzelaerr/makepad.git", tag =
 makepad-ai-stems = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 makepad-ai-beats = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 makepad-ai-speech = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021", default-features = false, features = ["whisper"] }
+# Its zlib, to spot Whisper stuck in a loop (as the sidecar does).
+makepad-fast-inflate = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 makepad-ai-hub = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021", default-features = false, features = ["local"] }
 makepad-strict-json = { git = "https://github.com/gijzelaerr/makepad.git", tag = "poing-pin-20261021" }
 

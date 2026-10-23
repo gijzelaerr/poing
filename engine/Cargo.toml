@@ -13,3 +13,4 @@ makepad-ai-stems.workspace = true
 makepad-ai-beats.workspace = true
 makepad-ai-speech.workspace = true
 makepad-ai-hub.workspace = true
+makepad-fast-inflate.workspace = true

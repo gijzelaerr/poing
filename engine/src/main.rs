@@ -3,10 +3,12 @@
 //!     poing-engine status                         which native models are installed, and the GPU store
 //!     poing-engine install [--accept-licence]     download the analysis models (asks for licences first)
 //!     poing-engine analyze <audio> <bundle_dir>   stems, beats and lyrics
+//!     poing-engine lyrics <bundle_dir|vocals>      lyrics only, as JSON on stdout
 //!
 //! `analyze` writes `<bundle>/stems/{vocals,drums,bass,other}.wav` (BS-RoFormer)
 //! and `<bundle>/analysis.json` with tempo, beats and downbeats (Beat This!)
-//! and lyrics (Whisper on the vocal stem). Sections, key and chords are not
+//! and lyrics (Whisper on the vocal stem, see `lyrics.rs`: timed to the
+//! bundle's lyrics.txt when it has one). Sections, key and chords are not
 //! native yet: the app runs `sidecar/poing_analyze.py --only structure` after
 //! this, which adds them to the same analysis.json.
 //!
@@ -102,7 +104,7 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: poing-engine status | install [--accept-licence] | analyze <audio> <bundle_dir> | lyrics <vocals>");
+            eprintln!("usage: poing-engine status | install [--accept-licence] | analyze <audio> <bundle_dir> | lyrics <bundle_dir|vocals>");
             ExitCode::from(64)
         }
     }
@@ -147,12 +149,13 @@ struct LyricsOnly {
     lyrics: Vec<LyricLine>,
 }
 
-/// Lyrics of a vocal stem, as JSON on stdout (for trying lyric settings on a
-/// song that already has stems).
-fn lyrics_only(vocals: &Path) -> ExitCode {
+/// Lyrics of a bundle that already has stems (its `stems/vocals.wav`, with its
+/// sheet.json and lyrics.txt), or of one vocal file, as JSON on stdout.
+fn lyrics_only(path: &Path) -> ExitCode {
+    let (vocals, bundle) = if path.is_dir() { (path.join("stems").join("vocals.wav"), Some(path)) } else { (path.to_path_buf(), None) };
     let result = Models::open().and_then(|m| m.analysis_paths()).and_then(|paths| {
-        let track = decode(vocals)?;
-        let (lyrics, language) = lyrics::transcribe(&paths.whisper, &mono_at(&track.left, &track.right, SAMPLE_RATE, 16_000))?;
+        let track = decode(&vocals)?;
+        let (lyrics, language) = lyrics::transcribe(&paths.whisper, &mono_at(&track.left, &track.right, SAMPLE_RATE, 16_000), bundle)?;
         Ok(LyricsOnly { language, lyrics })
     });
     match result {
@@ -226,7 +229,7 @@ fn run(audio: &Path, bundle: &Path, paths: &models::AnalysisPaths, separator: &m
     emit("beats", overall("beats", 1.0), &format!("{} beats, {} bpm", beat_times.len(), tempo.map_or("?".into(), |t| t.to_string())));
 
     emit("lyrics", overall("lyrics", 0.0), "Transcribing lyrics");
-    let (lines, language) = lyrics::transcribe(&paths.whisper, &vocals_16k)?;
+    let (lines, language) = lyrics::transcribe(&paths.whisper, &vocals_16k, Some(bundle))?;
     emit("lyrics", overall("lyrics", 1.0), &format!("{} lyric lines", lines.len()));
 
     let model_name = |p: &Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
