@@ -22,3 +22,36 @@ makepad-zip-file.workspace = true
 # engine drives it); process isolation runs a plugin in a helper process.
 [target.'cfg(windows)'.dependencies]
 vst3-host = { version = "0.10", default-features = false, features = ["process-isolation"] }
+
+# The installer (docs/INSTALL.md I1): `cargo packager -p poing --release`, after
+# a release build of the workspace and with the pinned uv in target/packaging/uv
+# (CI fetches it). A per-user NSIS installer, unsigned until M8. Paths are
+# relative to this file.
+[package.metadata.packager]
+productName = "Poing"
+identifier = "com.github.gijzelaerr.poing"
+publisher = "Gijs Molenaar"
+description = "AI-native music workstation"
+homepage = "https://github.com/gijzelaerr/poing"
+outDir = "../target/release"
+formats = ["nsis"]
+licenseFile = "../LICENSE"
+binaries = [
+    { path = "poing", main = true },
+    # The CPU stub in CI (no CUDA toolkit on the runners): analysis then uses Python.
+    { path = "poing-engine" },
+]
+resources = [
+    { src = "../sidecar/*.py", target = "sidecar" },
+    { src = "../sidecar/pyproject.toml", target = "sidecar/pyproject.toml" },
+    { src = "../sidecar/uv.lock", target = "sidecar/uv.lock" },
+    { src = "../target/packaging/uv/uv.exe", target = "uv.exe" },
+    { src = "../LICENSE", target = "LICENSE" },
+    { src = "../packaging/NOTICE.md", target = "NOTICE.md" },
+    { src = "../packaging/licences/*", target = "licences" },
+]
+
+[package.metadata.packager.nsis]
+installMode = "currentUser"
+# Uninstall asks (default no) whether to remove the downloaded models too.
+appdataPaths = ["$LOCALAPPDATA/Poing"]
