@@ -356,8 +356,13 @@ def words_to_lines(words):
         if line[-1]["end"] - line[0]["start"] <= 10.0 or len(line) < 6:
             done.append(line)
             continue
-        cut = max(range(3, len(line) - 2), key=lambda i: (line[i]["start"] - line[i - 1]["end"],
-                                                          line[i - 1]["text"][-1] in ",;:"))
+        # the longest pause (a comma first) that leaves each half at least a third of the line
+        t0, t1 = line[0]["start"], line[-1]["end"]
+        fair = [i for i in range(1, len(line)) if min(line[i]["start"] - t0, t1 - line[i]["start"]) >= (t1 - t0) / 3]
+        if fair:
+            cut = max(fair, key=lambda i: (line[i - 1]["text"][-1] in ",;:", line[i]["start"] - line[i - 1]["end"]))
+        else:
+            cut = min(range(1, len(line)), key=lambda i: abs(line[i]["start"] - (t0 + t1) / 2))
         lines[:0] = [line[:cut], line[cut:]]
     return [{"start": l[0]["start"], "end": l[-1]["end"], "text": " ".join(w["text"] for w in l)} for l in done]
 
