@@ -174,6 +174,9 @@ pub struct MixParams {
     pub gains: Vec<f32>,
     pub regions: Vec<MixRegion>,
     pub takes: [Option<MixTake>; MAX_ACTIVE_TAKES],
+    /// Only the lanes (with their lane takes and layers) are heard: section
+    /// takes still duck the lanes under them but are not added (a stem export).
+    pub lanes_only: bool,
 }
 
 impl MixParams {
@@ -210,7 +213,7 @@ impl MixParams {
                 fade_out: t.end < p.duration - 0.01,
             });
         }
-        Self { version, gains: p.track_gains(), regions, takes }
+        Self { version, gains: p.track_gains(), regions, takes, lanes_only: false }
     }
 
     pub fn song_take(&self) -> Option<MixTake> {
@@ -303,7 +306,7 @@ fn take_gain(mix: &MixParams, k: &MixTake, t: f64) -> f32 {
 }
 
 /// The lane a take plays on, if it belongs to one.
-fn take_lane(k: &MixTake) -> Option<usize> {
+pub(crate) fn take_lane(k: &MixTake) -> Option<usize> {
     match k.kind {
         TakeKind::Lane(lane) | TakeKind::Layer(Some(lane)) => Some(lane),
         _ => None,
@@ -451,7 +454,7 @@ pub fn mix_metered(
     }
     let routed = |k: &MixTake| take_lane(k).is_some_and(|lane| rack.as_ref().is_some_and(|r| r.lane_has_fx(lane)));
     for k in mix.takes.iter().flatten().filter(|k| k.touches(t0, t1) && !routed(k)) {
-        if k.kind == TakeKind::Song {
+        if k.kind == TakeKind::Song || (mix.lanes_only && take_lane(k).is_none()) {
             continue;
         }
         if let Some(s) = stems.get(k.stem) {
@@ -647,6 +650,8 @@ pub enum Job {
     Song { prompt: String, dir: PathBuf, count: usize, sr: u32 },
     /// Remixes of the song in `bundle` (ACE-Step cover), one song take each.
     Remix { bundle: PathBuf, takes: Vec<Take>, job: SongJob, sr: u32 },
+    /// Stems, MIDI files, a DAWproject or the DJ export (see `export`).
+    Export(Box<crate::export::ExportJob>),
 }
 
 /// What `sidecar/acestep_song.py` reads.
@@ -750,6 +755,7 @@ impl Jobs {
                         Job::WriteMidi { bundle, request, role, sheet, bars, range } => write_midi(&bundle, request, &role, &sheet, bars, range, &up_tx),
                         Job::Song { prompt, dir, count, sr } => make_song(&prompt, &dir, count, sr, &up_tx),
                         Job::Remix { bundle, takes, job, sr } => remix(&bundle, takes, job, sr, &up_tx),
+                        Job::Export(job) => crate::export::run(*job, &up_tx),
                     }
                     send(&up_tx, JobUpdate::JobDone { seq });
                 }
@@ -772,12 +778,12 @@ impl Jobs {
     }
 }
 
-fn send(tx: &Sender<JobUpdate>, u: JobUpdate) {
+pub(crate) fn send(tx: &Sender<JobUpdate>, u: JobUpdate) {
     let _ = tx.send(u);
     SignalToUI::set_ui_signal();
 }
 
-fn ffmpeg() -> Option<PathBuf> {
+pub(crate) fn ffmpeg() -> Option<PathBuf> {
     let mut candidates = vec![PathBuf::from("ffmpeg")];
     if let Ok(p) = std::env::var("FFMPEG") {
         candidates.insert(0, PathBuf::from(p));
@@ -790,6 +796,11 @@ fn ffmpeg() -> Option<PathBuf> {
 
 /// 24-bit stereo PCM WAV.
 pub fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::io::Result<()> {
+    std::fs::write(path, wav_bytes(l, r, sr, gain))
+}
+
+/// A 24-bit stereo PCM WAV file's bytes.
+pub fn wav_bytes(l: &[f32], r: &[f32], sr: u32, gain: f32) -> Vec<u8> {
     let frames = l.len().min(r.len());
     let data_len = (frames * 2 * 3) as u32;
     let mut b = Vec::with_capacity(44 + data_len as usize);
@@ -811,7 +822,7 @@ pub fn write_wav(path: &Path, l: &[f32], r: &[f32], sr: u32, gain: f32) -> std::
             b.extend_from_slice(&v.to_le_bytes()[..3]);
         }
     }
-    std::fs::write(path, b)
+    b
 }
 
 /// Full mix -> 24-bit WAV, then (when ffmpeg exists) two-pass loudnorm to
