@@ -146,47 +146,68 @@ impl Synth {
     }
 }
 
-/// A VST3 instrument in a MIDI lane (Windows for now). A rebuilt rack starts
-/// without its instance and takes it over from the rack it replaces.
+/// A VST3 instrument in a MIDI lane (Windows for now), shared with the UI
+/// (its editor). A rebuilt rack starts without it and takes it over from the
+/// rack it replaces.
 #[cfg(windows)]
 pub struct PluginSound {
     pub id: String,
-    pub hosted: Option<Box<crate::plugins::Hosted>>,
+    pub hosted: Option<crate::plugins::Shared>,
     buffers: vst3_host::audio::AudioBuffers,
     /// Notes the plugin holds, to release on a jump.
     held: [bool; 128],
+    /// Note events not yet given to the plugin (it was busy): (pitch, velocity, on).
+    /// Room made up front, so the audio thread never allocates.
+    queued: Vec<(u8, u8, bool)>,
 }
+
+/// Note events a plugin instrument can have waiting while it is busy.
+#[cfg(windows)]
+const QUEUE: usize = 1024;
 
 #[cfg(windows)]
 impl PluginSound {
     pub fn new(id: &str, sample_rate: u32) -> Self {
         let buffers = vst3_host::audio::AudioBuffers::new(0, 2, crate::fx::PLUGIN_BLOCK, sample_rate as f64);
-        PluginSound { id: id.to_string(), hosted: None, buffers, held: [false; 128] }
+        PluginSound { id: id.to_string(), hosted: None, buffers, held: [false; 128], queued: Vec::with_capacity(QUEUE) }
     }
 
     /// Take over the instance (and the notes it holds) of the lane this one replaces.
     pub fn take_over(&mut self, old: &mut PluginSound) {
         self.hosted = old.hosted.take();
         self.held = old.held;
+        for e in old.queued.drain(..) {
+            if self.queued.len() < QUEUE {
+                self.queued.push(e);
+            }
+        }
     }
 
     fn send(&mut self, pitch: u8, vel: f32, on: bool) {
-        use vst3_host::midi::{MidiChannel, MidiEvent};
-        let Some(plugin) = self.hosted.as_mut().and_then(|h| h.plugin.as_mut()) else { return };
         let note = pitch.min(127);
-        let event = if on {
-            MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity: (vel * 127.0).round().clamp(1.0, 127.0) as u8 }
-        } else {
-            MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
-        };
-        if plugin.send_midi_event_at(event, 0).is_ok() {
+        if self.queued.len() < QUEUE {
+            self.queued.push((note, (vel * 127.0).round().clamp(1.0, 127.0) as u8, on));
             self.held[note as usize] = on;
         }
     }
 
-    /// Add `l.len()` frames of the plugin's output into l/r.
+    /// Add `l.len()` frames of the plugin's output into l/r. The plugin busy
+    /// (the UI has it): silence for this stretch, its notes wait for the next.
     fn render(&mut self, l: &mut [f32], r: &mut [f32]) {
-        let Some(plugin) = self.hosted.as_mut().and_then(|h| h.plugin.as_mut()) else { return };
+        use vst3_host::midi::{MidiChannel, MidiEvent};
+        let Some(shared) = self.hosted.as_ref() else { return };
+        let Ok(mut plugin) = shared.try_lock() else {
+            crate::plugins::MISSED_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        for (note, velocity, on) in self.queued.drain(..) {
+            let event = if on {
+                MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity }
+            } else {
+                MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
+            };
+            let _ = plugin.send_midi_event_at(event, 0);
+        }
         let n = l.len().min(r.len());
         let mut done = 0;
         while done < n {
@@ -204,7 +225,6 @@ impl PluginSound {
         }
     }
 }
-
 /// What plays a MIDI lane: a Splash instrument or a plugin.
 pub enum Sound {
     Splash(Synth),

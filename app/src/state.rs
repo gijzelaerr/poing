@@ -76,21 +76,22 @@ pub struct EditorState {
     pub plugin_library: Vec<(String, PathBuf)>,
     /// Each plugin effect's parameters (by effect id).
     pub plugin_params: HashMap<String, Vec<PluginParam>>,
-    /// The UI's handle to each playing plugin (knob changes, teardown).
+    /// The UI's handle to each loaded plugin, effects by effect id and MIDI
+    /// lane instruments by track id: knobs, its editor window, its state.
     #[cfg(windows)]
-    plugin_controls: HashMap<String, vst3_host::realtime::RtControl>,
-    /// Plugin instances loaded but not yet in a rack.
+    plugins: HashMap<String, crate::plugins::Handle>,
+    /// Plugin effects loaded but not yet in a rack.
     #[cfg(windows)]
-    pending_runners: Vec<(String, Box<fx::Runner>)>,
-    /// Handles of plugins on their way out: they destroy their plugin here,
-    /// on the UI thread, once the audio thread has let go of it.
+    pending_runners: Vec<(String, crate::plugins::Shared)>,
+    /// Plugins on their way out: destroyed here, on the UI thread, once no
+    /// rack holds them any more.
     #[cfg(windows)]
-    retired_controls: Vec<(vst3_host::realtime::RtControl, Instant)>,
+    retiring: Vec<crate::plugins::Handle>,
     /// MIDI lanes played by a plugin: track id -> the plugin path loaded for it.
     pub inst_plugins: HashMap<String, String>,
     /// Plugin instruments loaded but not yet in a rack.
     #[cfg(windows)]
-    pending_insts: Vec<(String, Box<crate::plugins::Hosted>)>,
+    pending_insts: Vec<(String, crate::plugins::Shared)>,
     /// A plugin to play the MIDI part Claude is writing (named in the Describe).
     pub next_instrument: Option<(String, PathBuf)>,
     /// A remix asked for when the song was dropped: made once it is understood.
@@ -179,11 +180,11 @@ impl EditorState {
             plugin_library: crate::plugins::library(),
             plugin_params: HashMap::new(),
             #[cfg(windows)]
-            plugin_controls: HashMap::new(),
+            plugins: HashMap::new(),
             #[cfg(windows)]
             pending_runners: Vec::new(),
             #[cfg(windows)]
-            retired_controls: Vec::new(),
+            retiring: Vec::new(),
             inst_plugins: HashMap::new(),
             #[cfg(windows)]
             pending_insts: Vec::new(),
@@ -278,7 +279,11 @@ impl EditorState {
         let tracks: Vec<Track> = self.project.tracks.iter().filter(|t| t.is_midi()).cloned().collect();
         // plugin instruments no longer wanted (an undo) go with the next rack swap
         let wanted: Vec<(String, String)> = tracks.iter().filter_map(|t| Some((t.id.clone(), t.instrument.as_ref()?.plugin.clone()?))).collect();
-        self.inst_plugins.retain(|id, path| wanted.iter().any(|(i, p)| i == id && p == path));
+        let gone: Vec<String> = self.inst_plugins.iter().filter(|(id, path)| !wanted.iter().any(|(i, p)| i == *id && p == *path)).map(|(id, _)| id.clone()).collect();
+        for id in gone {
+            self.inst_plugins.remove(&id);
+            self.retire_plugin(&id);
+        }
         for t in tracks {
             let Some(inst) = &t.instrument else { continue };
             if let Some(path) = &inst.plugin {
@@ -383,16 +388,17 @@ impl EditorState {
     fn load_plugin_fx(&mut self, fx: &Fx) -> bool {
         #[cfg(windows)]
         {
-            if self.plugin_controls.contains_key(&fx.id) {
+            if self.plugins.contains_key(&fx.id) {
                 return true; // already playing: the rack keeps its instance
             }
             let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
-            match crate::plugins::load(&path, self.sr(), Some(fx)) {
-                Ok(loaded) => {
+            let state = self.plugin_state(&fx.id);
+            match crate::plugins::load(&path, self.sr(), Some(fx), state.as_deref(), false) {
+                Ok((handle, shared)) => {
                     self.fx_controls.insert(fx.id.clone(), FxControls::for_plugin(fx));
-                    self.plugin_params.insert(fx.id.clone(), loaded.params);
-                    self.plugin_controls.insert(fx.id.clone(), loaded.control);
-                    self.pending_runners.push((fx.id.clone(), loaded.runner));
+                    self.plugin_params.insert(fx.id.clone(), handle.params.clone());
+                    self.plugins.insert(fx.id.clone(), handle);
+                    self.pending_runners.push((fx.id.clone(), shared));
                     self.fx_errors.remove(&fx.id);
                     true
                 }
@@ -413,8 +419,69 @@ impl EditorState {
     fn retire_plugin(&mut self, id: &str) {
         self.plugin_params.remove(id);
         #[cfg(windows)]
-        if let Some(control) = self.plugin_controls.remove(id) {
-            self.retired_controls.push((control, Instant::now()));
+        if let Some(mut handle) = self.plugins.remove(id) {
+            handle.close_editor();
+            self.retiring.push(handle);
+        }
+    }
+
+    /// Where a plugin's saved state lives in the bundle.
+    fn plugin_state_file(&self, id: &str) -> PathBuf {
+        self.dir().join("plugins").join(format!("{id}.state"))
+    }
+
+    /// A plugin's saved state (presets, wavetables, all its parameters), if any.
+    fn plugin_state(&self, id: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.plugin_state_file(id)).ok()
+    }
+
+    /// Write every loaded plugin's state next to the project (on each save):
+    /// what is done in a plugin's own window survives reloads, undo, tabs and export.
+    fn save_plugin_states(&self) {
+        #[cfg(windows)]
+        for (id, h) in &self.plugins {
+            if let Some(bytes) = h.save_state() {
+                let file = self.plugin_state_file(id);
+                if let Some(dir) = file.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(file, bytes);
+            }
+        }
+    }
+
+    /// Open the window of plugin `id` (an effect id, or a MIDI lane's track id).
+    pub fn open_editor(&mut self, id: &str) -> Result<String, String> {
+        #[cfg(windows)]
+        {
+            let h = self.plugins.get_mut(id).ok_or("that plugin is not loaded")?;
+            h.open_editor()?;
+            return Ok(format!("{}'s own window is open; what you change there is saved with the song.", h.name));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            Err("plugin windows are Windows-only for now".into())
+        }
+    }
+
+    pub fn editors_open(&self) -> bool {
+        #[cfg(windows)]
+        return self.plugins.values().any(|h| h.editor_open());
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// Keep plugin windows and queued knob moves going (UI thread, often).
+    /// A window the user closed saves the plugin's state.
+    pub fn pump_plugins(&mut self) {
+        #[cfg(windows)]
+        {
+            crate::plugins::pump_window_messages();
+            let closed = self.plugins.values_mut().map(|h| h.pump()).fold(false, |a, b| a | b);
+            if closed {
+                self.save_plugin_states();
+            }
         }
     }
 
@@ -465,11 +532,13 @@ impl EditorState {
         #[cfg(windows)]
         for fx in self.all_fx().into_iter().filter(|f| f.plugin.is_some()) {
             let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
-            match crate::plugins::load(&path, self.sr(), Some(&fx)) {
-                Ok(loaded) => {
-                    let _ = rack.install(&fx.id, loaded.runner);
-                    // the render drops its rack on the worker; this destroys the plugin later
-                    self.retired_controls.push((loaded.control, Instant::now()));
+            // the state as it sounds now (unsaved edits too), else as saved
+            let state = self.plugins.get(&fx.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&fx.id));
+            match crate::plugins::load(&path, self.sr(), Some(&fx), state.as_deref(), false) {
+                Ok((handle, shared)) => {
+                    let _ = rack.install(&fx.id, shared);
+                    // the render lets go of it on the worker; it is destroyed here after
+                    self.retiring.push(handle);
                 }
                 Err(_) => missing.push(fx.name.clone()),
             }
@@ -477,9 +546,11 @@ impl EditorState {
         #[cfg(windows)]
         for t in self.project.tracks.iter().filter(|t| t.is_midi()) {
             let Some(inst) = t.instrument.as_ref().filter(|f| f.plugin.is_some()) else { continue };
-            match crate::plugins::load_instrument(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst)) {
-                Ok((hosted, _)) => {
-                    let _ = rack.install_instrument(&t.id, hosted);
+            let state = self.plugins.get(&t.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&t.id));
+            match crate::plugins::load(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst), state.as_deref(), true) {
+                Ok((handle, shared)) => {
+                    let _ = rack.install_instrument(&t.id, shared);
+                    self.retiring.push(handle);
                 }
                 Err(_) => missing.push(inst.name.clone()),
             }
@@ -494,12 +565,16 @@ impl EditorState {
         }
         #[cfg(windows)]
         {
-            match crate::plugins::load_instrument(std::path::Path::new(path), self.sr(), Some(inst)) {
-                Ok((hosted, params)) => {
-                    self.plugin_params.insert(id.to_string(), params);
+            // another plugin was playing this lane: it goes
+            self.retire_plugin(id);
+            let state = self.plugin_state(id).filter(|_| self.project.track_index(id).and_then(|l| self.project.tracks[l].instrument.as_ref()).and_then(|i| i.plugin.as_deref()) == Some(path));
+            match crate::plugins::load(std::path::Path::new(path), self.sr(), Some(inst), state.as_deref(), true) {
+                Ok((handle, shared)) => {
+                    self.plugin_params.insert(id.to_string(), handle.params.clone());
                     self.inst_plugins.insert(id.to_string(), path.to_string());
+                    self.plugins.insert(id.to_string(), handle);
                     self.pending_insts.retain(|(i, _)| i != id);
-                    self.pending_insts.push((id.to_string(), hosted));
+                    self.pending_insts.push((id.to_string(), shared));
                     self.fx_errors.remove(id);
                     true
                 }
@@ -539,18 +614,22 @@ impl EditorState {
         self.save()
     }
 
-    /// The plugin handles a song switch must keep alive until the audio
-    /// thread lets go of this song's rack.
+    /// The plugins a song switch must keep alive until the audio thread lets
+    /// go of this song's rack (their windows close, their state is saved).
     #[cfg(windows)]
-    pub fn take_plugin_controls(&mut self) -> Vec<vst3_host::realtime::RtControl> {
-        let mut out: Vec<_> = self.plugin_controls.drain().map(|(_, c)| c).collect();
-        out.extend(self.retired_controls.drain(..).map(|(c, _)| c));
+    pub fn take_plugin_controls(&mut self) -> Vec<crate::plugins::Handle> {
+        self.save_plugin_states();
+        let mut out: Vec<_> = self.plugins.drain().map(|(_, h)| h).collect();
+        for h in &mut out {
+            h.close_editor();
+        }
+        out.extend(self.retiring.drain(..));
         out
     }
 
     #[cfg(windows)]
-    pub fn adopt_plugin_controls(&mut self, controls: Vec<vst3_host::realtime::RtControl>) {
-        self.retired_controls.extend(controls.into_iter().map(|c| (c, Instant::now())));
+    pub fn adopt_plugin_controls(&mut self, handles: Vec<crate::plugins::Handle>) {
+        self.retiring.extend(handles);
     }
 
     /// Add an effect written as `code` to a lane (or the master).
@@ -590,8 +669,8 @@ impl EditorState {
             // a plugin knob: normalized 0..1, through the plugin's control queue
             let Some(p) = crate::plugins::knob_params(params).get(index).cloned() else { return };
             #[cfg(windows)]
-            if let Some(c) = self.plugin_controls.get_mut(id) {
-                c.set_parameter(p.id, value.clamp(0.0, 1.0));
+            if let Some(h) = self.plugins.get_mut(id) {
+                h.set_param(p.id, value);
             }
             if let Some((lane, i)) = self.project.find_fx(id) {
                 self.project.chain_mut(lane)[i].set_param(&p.name, value);
@@ -713,7 +792,7 @@ impl EditorState {
     /// plugin handles, the stem sets the audio thread may still hold).
     /// Its plugins are loaded again when it comes back.
     #[cfg(windows)]
-    pub fn deactivate(&mut self) -> (Vec<vst3_host::realtime::RtControl>, Vec<Stems>) {
+    pub fn deactivate(&mut self) -> (Vec<crate::plugins::Handle>, Vec<Stems>) {
         let controls = self.take_plugin_controls();
         (controls, self.go_back())
     }
@@ -819,14 +898,12 @@ impl EditorState {
         // handle stays a while for the swap to come round.
         #[cfg(windows)]
         {
-            for c in self.plugin_controls.values_mut() {
-                c.service_teardown();
+            // destroyed here once no rack (live or render) holds them
+            let (gone, keep): (Vec<_>, Vec<_>) = self.retiring.drain(..).partition(|h| h.released());
+            self.retiring = keep;
+            for h in gone {
+                h.shut_down();
             }
-            crate::plugins::bury();
-            self.retired_controls.retain_mut(|(c, since)| {
-                let destroyed = c.service_teardown();
-                !destroyed && since.elapsed().as_secs_f64() < 30.0
-            });
         }
         if !self.retired.is_empty()
             && self.shared.stems_seen.load(Ordering::Acquire) == self.shared.stems_gen.load(Ordering::Acquire)
@@ -1375,6 +1452,7 @@ impl EditorState {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
+        self.save_plugin_states();
         // Regions are kept in time order; a selected region stays selected.
         let selected = match self.sel {
             Selection::Region(i) => self.project.regions().get(i).map(|r| r.id.clone()),

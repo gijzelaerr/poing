@@ -46,10 +46,6 @@ impl FxControls {
     }
 }
 
-/// A VST3 plugin running in the rack (Windows for now).
-#[cfg(windows)]
-pub type Runner = vst3_host::realtime::RealtimePluginRunner;
-
 /// The block size plugins are set up for; lane audio is fed to them in
 /// blocks this long.
 pub const PLUGIN_BLOCK: usize = 1024;
@@ -66,10 +62,11 @@ enum Engine {
         applied: Box<[u32]>,
         frame: u32,
     },
-    /// A VST3 plugin. A rebuilt rack starts without one and takes it over
-    /// from the rack it replaces (`adopt`): never a reload.
+    /// A VST3 plugin (shared with the UI, which holds its editor). A rebuilt
+    /// rack starts without one and takes it over from the rack it replaces
+    /// (`adopt`): never a reload.
     #[cfg(windows)]
-    Plugin { runner: Option<Box<Runner>>, buffers: vst3_host::audio::AudioBuffers },
+    Plugin { plugin: Option<crate::plugins::Shared>, buffers: vst3_host::audio::AudioBuffers },
 }
 
 /// One playing effect.
@@ -102,7 +99,7 @@ impl FxUnit {
     #[cfg(windows)]
     pub fn plugin(id: &str, controls: Arc<FxControls>, sample_rate: u32) -> Self {
         let buffers = vst3_host::audio::AudioBuffers::new(2, 2, PLUGIN_BLOCK, sample_rate as f64);
-        FxUnit { id: id.to_string(), controls, engine: Engine::Plugin { runner: None, buffers } }
+        FxUnit { id: id.to_string(), controls, engine: Engine::Plugin { plugin: None, buffers } }
     }
 
 
@@ -115,9 +112,9 @@ impl FxUnit {
                 *frame = *old_frame;
             }
             #[cfg(windows)]
-            (Engine::Plugin { runner, .. }, Engine::Plugin { runner: old_runner, .. }) => {
-                if runner.is_none() {
-                    *runner = old_runner.take();
+            (Engine::Plugin { plugin, .. }, Engine::Plugin { plugin: old_plugin, .. }) => {
+                if plugin.is_none() {
+                    *plugin = old_plugin.take();
                 }
             }
             #[cfg(windows)]
@@ -157,8 +154,13 @@ impl FxUnit {
                 }
             }
             #[cfg(windows)]
-            Engine::Plugin { runner, buffers } => {
-                let Some(runner) = runner.as_mut() else { return };
+            Engine::Plugin { plugin, buffers } => {
+                let Some(plugin) = plugin.as_ref() else { return };
+                // the UI has it (its editor, a knob): this block passes through
+                let Ok(mut runner) = plugin.try_lock() else {
+                    crate::plugins::MISSED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
                 let n = l.len().min(r.len());
                 let mut done = 0;
                 while done < n {
@@ -166,7 +168,7 @@ impl FxUnit {
                     buffers.block_size = k;
                     buffers.inputs[0][..k].copy_from_slice(&l[done..done + k]);
                     buffers.inputs[1][..k].copy_from_slice(&r[done..done + k]);
-                    if runner.process(buffers).is_ok() {
+                    if runner.process_audio(buffers).is_ok() {
                         let (out_l, out_r) = (&buffers.outputs[0], &buffers.outputs[buffers.outputs.len().min(2) - 1]);
                         for j in 0..k {
                             l[done + j] = if out_l[j].is_finite() { out_l[j].clamp(-4.0, 4.0) } else { 0.0 };
@@ -262,7 +264,7 @@ impl FxRack {
 
     /// Give MIDI lane instrument `id` its plugin instance.
     #[cfg(windows)]
-    pub fn install_instrument(&mut self, id: &str, new: Box<crate::plugins::Hosted>) -> Result<(), Box<crate::plugins::Hosted>> {
+    pub fn install_instrument(&mut self, id: &str, new: crate::plugins::Shared) -> Result<(), crate::plugins::Shared> {
         for m in &mut self.midi {
             if let crate::synth::Sound::Plugin(p) = &mut m.sound {
                 if p.id == id {
@@ -276,7 +278,7 @@ impl FxRack {
 
     /// Take every plugin instrument out (see `take_runners`).
     #[cfg(windows)]
-    pub fn take_instruments(&mut self) -> Vec<(String, Box<crate::plugins::Hosted>)> {
+    pub fn take_instruments(&mut self) -> Vec<(String, crate::plugins::Shared)> {
         let mut out = Vec::new();
         for m in &mut self.midi {
             if let crate::synth::Sound::Plugin(p) = &mut m.sound {
@@ -290,10 +292,10 @@ impl FxRack {
 
     /// Give plugin unit `id` its instance (a newly loaded plugin).
     #[cfg(windows)]
-    pub fn install(&mut self, id: &str, new: Box<Runner>) -> Result<(), Box<Runner>> {
+    pub fn install(&mut self, id: &str, new: crate::plugins::Shared) -> Result<(), crate::plugins::Shared> {
         for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
-            if let (true, Engine::Plugin { runner, .. }) = (unit.id == id, &mut unit.engine) {
-                *runner = Some(new);
+            if let (true, Engine::Plugin { plugin, .. }) = (unit.id == id, &mut unit.engine) {
+                *plugin = Some(new);
                 return Ok(());
             }
         }
@@ -303,11 +305,11 @@ impl FxRack {
     /// Take every plugin instance out (a rack that never reached the audio
     /// thread hands them back instead of destroying them).
     #[cfg(windows)]
-    pub fn take_runners(&mut self) -> Vec<(String, Box<Runner>)> {
+    pub fn take_runners(&mut self) -> Vec<(String, crate::plugins::Shared)> {
         let mut out = Vec::new();
         for unit in self.lanes.iter_mut().flatten().chain(self.master.iter_mut()) {
-            if let Engine::Plugin { runner, .. } = &mut unit.engine {
-                if let Some(r) = runner.take() {
+            if let Engine::Plugin { plugin, .. } = &mut unit.engine {
+                if let Some(r) = plugin.take() {
                     out.push((unit.id.clone(), r));
                 }
             }

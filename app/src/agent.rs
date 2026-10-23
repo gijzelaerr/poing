@@ -193,6 +193,8 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         ("playing", Value::Bool(st.shared.playing())),
         ("playhead", f(st.playhead())),
         ("selected", json::s(selected)),
+        #[cfg(windows)]
+        ("plugin_missed_blocks", Value::Int(crate::plugins::MISSED_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) as i64)),
         ("lanes", Value::Arr(lanes)),
         ("master_effects", chain(None)),
         ("sections", Value::Arr(sections)),

@@ -1,6 +1,7 @@
-//! VST3 plugins as lane effects: the installed library (found on disk, never
-//! loaded to list it), loading an instance on the UI thread with its saved
-//! knob values, and what the UI keeps to drive it. Windows for now.
+//! VST3 plugins as lane effects and MIDI lane instruments: the installed
+//! library (found on disk, never loaded to list it), loading an instance on the
+//! UI thread with its saved state, and the UI's handle to it (knobs, its own
+//! editor window, state). Windows for now.
 
 use poing_model::Fx;
 use std::path::{Path, PathBuf};
@@ -55,23 +56,150 @@ fn host_for(sample_rate: u32) -> Result<vst3_host::Vst3Host, String> {
         .map_err(|e| e.to_string())
 }
 
-/// A plugin instance ready for the rack, and the UI's handle to it.
+/// A loaded plugin, shared by the UI (editor window, knobs, state, and the
+/// last reference: it is destroyed on the UI thread) and the rack, whose
+/// audio thread only ever `try_lock`s it (a missed block passes through).
 #[cfg(windows)]
-pub struct Loaded {
-    pub runner: Box<crate::fx::Runner>,
-    pub control: vst3_host::realtime::RtControl,
+pub type Shared = std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>;
+
+/// Blocks a plugin was busy for (the UI held it): passed through or silent.
+#[cfg(windows)]
+pub static MISSED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The UI's side of a loaded plugin: what it shows and changes.
+#[cfg(windows)]
+pub struct Handle {
+    pub plugin: Shared,
     pub params: Vec<PluginParam>,
+    pub name: String,
+    window: Option<vst3_host::PluginWindow>,
+    /// Knob moves the plugin was too busy to take yet: (id, value), newest per id.
+    pending: Vec<(u32, f64)>,
 }
 
-/// Load a plugin on this (the UI) thread, set its saved knob values, start
-/// it processing at `sample_rate` in PLUGIN_BLOCK blocks.
 #[cfg(windows)]
-pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>) -> Result<Loaded, String> {
-    use vst3_host::realtime::RealtimePluginRunner;
+impl Handle {
+    /// Turn a knob (normalized 0..1): now if the plugin is free, else on the next pump.
+    pub fn set_param(&mut self, id: u32, value: f64) {
+        self.pending.retain(|(i, _)| *i != id);
+        self.pending.push((id, value.clamp(0.0, 1.0)));
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if let Ok(mut p) = self.plugin.try_lock() {
+            for (id, v) in self.pending.drain(..) {
+                let _ = p.set_parameter(id, v);
+            }
+        }
+    }
+
+    /// The plugin's whole state (presets, wavetables, every parameter), if it is free.
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        self.plugin.try_lock().ok().and_then(|p| p.save_state().ok())
+    }
+
+    pub fn editor_open(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.is_open())
+    }
+
+    /// Open the plugin's own window (or bring it back).
+    pub fn open_editor(&mut self) -> Result<(), String> {
+        if self.editor_open() {
+            return Ok(());
+        }
+        let mut w = vst3_host::PluginWindow::new(self.plugin.clone());
+        w.open().map_err(|e| format!("{} has no window here: {e}", self.name))?;
+        self.window = Some(w);
+        Ok(())
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(mut w) = self.window.take() {
+            w.close();
+        }
+    }
+
+    /// Keep the editor window and queued knobs moving (UI thread, often).
+    /// True when the user closed the editor just now.
+    pub fn pump(&mut self) -> bool {
+        self.flush();
+        let Some(w) = &self.window else { return false };
+        let _ = w.service_platform_events();
+        if w.closed_by_user() {
+            self.close_editor();
+            return true;
+        }
+        false
+    }
+
+    /// Is the rack done with it (only this handle holds it)?
+    pub fn released(&self) -> bool {
+        std::sync::Arc::strong_count(&self.plugin) == 1
+    }
+
+    /// Destroy it here, on the UI thread (once [`Self::released`]).
+    pub fn shut_down(mut self) {
+        self.close_editor();
+        if let Ok(mut p) = self.plugin.lock() {
+            let _ = p.stop_processing();
+        }
+    }
+}
+
+/// Plugin windows are made on the app thread, but Makepad runs its Win32
+/// message loop on a thread of its own: without this nobody dispatches their
+/// messages (they paint, but take no clicks). Drains only this thread's
+/// queue, so Makepad's own windows are untouched. Call often while one is open.
+#[cfg(windows)]
+pub fn pump_window_messages() {
+    #[repr(C)]
+    struct Msg {
+        hwnd: *mut std::ffi::c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: [i32; 2],
+        private: u32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn PeekMessageW(msg: *mut Msg, hwnd: *mut std::ffi::c_void, min: u32, max: u32, remove: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> isize;
+    }
+    const PM_REMOVE: u32 = 1;
+    let mut msg = Msg { hwnd: std::ptr::null_mut(), message: 0, wparam: 0, lparam: 0, time: 0, pt: [0, 0], private: 0 };
+    // bounded: a window that floods its queue cannot hold the app thread
+    for _ in 0..256 {
+        // SAFETY: plain Win32 calls on a stack MSG for this thread's own queue.
+        unsafe {
+            if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+/// Load a plugin on this (the UI) thread: as a lane effect, or (`instrument`)
+/// to play a MIDI lane. Its saved state wins over its saved knob values.
+/// Returns the UI's handle and the rack's share of it.
+#[cfg(windows)]
+pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u8]>, instrument: bool) -> Result<(Handle, Shared), String> {
+    use vst3_host::audio::{BusDirection, MediaType};
     let mut host = host_for(sample_rate)?;
     let mut plugin = host.load_plugin(path).map_err(|e| format!("{} did not load: {e}", path.display()))?;
     let info = plugin.info().clone();
-    if info.category.contains("Instrument") && !info.category.contains("Fx") {
+    let is_instrument = info.category.contains("Instrument");
+    if instrument && !is_instrument {
+        return Err(format!("{} is not an instrument", info.name));
+    }
+    if !instrument && is_instrument && !info.category.contains("Fx") {
         return Err(format!("{} is an instrument; a lane takes effects", info.name));
     }
     let params: Vec<PluginParam> = plugin
@@ -80,91 +208,24 @@ pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>) -> Result<Loaded,
         .into_iter()
         .map(|p| PluginParam { id: p.id, name: p.name.clone(), default: p.value })
         .collect();
-    if let Some(fx) = saved {
+    let restored = state.is_some_and(|bytes| plugin.load_state(bytes).is_ok());
+    if let (false, Some(fx)) = (restored, saved) {
         for p in &params {
             if let Some(v) = fx.param(&p.name) {
                 let _ = plugin.set_parameter(p.id, v.clamp(0.0, 1.0));
             }
         }
     }
-    let (mut runner, control) = RealtimePluginRunner::new(plugin, 512);
-    runner.start().map_err(|e| format!("{} did not start: {e}", info.name))?;
-    Ok(Loaded { runner: Box::new(runner), control, params })
-}
-
-/// A plugin instrument owned by a MIDI lane in the rack. The audio thread
-/// sends it notes and runs it directly (a runner only takes MIDI from the UI
-/// side). Wherever it is dropped, its plugin goes back to the UI thread
-/// ([`bury`]) to be destroyed there, never on the audio thread.
-#[cfg(windows)]
-pub struct Hosted {
-    pub plugin: Option<vst3_host::Plugin>,
-}
-
-#[cfg(windows)]
-type Grave = (std::sync::mpsc::SyncSender<vst3_host::Plugin>, std::sync::Mutex<std::sync::mpsc::Receiver<vst3_host::Plugin>>);
-
-#[cfg(windows)]
-fn grave() -> &'static Grave {
-    static GRAVE: std::sync::OnceLock<Grave> = std::sync::OnceLock::new();
-    GRAVE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        (tx, std::sync::Mutex::new(rx))
-    })
-}
-
-#[cfg(windows)]
-impl Drop for Hosted {
-    fn drop(&mut self) {
-        let Some(plugin) = self.plugin.take() else { return };
-        // a bounded, preallocated hand-off: never blocks; full, it leaks rather than destroy here
-        if let Err(std::sync::mpsc::TrySendError::Full(p) | std::sync::mpsc::TrySendError::Disconnected(p)) = grave().0.try_send(plugin) {
-            std::mem::forget(p);
-        }
+    if instrument {
+        let _ = plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
     }
-}
-
-/// Destroy plugin instruments their racks let go of (call on the UI thread).
-#[cfg(windows)]
-pub fn bury() {
-    if let Ok(rx) = grave().1.try_lock() {
-        while let Ok(mut plugin) = rx.try_recv() {
-            let _ = plugin.stop_processing();
-            drop(plugin);
-        }
-    }
-}
-
-/// Load a plugin instrument for a MIDI lane (UI thread): its note input on,
-/// processing at `sample_rate`, its saved knob values set.
-#[cfg(windows)]
-pub fn load_instrument(path: &Path, sample_rate: u32, saved: Option<&Fx>) -> Result<(Box<Hosted>, Vec<PluginParam>), String> {
-    use vst3_host::audio::{BusDirection, MediaType};
-    let mut host = host_for(sample_rate)?;
-    let mut plugin = host.load_plugin(path).map_err(|e| format!("{} did not load: {e}", path.display()))?;
-    let info = plugin.info().clone();
-    if !info.category.contains("Instrument") {
-        return Err(format!("{} is not an instrument", info.name));
-    }
-    let params: Vec<PluginParam> = plugin
-        .get_parameters()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|p| PluginParam { id: p.id, name: p.name.clone(), default: p.value })
-        .collect();
-    if let Some(fx) = saved {
-        for p in &params {
-            if let Some(v) = fx.param(&p.name) {
-                let _ = plugin.set_parameter(p.id, v.clamp(0.0, 1.0));
-            }
-        }
-    }
-    let _ = plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
     plugin.start_processing().map_err(|e| format!("{} did not start: {e}", info.name))?;
-    let _ = plugin.set_playing(true);
-    Ok((Box::new(Hosted { plugin: Some(plugin) }), params))
+    if instrument {
+        let _ = plugin.set_playing(true);
+    }
+    let shared: Shared = std::sync::Arc::new(std::sync::Mutex::new(plugin));
+    Ok((Handle { plugin: shared.clone(), params, name: info.name, window: None, pending: Vec::new() }, shared))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

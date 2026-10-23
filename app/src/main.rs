@@ -392,6 +392,7 @@ script_mod! {
                             fx_b3 := View{width: Fit height: Fit fx_k3 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_b4 := View{width: Fit height: Fit fx_k4 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
                             fx_b5 := View{width: Fit height: Fit fx_k5 := Slider{width: 170 text: "" min: 0.0 max: 1.0 step: 0.0 precision: 2}}
+                            fx_editor := PillButton{text: "Open its window"}
                             fx_bypass := CheckBox{text: "Bypass"}
                             fx_remove := PillButton{text: "Remove"}
                         }
@@ -441,6 +442,9 @@ pub struct App {
     /// The audio output's state, shared by every song (made with the first).
     #[rust]
     shared: Option<std::sync::Arc<audio::Shared>>,
+    /// Services open plugin windows (and knob moves waiting for a busy plugin).
+    #[rust]
+    plugin_pump: Timer,
 }
 
 /// The song a job belongs to, in front or in a background tab.
@@ -1410,12 +1414,14 @@ impl App {
                 ui.check_box(cx, ids!(mute_cb)).set_active(cx, t.muted(), Animate::No);
                 ui.check_box(cx, ids!(solo_cb)).set_active(cx, t.soloed(), Animate::No);
                 show_track = true;
-                // a built-in instrument's knobs, under the lane's level
+                // a built-in instrument's knobs, under the lane's level; a plugin's own window
                 let knobs = st.inst_knobs(i);
-                if !knobs.is_empty() {
+                let plugin = t.instrument.as_ref().is_some_and(|i| i.plugin.is_some());
+                if !knobs.is_empty() || plugin {
                     fill_knobs(&ui, cx, &knobs);
                     ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, false);
                     ui.button(cx, ids!(fx_remove)).set_visible(cx, false);
+                    ui.button(cx, ids!(fx_editor)).set_visible(cx, plugin);
                     show_fx = true;
                 }
             }
@@ -1430,6 +1436,7 @@ impl App {
                 };
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{} on {place}{state}", fx.name));
                 fill_knobs(&ui, cx, &st.fx_knobs(&fx.id));
+                ui.button(cx, ids!(fx_editor)).set_visible(cx, fx.plugin.is_some());
                 ui.check_box(cx, ids!(fx_bypass)).set_visible(cx, true);
                 ui.button(cx, ids!(fx_remove)).set_visible(cx, true);
                 ui.check_box(cx, ids!(fx_bypass)).set_active(cx, fx.bypassed(), Animate::No);
@@ -2106,6 +2113,19 @@ impl MatchEvent for App {
             }
         }
 
+        if ui.button(cx, ids!(fx_editor)).clicked(actions) {
+            let id = match st.sel {
+                Selection::Track(l) => st.project.tracks.get(l).map(|t| t.id.clone()),
+                Selection::Fx(lane, i) => st.project.chain(lane).get(i).map(|f| f.id.clone()),
+                _ => None,
+            };
+            if let Some(id) = id {
+                status = Some(st.open_editor(&id).unwrap_or_else(|e| e));
+                if st.editors_open() && self.plugin_pump.is_empty() {
+                    self.plugin_pump = cx.start_interval(0.016);
+                }
+            }
+        }
         if let Selection::Track(lane) = st.sel {
             let sliders = [ids!(fx_k0), ids!(fx_k1), ids!(fx_k2), ids!(fx_k3), ids!(fx_k4), ids!(fx_k5)];
             for (k, s) in sliders.iter().enumerate() {
@@ -2221,6 +2241,21 @@ impl AppMain for App {
             self.drain_agent(cx);
         }
         self.drain_ai_port(cx, event);
+        if self.plugin_pump.is_event(event).is_some() {
+            match self.state.as_mut() {
+                Some(st) => {
+                    st.pump_plugins();
+                    if !st.editors_open() {
+                        cx.stop_timer(self.plugin_pump);
+                        self.plugin_pump = Timer::empty();
+                    }
+                }
+                None => {
+                    cx.stop_timer(self.plugin_pump);
+                    self.plugin_pump = Timer::empty();
+                }
+            }
+        }
         if self.autosave.is_event(event).is_some() {
             self.autosave = Timer::empty();
             if let Some(st) = self.state.as_mut().filter(|st| st.dirty) {

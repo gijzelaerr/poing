@@ -33,6 +33,66 @@ fn main() {
         let shown = plugin.format_parameter(p.id, p.value).unwrap_or_default();
         println!("  {:>10}  {:<28} {:.3}  ({shown})", p.id, p.name, p.value);
     }
+    if std::env::args().any(|a| a == "--state") {
+        // State round trip, as Poing saves a plugin: move some knobs, save the
+        // state, load it into a fresh instance, render the same note through both.
+        use vst3_host::audio::{BusDirection, MediaType};
+        use vst3_host::midi::{MidiChannel, MidiEvent};
+        let instrument = info.category.contains("Instrument");
+        for p in params.iter().filter(|p| p.can_automate).take(8) {
+            let _ = plugin.set_parameter(p.id, (p.value + 0.37) % 1.0);
+        }
+        // the changes reach the processor in its next block: run a few before saving
+        {
+            if instrument {
+                let _ = plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
+            }
+            plugin.start_processing().expect("start");
+            let mut warm = AudioBuffers::new(if instrument { 0 } else { 2 }, 2, 1024, 48_000.0);
+            for _ in 0..4 {
+                plugin.process_audio(&mut warm).expect("process");
+            }
+            let _ = plugin.stop_processing();
+        }
+        let state = plugin.save_state().expect("save_state");
+        println!("state: {} bytes", state.len());
+        let mut fresh = host.load_plugin(path).expect("load again");
+        fresh.load_state(&state).expect("load_state");
+        let (pa, pb) = (plugin.get_parameters().expect("params"), fresh.get_parameters().expect("params"));
+        let differ = pa.iter().zip(&pb).filter(|(x, y)| (x.value - y.value).abs() > 1e-6).count();
+        println!("parameters after restore: {} of {} differ", differ, pa.len());
+        let render = |p: &mut vst3_host::Plugin| -> Vec<f32> {
+            if instrument {
+                let _ = p.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
+            }
+            p.start_processing().expect("start");
+            let _ = p.set_playing(true);
+            let mut buffers = AudioBuffers::new(if instrument { 0 } else { 2 }, 2, 1024, 48_000.0);
+            let mut out = Vec::new();
+            for b in 0..60 {
+                if !instrument {
+                    for i in 0..1024 {
+                        let x = 0.3 * (std::f32::consts::TAU * 220.0 * (b * 1024 + i) as f32 / 48_000.0).sin();
+                        buffers.inputs[0][i] = x;
+                        buffers.inputs[1][i] = x;
+                    }
+                }
+                if instrument && b == 2 {
+                    let _ = p.send_midi_event_at(MidiEvent::NoteOn { channel: MidiChannel::Ch1, note: 57, velocity: 100 }, 0);
+                }
+                p.process_audio(&mut buffers).expect("process");
+                out.extend_from_slice(&buffers.outputs[0][..1024]);
+            }
+            let _ = p.stop_processing();
+            out
+        };
+        let (a, b) = (render(&mut plugin), render(&mut fresh));
+        let energy = |x: &[f32]| x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+        let diff: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x - y).collect();
+        let snr = 10.0 * (energy(&a) / energy(&diff).max(1e-30)).log10();
+        println!("same note through both: energy {:.3} vs {:.3}, match {snr:.1} dB", energy(&a), energy(&b));
+        return;
+    }
     if std::env::args().any(|a| a == "--instrument") {
         // An instrument, as Poing will run it: the Plugin itself moved to another
         // thread, a note sent at a sample offset, processed, released.
