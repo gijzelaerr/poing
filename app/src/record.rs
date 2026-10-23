@@ -41,7 +41,13 @@ impl EditorState {
     /// Tell the audio thread which lane the keys play (the song in front only).
     pub fn sync_keys(&self) {
         if self.is_current {
-            self.shared.live.set_lane(self.keys_lane());
+            let live = &self.shared.live;
+            live.set_lane(self.keys_lane());
+            // not recording here: no count-in or click left over from another song
+            if self.rec.is_none() && live.state() != live::IDLE {
+                live.state.store(live::IDLE, Ordering::Release);
+                live.count_left.store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -126,7 +132,7 @@ impl EditorState {
         Some((r.lane, rec::quantise(&notes, self.quantise)))
     }
 
-    fn finish_recording(&mut self) -> String {
+    pub(super) fn finish_recording(&mut self) -> String {
         self.take_played();
         let live = &self.shared.live;
         live.state.store(live::IDLE, Ordering::Release);

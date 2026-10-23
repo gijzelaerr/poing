@@ -834,6 +834,10 @@ impl EditorState {
     }
 
     fn go_back(&mut self) -> Vec<Stems> {
+        // a recording ends with its song going to the back (what was played lands)
+        if self.recording() {
+            self.notice = Some(self.finish_recording());
+        }
         self.saved_pos = self.playhead();
         self.is_current = false;
         self.plugin_params.retain(|_, _| false);
@@ -1435,6 +1439,9 @@ impl EditorState {
 
     /// Step back one edit (or forward again with `redo`).
     pub fn undo(&mut self, redo: bool) -> Option<String> {
+        if self.recording() {
+            return Some("Stop recording first (R)".into());
+        }
         let (project, stems) = if redo { self.redo.pop()? } else { self.undo.pop()? };
         let stems = match stems {
             Some(s) => s,
