@@ -55,8 +55,8 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "effect",
-        "Turn an effect's knob (by its name in `song`) or bypass it. `lane` absent means the master chain; `effect` is the index in that chain.",
-        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"effect":{"type":"integer","minimum":0},"knob":{"type":"string"},"value":{"type":"number"},"bypass":{"type":"boolean"}},"required":["effect"],"additionalProperties":false}"#,
+        "Turn an effect's knob (by its name in `song`) or bypass it. `lane` absent means the master chain; `effect` is the index in that chain. `own_process` runs a VST3 plugin in a process of its own (a crash there leaves Poing playing and the plugin is reloaded as it was; its audio comes ~43 ms later, which Poing compensates) or back in Poing.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"effect":{"type":"integer","minimum":0},"knob":{"type":"string"},"value":{"type":"number"},"bypass":{"type":"boolean"},"own_process":{"type":"boolean"}},"required":["effect"],"additionalProperties":false}"#,
         Risk::Act,
     ))
     .with_tool(tool(
@@ -138,13 +138,15 @@ pub fn summary(st: &EditorState, status: &str) -> String {
                         .into_iter()
                         .map(|(name, value, min, max)| json::obj(vec![("name", json::s(name)), ("value", f(value)), ("min", f(min)), ("max", f(max))]))
                         .collect();
-                    json::obj(vec![
+                    let mut fields = vec![
                         ("index", Value::Int(i as i64)),
                         ("name", json::s(fx.name.clone())),
                         ("plugin", Value::Bool(fx.plugin.is_some())),
                         ("bypass", Value::Bool(fx.bypassed())),
                         ("knobs", Value::Arr(knobs)),
-                    ])
+                    ];
+                    fields.extend(plugin_fields(st, &fx.id));
+                    json::obj(fields)
                 })
                 .collect(),
         )
@@ -169,6 +171,7 @@ pub fn summary(st: &EditorState, status: &str) -> String {
                 fields.push(("midi_notes", Value::Int(notes.len() as i64)));
                 let by = t.instrument.as_ref().filter(|x| x.plugin.is_some()).map(|x| x.name.clone()).unwrap_or_else(|| "Poing's built-in synth".into());
                 fields.push(("instrument", json::s(by)));
+                fields.extend(plugin_fields(st, &t.id));
             }
             json::obj(fields)
         })
@@ -230,6 +233,26 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         ("takes", Value::Arr(takes)),
     ])
     .to_json()
+}
+
+/// A loaded plugin's latency and where it runs, for `song`.
+fn plugin_fields(st: &EditorState, id: &str) -> Vec<(&'static str, Value)> {
+    let Some(i) = st.plugin_info(id) else { return Vec::new() };
+    let mut out = vec![
+        ("latency_ms", f(i.latency as f64 * 1000.0 / st.sr() as f64)),
+        ("own_process", Value::Bool(i.isolated)),
+    ];
+    if let Some(pid) = i.pid {
+        out.push(("process_id", Value::Int(pid as i64)));
+    }
+    if i.recoveries > 0 {
+        out.push(("reloads_after_crash", Value::Int(i.recoveries as i64)));
+    }
+    if let Some((blocks, worst_us)) = i.bridge {
+        out.push(("process_blocks", Value::Int(blocks as i64)));
+        out.push(("process_slowest_ms", f(worst_us as f64 / 1000.0)));
+    }
+    out
 }
 
 // ------------------------------------------------- the assistant behind the Describe bar

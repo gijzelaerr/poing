@@ -346,6 +346,21 @@ pub fn mix_into(
     mix_metered(stems, mix, sr, start, out_l, out_r, rack, None)
 }
 
+/// Frames [0, frames) of the mix through `rack` (an offline render or export)
+/// with the plugins' latency taken out: rendered that much longer and the
+/// front dropped, so it lines up with the song (and every stem with the others).
+pub fn render_aligned(stems: &[Arc<Stem>], mix: &MixParams, sr: u32, frames: usize, rack: &mut FxRack) -> (Vec<f32>, Vec<f32>) {
+    // a song take plays through the master only
+    let lanes = if mix.song_take().is_some() { 0 } else { rack.latency };
+    let late = (lanes + rack.master_latency()) as usize;
+    rack.clear_delays();
+    let (mut l, mut r) = (vec![0f32; frames + late], vec![0f32; frames + late]);
+    mix_into(stems, mix, sr, 0, &mut l, &mut r, Some(rack));
+    l.drain(..late);
+    r.drain(..late);
+    (l, r)
+}
+
 /// [`mix_into`], raising `meters` (lanes then master) to this block's peaks.
 #[allow(clippy::too_many_arguments)]
 pub fn mix_metered(
@@ -402,6 +417,11 @@ pub fn mix_metered(
         meter(meters, MASTER_METER, peak_of(&out_l[..n], &out_r[..n]));
         return;
     }
+    // latent plugins: the lanes through the rack gather in its wet sum, the rest waits in out
+    if let Some(rk) = rack.as_deref_mut().filter(|r| r.latency > 0) {
+        rk.wet_l[..n].fill(0.0);
+        rk.wet_r[..n].fill(0.0);
+    }
     let tracks = mix.gains.len().min(stems.len());
     for (ti, s) in stems[..tracks].iter().enumerate() {
         if mix.gains[ti] == 0.0 {
@@ -420,11 +440,8 @@ pub fn mix_metered(
                 rk.lane_r[i] *= g;
             }
             rk.process_lane(ti, n);
-            for i in 0..n {
-                out_l[i] += rk.lane_l[i];
-                out_r[i] += rk.lane_r[i];
-            }
             meter(meters, ti, peak_of(&rk.lane_l[..n], &rk.lane_r[..n]));
+            rk.lane_out(ti, n, out_l, out_r);
             continue;
         }
         match rack.as_deref_mut().filter(|r| r.lane_has_fx(ti)) {
@@ -440,11 +457,8 @@ pub fn mix_metered(
                     }
                 }
                 rk.process_lane(ti, n);
-                for i in 0..n {
-                    out_l[i] += rk.lane_l[i];
-                    out_r[i] += rk.lane_r[i];
-                }
                 meter(meters, ti, peak_of(&rk.lane_l[..n], &rk.lane_r[..n]));
+                rk.lane_out(ti, n, out_l, out_r);
             }
             None => {
                 let peak = add(&mut out_l[..n], &mut out_r[..n], s, 0, &lane_gain);
@@ -465,6 +479,7 @@ pub fn mix_metered(
         }
     }
     if let Some(rack) = rack {
+        rack.join_wet(&mut out_l[..n], &mut out_r[..n]);
         rack.process_master(&mut out_l[..n], &mut out_r[..n]);
     }
     meter(meters, MASTER_METER, peak_of(&out_l[..n], &out_r[..n]));
@@ -563,6 +578,8 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut was_playing = false;
     let mut last_live: Option<usize> = None;
     let mut click = crate::live::Click::new(sr);
+    // where the last block ended: playback from anywhere else is a jump
+    let mut expected = usize::MAX;
     cx.audio_output(0, move |info, out| {
         out.zero();
         // A new effects rack: adopt the old one's state, hand the old one back
@@ -653,6 +670,10 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
                 shared.set_playing(false);
                 return;
             }
+            if start != expected {
+                // a seek: what the latency delay lines hold is from elsewhere
+                rack.clear_delays();
+            }
             // the keys are heard from this block's first frame
             while let Some(k) = shared.live.keys.pop() {
                 if let Some(lane) = live_lane {
@@ -685,6 +706,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
                 }
             }
             shared.seek(next);
+            expected = next;
             n_src
         };
         if !muted {
@@ -934,8 +956,7 @@ pub fn render(stems: &[Arc<Stem>], mix: &MixParams, mut rack: Box<FxRack>, sr: u
         Some(k) => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
         None => lanes,
     };
-    let (mut l, mut r) = (vec![0f32; frames], vec![0f32; frames]);
-    mix_into(stems, mix, sr, 0, &mut l, &mut r, Some(&mut rack));
+    let (l, r) = render_aligned(stems, mix, sr, frames, &mut rack);
     let peak = l.iter().chain(r.iter()).fold(0f32, |a, x| a.max(x.abs()));
     let norm = if peak > 0.99 { 0.99 / peak } else { 1.0 };
     let _ = std::fs::create_dir_all(out_dir);
@@ -1892,12 +1913,60 @@ mod tests {
         assert_eq!(MAX_ACTIVE_TAKES, mix.takes.len());
     }
 
+    /// Plugin slots without an instance pass audio through untouched, so with
+    /// a claimed latency each lane comes out (most - its own) late: what a
+    /// real plugin of that latency would add up to `most`, the same for every lane.
+    #[cfg(windows)]
+    #[test]
+    fn lanes_are_delayed_to_meet_the_latest_one() {
+        use crate::fx::{FxControls, FxRack, FxUnit};
+        use std::sync::atomic::Ordering;
+        let fx = poing_model::Fx { id: String::new(), name: String::new(), file: String::new(), params: None, bypass: None, prompt: None, plugin: Some("x".into()), isolate: None };
+        let slot = |id: &str| FxUnit::plugin(id, FxControls::for_plugin(&fx), 1000);
+        let mut rack = FxRack::new(vec![vec![slot("a")], vec![slot("b")], Vec::new()], Vec::new());
+        rack.compensate(&|id| match id {
+            "a" => 300,
+            "b" => 100,
+            _ => 0,
+        });
+        assert_eq!((rack.latency, rack.lane_latency.clone()), (300, vec![300, 100, 0]));
+        let click = |at: usize| {
+            let mut v = vec![0.0f32; 4000];
+            v[at] = 1.0;
+            Arc::new(Stem::new(v.clone(), v))
+        };
+        let stems = vec![click(1000), click(1000), click(1000)];
+        let heard = |rack: &mut FxRack, lane: usize| -> usize {
+            let mut mix = with_takes(&[]);
+            mix.gains = vec![0.0; 3];
+            mix.gains[lane] = 1.0;
+            rack.clear_delays();
+            let (mut l, mut r) = (vec![0.0; 3000], vec![0.0; 3000]);
+            // in odd blocks, as the audio callback does
+            for (a, b) in [(0, 700), (700, 1301), (1301, 3000)] {
+                mix_into(&stems, &mix, 1000, a, &mut l[a..b], &mut r[a..b], Some(rack));
+            }
+            l.iter().position(|x| *x > 0.5).unwrap()
+        };
+        assert_eq!(heard(&mut rack, 0) + 300, 1300, "lane a, with its own 300");
+        assert_eq!(heard(&mut rack, 1) + 100, 1300, "lane b, with its own 100");
+        assert_eq!(heard(&mut rack, 2), 1300, "the lane without effects waits for them");
+        // bypassed, a latent effect still delays its lane by its latency
+        rack.lanes[0][0].controls.bypass.store(true, Ordering::Relaxed);
+        assert_eq!(heard(&mut rack, 0), 1300);
+        // an offline render takes the 300 out again
+        let mut mix = with_takes(&[]);
+        mix.gains = vec![0.0, 0.0, 1.0];
+        let (l, _) = super::render_aligned(&stems, &mix, 1000, 3000, &mut rack);
+        assert_eq!((l.len(), l.iter().position(|x| *x > 0.5)), (3000, Some(1000)));
+    }
+
     #[test]
     fn a_lane_effect_also_processes_that_lane_s_takes() {
         use crate::fx::{compile_source, FxControls, FxRack, FxUnit};
         let code = "let gain = param(0.5, 0, 1)\nfn effect(l, r) { vec2(l * gain, r * gain) }\n";
         let shader = compile_source(code).unwrap();
-        let fx = poing_model::Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None };
+        let fx = poing_model::Fx { id: "fx1".into(), name: "half".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None, isolate: None };
         let unit = FxUnit::new("fx1", shader.clone(), FxControls::new(&shader, &fx, None), 1000);
         let mut rack = FxRack::new(vec![vec![unit], Vec::new()], Vec::new());
         // lane 0 (1.0) has the effect and a layer (1.0); lane 1 (0.25) has none

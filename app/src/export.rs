@@ -7,7 +7,7 @@
 //! DAW sees it, so MIDI notes, audio and section markers land where Poing
 //! plays them.
 
-use crate::audio::{self, mix_into, take_lane, JobUpdate, MixParams, Stem, Stems, TakeKind};
+use crate::audio::{self, take_lane, JobUpdate, MixParams, Stem, Stems, TakeKind};
 use crate::fx::FxRack;
 use crate::state::EditorState;
 use poing_model::{db_to_lin, BeatGrid, Note, Project};
@@ -46,9 +46,7 @@ pub fn run(job: ExportJob, tx: &Sender<JobUpdate>) {
 
 fn render_part(stems: &[Arc<Stem>], rack: &mut FxRack, sr: u32, frames: usize, part: &Part) -> (Vec<f32>, Vec<f32>) {
     let n = if part.frames > 0 { part.frames } else { frames };
-    let (mut l, mut r) = (vec![0f32; n], vec![0f32; n]);
-    mix_into(stems, &part.mix, sr, 0, &mut l, &mut r, Some(rack));
-    (l, r)
+    audio::render_aligned(stems, &part.mix, sr, n, rack)
 }
 
 fn export_stems(stems: &[Arc<Stem>], rack: &mut FxRack, sr: u32, frames: usize, parts: &[Part], dir: &Path, tx: &Sender<JobUpdate>) -> Result<String, String> {
@@ -1001,7 +999,7 @@ mod tests {
         mix.takes[2] = take(5, 0.9, 1.9, TakeKind::Section, 1.0);
         let render = |m: &MixParams| {
             let (mut l, mut r) = (vec![0f32; n], vec![0f32; n]);
-            mix_into(&stems, m, sr, 0, &mut l, &mut r, None);
+            audio::mix_into(&stems, m, sr, 0, &mut l, &mut r, None);
             (l, r)
         };
         let (ml, mr) = render(&mix);

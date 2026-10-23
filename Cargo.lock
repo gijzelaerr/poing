@@ -1188,6 +1188,7 @@ dependencies = [
  "makepad-widgets",
  "makepad-zip-file",
  "poing-model",
+ "serde_json",
  "vst3-host",
 ]
 

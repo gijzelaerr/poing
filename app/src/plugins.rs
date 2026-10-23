@@ -1,7 +1,13 @@
 //! VST3 plugins as lane effects and MIDI lane instruments: the installed
 //! library (found on disk, never loaded to list it), loading an instance on the
 //! UI thread with its saved state, and the UI's handle to it (knobs, its own
-//! editor window, state). Windows for now.
+//! editor window, state, its latency). Windows for now.
+//!
+//! A plugin runs in Poing, or ("Run in its own process") in poing-plughost,
+//! where a crash takes only that process down: Poing reloads the plugin there
+//! with its last state. The audio thread never talks to another process: an
+//! isolated plugin's worker ([`Bridge`]) does, through lock-free rings, and its
+//! audio comes back [`BRIDGE_DELAY`] frames late (compensated like any latency).
 
 use poing_model::Fx;
 use std::path::{Path, PathBuf};
@@ -46,41 +52,334 @@ pub fn knob_params(params: &[PluginParam]) -> Vec<PluginParam> {
         .collect()
 }
 
-/// A host set up for Poing's sample rate and plugin block.
+/// A host set up for Poing's sample rate and plugin block; `isolated`: the
+/// plugin runs in poing-plughost (next to poing.exe).
 #[cfg(windows)]
-fn host_for(sample_rate: u32) -> Result<vst3_host::Vst3Host, String> {
-    vst3_host::Vst3Host::builder()
-        .sample_rate(sample_rate as f64)
-        .block_size(crate::fx::PLUGIN_BLOCK)
-        .build()
-        .map_err(|e| e.to_string())
+fn host_for(sample_rate: u32, isolated: bool) -> Result<vst3_host::Vst3Host, String> {
+    let mut b = vst3_host::Vst3Host::builder().sample_rate(sample_rate as f64).block_size(crate::fx::PLUGIN_BLOCK);
+    if isolated {
+        let helper = helper_path().ok_or("poing-plughost.exe is missing next to poing.exe")?;
+        // a crash is ours to handle (reload with the plugin's state), never a silent reset
+        b = b.with_process_isolation(true).helper_path(helper).auto_recover_plugins(false);
+    }
+    b.build().map_err(|e| e.to_string())
+}
+
+/// poing-plughost next to this executable (tests run one folder deeper, in deps/).
+#[cfg(windows)]
+pub fn helper_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let found = [Some(dir), dir.parent()].into_iter().flatten().map(|d| d.join("poing-plughost.exe")).find(|p| p.exists());
+    found
 }
 
 /// A loaded plugin, shared by the UI (editor window, knobs, state, and the
-/// last reference: it is destroyed on the UI thread) and the rack, whose
-/// audio thread only ever `try_lock`s it (a missed block passes through).
+/// last reference: it is destroyed on the UI thread) and the rack. In Poing
+/// the audio thread only ever `try_lock`s it (a missed block passes through);
+/// in poing-plughost its bridge worker talks to it instead.
 #[cfg(windows)]
-pub type Shared = std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>;
+pub struct Hosted {
+    pub plugin: std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>,
+    pub bridge: Option<Bridge>,
+}
 
-/// Blocks a plugin was busy for (the UI held it): passed through or silent.
+#[cfg(windows)]
+pub type Shared = std::sync::Arc<Hosted>;
+
+/// Blocks a plugin was busy for (the UI held it, or its process fell behind): passed through or silent.
 #[cfg(windows)]
 pub static MISSED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How late an isolated plugin's audio comes back, on top of its own latency:
+/// room for its worker to answer one audio block (it takes whatever has
+/// arrived, so device blocks up to this many frames at the song's rate).
+/// Compensated like any latency.
+pub const BRIDGE_DELAY: usize = 2 * crate::fx::PLUGIN_BLOCK;
+
+/// Frames the bridge rings hold.
+#[cfg(windows)]
+const RING: usize = 1 << 15;
+/// Note events that can wait for the worker.
+#[cfg(windows)]
+const EVENTS: usize = 1024;
+
+/// What the audio thread and an isolated plugin's worker share: lock-free
+/// rings of audio (f32 bits) and note events, by absolute frame. Output frame
+/// f is the plugin's answer to input frame f.
+#[cfg(windows)]
+struct Ring {
+    in_l: Box<[std::sync::atomic::AtomicU32]>,
+    in_r: Box<[std::sync::atomic::AtomicU32]>,
+    out_l: Box<[std::sync::atomic::AtomicU32]>,
+    out_r: Box<[std::sync::atomic::AtomicU32]>,
+    /// Input frames the audio side wrote.
+    written: std::sync::atomic::AtomicU64,
+    /// Output frames [from, done) are the plugin's (a skip moves `from` up).
+    from: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicU64,
+    /// Note events: the frame, and pitch | velocity << 8 | on << 16.
+    ev_frame: Box<[std::sync::atomic::AtomicU64]>,
+    ev_data: Box<[std::sync::atomic::AtomicU32]>,
+    ev_written: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+    /// The plugin's process died or hung: the UI reloads it.
+    crashed: std::sync::atomic::AtomicBool,
+    /// Blocks the worker sent, and the slowest round trip (µs).
+    blocks: std::sync::atomic::AtomicU64,
+    worst_us: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(windows)]
+fn atomics<T: Default>(n: usize) -> Box<[T]> {
+    (0..n).map(|_| T::default()).collect()
+}
+
+/// The audio thread's side of an isolated plugin, and the worker that talks
+/// to its process.
+#[cfg(windows)]
+pub struct Bridge {
+    ring: std::sync::Arc<Ring>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    instrument: bool,
+}
+
+#[cfg(windows)]
+impl Bridge {
+    fn start(plugin: std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>, instrument: bool, sample_rate: u32) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let ring = std::sync::Arc::new(Ring {
+            in_l: atomics(RING),
+            in_r: atomics(RING),
+            out_l: atomics(RING),
+            out_r: atomics(RING),
+            written: AtomicU64::new(0),
+            from: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            ev_frame: atomics(EVENTS),
+            ev_data: atomics(EVENTS),
+            ev_written: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            blocks: AtomicU64::new(0),
+            worst_us: AtomicU64::new(0),
+        });
+        let r = ring.clone();
+        let worker = std::thread::Builder::new()
+            .name("poing-plugin-bridge".into())
+            .spawn(move || bridge_worker(&r, &plugin, instrument, sample_rate))
+            .ok();
+        Bridge { ring, worker, instrument }
+    }
+
+    /// A note for the plugin, at the frame the next block starts (audio thread).
+    pub fn note(&self, pitch: u8, velocity: u8, on: bool) {
+        use std::sync::atomic::Ordering;
+        let ring = &*self.ring;
+        let k = ring.ev_written.load(Ordering::Relaxed);
+        let slot = (k as usize) % EVENTS;
+        ring.ev_frame[slot].store(ring.written.load(Ordering::Relaxed), Ordering::Relaxed);
+        ring.ev_data[slot].store(pitch as u32 | (velocity as u32) << 8 | (on as u32) << 16, Ordering::Relaxed);
+        ring.ev_written.store(k + 1, Ordering::Release);
+    }
+
+    /// Hand the worker l/r (an effect's input) and take back the plugin's
+    /// output from BRIDGE_DELAY frames ago: into l/r (an effect) or added to
+    /// them (an instrument). `feed_only`: l/r stay as they are (bypassed, but
+    /// the plugin keeps time). Never waits: frames the worker has not made
+    /// yet are silent and counted as missed. Audio thread.
+    pub fn run(&self, l: &mut [f32], r: &mut [f32], feed_only: bool) {
+        use std::sync::atomic::Ordering;
+        let ring = &*self.ring;
+        let n = l.len().min(r.len()).min(RING - BRIDGE_DELAY - crate::fx::PLUGIN_BLOCK);
+        let base = ring.written.load(Ordering::Relaxed);
+        if !self.instrument {
+            for i in 0..n {
+                let s = (base as usize + i) % RING;
+                ring.in_l[s].store(l[i].to_bits(), Ordering::Relaxed);
+                ring.in_r[s].store(r[i].to_bits(), Ordering::Relaxed);
+            }
+        }
+        ring.written.store(base + n as u64, Ordering::Release);
+        if feed_only {
+            return;
+        }
+        let done = ring.done.load(Ordering::Acquire);
+        let from = ring.from.load(Ordering::Relaxed);
+        let mut missed = false;
+        for i in 0..n {
+            let (a, b) = match (base + i as u64).checked_sub(BRIDGE_DELAY as u64) {
+                Some(f) if f >= from && f < done => {
+                    let s = f as usize % RING;
+                    (f32::from_bits(ring.out_l[s].load(Ordering::Relaxed)), f32::from_bits(ring.out_r[s].load(Ordering::Relaxed)))
+                }
+                Some(_) => {
+                    missed = true;
+                    (0.0, 0.0)
+                }
+                None => (0.0, 0.0), // the first BRIDGE_DELAY frames: nothing yet
+            };
+            let a = if a.is_finite() { a.clamp(-4.0, 4.0) } else { 0.0 };
+            let b = if b.is_finite() { b.clamp(-4.0, 4.0) } else { 0.0 };
+            if self.instrument {
+                l[i] += a;
+                r[i] += b;
+            } else {
+                l[i] = a;
+                r[i] = b;
+            }
+        }
+        if missed {
+            MISSED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn crashed(&self) -> bool {
+        self.ring.crashed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (blocks sent, slowest round trip in µs) so far.
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (self.ring.blocks.load(Ordering::Relaxed), self.ring.worst_us.load(Ordering::Relaxed))
+    }
+
+    fn stop(&mut self) {
+        self.ring.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The worker: what the audio thread wrote goes to the plugin's process in
+/// blocks of up to PLUGIN_BLOCK, its answers into the out ring. It polls, so
+/// the audio thread never has to wake it (no syscalls there).
+#[cfg(windows)]
+fn bridge_worker(ring: &Ring, plugin: &std::sync::Mutex<vst3_host::Plugin>, instrument: bool, sample_rate: u32) {
+    use std::sync::atomic::Ordering;
+    use vst3_host::midi::{MidiChannel, MidiEvent};
+    let block = crate::fx::PLUGIN_BLOCK;
+    let mut buffers = vst3_host::audio::AudioBuffers::new(if instrument { 0 } else { 2 }, 2, block, sample_rate as f64);
+    let (mut read, mut ev_read) = (0u64, 0u64);
+    while !ring.stop.load(Ordering::Relaxed) {
+        let written = ring.written.load(Ordering::Acquire);
+        if written - read > (RING - BRIDGE_DELAY - 2 * block) as u64 {
+            // far behind (the process hung): drop what waited, carry on from now
+            read = written;
+            ring.from.store(read, Ordering::Relaxed);
+            ring.done.store(read, Ordering::Release);
+        }
+        if written == read {
+            std::thread::sleep(std::time::Duration::from_micros(300));
+            continue;
+        }
+        let k = ((written - read) as usize).min(block);
+        crate::fx::fit(&mut buffers, k);
+        if !instrument {
+            for i in 0..k {
+                let s = (read as usize + i) % RING;
+                buffers.inputs[0][i] = f32::from_bits(ring.in_l[s].load(Ordering::Relaxed));
+                buffers.inputs[1][i] = f32::from_bits(ring.in_r[s].load(Ordering::Relaxed));
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let ok = {
+            let mut p = plugin.lock().unwrap_or_else(|e| e.into_inner());
+            let ev_written = ring.ev_written.load(Ordering::Acquire);
+            ev_read = ev_read.max(ev_written.saturating_sub(EVENTS as u64));
+            while ev_read < ev_written {
+                let slot = (ev_read as usize) % EVENTS;
+                let frame = ring.ev_frame[slot].load(Ordering::Relaxed);
+                if frame >= read + k as u64 {
+                    break;
+                }
+                let d = ring.ev_data[slot].load(Ordering::Relaxed);
+                let (note, velocity) = ((d & 0x7f) as u8, ((d >> 8) & 0x7f) as u8);
+                let event = if d >> 16 != 0 {
+                    MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity }
+                } else {
+                    MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
+                };
+                let _ = p.send_midi_event_at(event, frame.saturating_sub(read) as i32);
+                ev_read += 1;
+            }
+            match p.process_audio(&mut buffers) {
+                Ok(()) => true,
+                Err(vst3_host::Error::PluginCrashed | vst3_host::Error::PluginTimeout) => {
+                    ring.crashed.store(true, Ordering::Relaxed);
+                    false
+                }
+                Err(_) => false,
+            }
+        };
+        ring.blocks.fetch_add(1, Ordering::Relaxed);
+        ring.worst_us.fetch_max(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let outs = &buffers.outputs;
+        for i in 0..k {
+            let s = (read as usize + i) % RING;
+            let (a, b) = if ok { (outs[0][i], outs[outs.len().min(2) - 1][i]) } else { (0.0, 0.0) };
+            ring.out_l[s].store(a.to_bits(), Ordering::Relaxed);
+            ring.out_r[s].store(b.to_bits(), Ordering::Relaxed);
+        }
+        read += k as u64;
+        ring.done.store(read, Ordering::Release);
+        if !ok {
+            // a dead process answers at once: do not spin on it
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+/// What a pump of a plugin found.
+#[cfg(windows)]
+#[derive(Default)]
+pub struct Pumped {
+    /// The user closed its editor just now.
+    pub closed: bool,
+    /// Its latency changed: the rack is rebuilt to compensate.
+    pub latency: bool,
+    /// Its process is gone: the caller reloads it with its state.
+    pub crashed: bool,
+}
 
 /// The UI's side of a loaded plugin: what it shows and changes.
 #[cfg(windows)]
 pub struct Handle {
-    pub plugin: Shared,
+    pub hosted: Shared,
     pub params: Vec<PluginParam>,
     pub name: String,
+    /// In poing-plughost ("Run in its own process").
+    pub isolated: bool,
+    instrument: bool,
+    /// The plugin's own latency as last read (frames).
+    plugin_latency: u32,
+    /// Its last known state, to reload it with after a crash.
+    pub last_state: Option<Vec<u8>>,
+    /// Times it came back after a crash.
+    pub recoveries: u32,
     window: Option<vst3_host::PluginWindow>,
+    /// An isolated plugin's editor (a window of its own process) is open.
+    remote_editor: bool,
     /// Knob moves the plugin was too busy to take yet: (id, value), newest per id.
     pending: Vec<(u32, f64)>,
+    last_check: std::time::Instant,
+    /// When a knob last moved (its latency may follow).
+    last_touch: std::time::Instant,
 }
 
 #[cfg(windows)]
 impl Handle {
     /// Turn a knob (normalized 0..1): now if the plugin is free, else on the next pump.
     pub fn set_param(&mut self, id: u32, value: f64) {
+        self.last_touch = std::time::Instant::now();
         self.pending.retain(|(i, _)| *i != id);
         self.pending.push((id, value.clamp(0.0, 1.0)));
         self.flush();
@@ -90,7 +389,7 @@ impl Handle {
         if self.pending.is_empty() {
             return;
         }
-        if let Ok(mut p) = self.plugin.try_lock() {
+        if let Ok(mut p) = self.hosted.plugin.try_lock() {
             for (id, v) in self.pending.drain(..) {
                 let _ = p.set_parameter(id, v);
             }
@@ -99,54 +398,197 @@ impl Handle {
 
     /// The plugin's whole state (presets, wavetables, every parameter), if it is free.
     pub fn save_state(&self) -> Option<Vec<u8>> {
-        self.plugin.try_lock().ok().and_then(|p| p.save_state().ok())
+        self.hosted.plugin.try_lock().ok().and_then(|p| p.save_state().ok())
+    }
+
+    /// [`Self::save_state`], kept to reload it with after a crash.
+    pub fn snapshot(&mut self) -> Option<Vec<u8>> {
+        let bytes = self.save_state()?;
+        self.last_state = Some(bytes.clone());
+        Some(bytes)
+    }
+
+    /// Frames its audio comes back late: the plugin's own latency, plus the
+    /// bridge's when it runs in its own process.
+    pub fn latency(&self) -> u32 {
+        self.plugin_latency + if self.hosted.bridge.is_some() { BRIDGE_DELAY as u32 } else { 0 }
+    }
+
+    /// poing-plughost's process id (isolated plugins).
+    pub fn helper_pid(&self) -> Option<u32> {
+        self.hosted.plugin.try_lock().ok().and_then(|p| p.isolation_pid())
+    }
+
+    /// (blocks sent, slowest round trip in µs) of an isolated plugin.
+    pub fn bridge_stats(&self) -> Option<(u64, u64)> {
+        self.hosted.bridge.as_ref().map(|b| b.stats())
     }
 
     pub fn editor_open(&self) -> bool {
-        self.window.as_ref().is_some_and(|w| w.is_open())
+        self.remote_editor || self.window.as_ref().is_some_and(|w| w.is_open())
     }
 
     /// Open the plugin's own window (or bring it back).
     pub fn open_editor(&mut self) -> Result<(), String> {
+        if self.isolated {
+            // poing-plughost makes the window (or raises it) in its own process
+            let mut p = self.hosted.plugin.lock().map_err(|e| e.to_string())?;
+            if let Some(pid) = p.isolation_pid() {
+                allow_foreground(pid);
+            }
+            // SAFETY: an isolated plugin never touches the parent: its helper owns the window.
+            let none = unsafe { vst3_host::WindowHandle::from_raw(std::ptr::null_mut()) };
+            p.open_editor(none).map_err(|e| format!("{} has no window here: {e}", self.name))?;
+            self.remote_editor = true;
+            return Ok(());
+        }
         if self.editor_open() {
             return Ok(());
         }
-        let mut w = vst3_host::PluginWindow::new(self.plugin.clone());
+        let mut w = vst3_host::PluginWindow::new(self.hosted.plugin.clone());
         w.open().map_err(|e| format!("{} has no window here: {e}", self.name))?;
         self.window = Some(w);
         Ok(())
     }
 
     pub fn close_editor(&mut self) {
+        if std::mem::take(&mut self.remote_editor) {
+            if let Ok(mut p) = self.hosted.plugin.lock() {
+                let _ = p.close_editor();
+            }
+        }
         if let Some(mut w) = self.window.take() {
             w.close();
         }
     }
 
-    /// Keep the editor window and queued knobs moving (UI thread, often).
-    /// True when the user closed the editor just now.
-    pub fn pump(&mut self) -> bool {
+    /// Keep the editor window and queued knobs moving (UI thread, often), and
+    /// every quarter second see whether an isolated plugin's editor was
+    /// closed, whether its process still runs, and (while it may have changed:
+    /// its editor open, a knob just moved) the plugin's latency. A plugin in
+    /// Poing is left alone otherwise: each look takes it from the audio thread.
+    pub fn pump(&mut self) -> Pumped {
+        let mut out = Pumped::default();
         self.flush();
-        let Some(w) = &self.window else { return false };
-        let _ = w.service_platform_events();
-        if w.closed_by_user() {
-            self.close_editor();
-            return true;
+        if let Some(w) = &self.window {
+            let _ = w.service_platform_events();
+            if w.closed_by_user() {
+                self.close_editor();
+                out.closed = true;
+            }
         }
-        false
+        if self.hosted.bridge.as_ref().is_some_and(|b| b.crashed()) {
+            out.crashed = true;
+            return out;
+        }
+        if self.last_check.elapsed() < std::time::Duration::from_millis(250) {
+            return out;
+        }
+        self.last_check = std::time::Instant::now();
+        if self.remote_editor && self.helper_pid().is_some_and(|pid| helper_windows(pid).is_empty()) {
+            // the user closed it in poing-plughost
+            self.remote_editor = false;
+            out.closed = true;
+        }
+        let touched = self.last_touch.elapsed() < std::time::Duration::from_secs(2);
+        if !(self.isolated || self.editor_open() || touched) {
+            return out;
+        }
+        let Ok(mut p) = self.hosted.plugin.try_lock() else { return out };
+        match p.service_host_requests() {
+            Err(vst3_host::Error::PluginCrashed | vst3_host::Error::PluginTimeout) => out.crashed = true,
+            _ => {
+                let latency = p.latency_samples();
+                if latency != self.plugin_latency {
+                    self.plugin_latency = latency;
+                    out.latency = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// Bring an isolated plugin back after its process died: a new process,
+    /// the plugin loaded again and given `state` (its last known).
+    pub fn recover(&mut self, state: Option<&[u8]>) -> Result<(), String> {
+        use vst3_host::audio::{BusDirection, MediaType};
+        let mut p = self.hosted.plugin.lock().map_err(|e| e.to_string())?;
+        p.recover().map_err(|e| format!("{} did not come back: {e}", self.name))?;
+        if let Some(bytes) = state {
+            let _ = p.load_state(bytes);
+        }
+        if self.instrument {
+            let _ = p.stop_processing();
+            let _ = p.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
+            let _ = p.start_processing();
+            let _ = p.set_playing(true);
+        }
+        let _ = p.service_host_requests();
+        self.plugin_latency = p.latency_samples();
+        drop(p);
+        self.remote_editor = false;
+        self.recoveries += 1;
+        if let Some(b) = &self.hosted.bridge {
+            b.ring.crashed.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Is the rack done with it (only this handle holds it)?
     pub fn released(&self) -> bool {
-        std::sync::Arc::strong_count(&self.plugin) == 1
+        std::sync::Arc::strong_count(&self.hosted) == 1
     }
 
-    /// Destroy it here, on the UI thread (once [`Self::released`]).
+    /// Destroy it here, on the UI thread (once [`Self::released`]): its
+    /// bridge worker stops first.
     pub fn shut_down(mut self) {
         self.close_editor();
-        if let Ok(mut p) = self.plugin.lock() {
+        if let Some(h) = std::sync::Arc::get_mut(&mut self.hosted) {
+            h.bridge = None;
+        }
+        if let Ok(mut p) = self.hosted.plugin.lock() {
             let _ = p.stop_processing();
         }
+    }
+}
+
+/// The visible top-level windows of process `pid` (an isolated plugin's editor).
+#[cfg(windows)]
+pub fn helper_windows(pid: u32) -> Vec<isize> {
+    type EnumProc = unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32;
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(f: EnumProc, l: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe extern "system" fn each(hwnd: *mut std::ffi::c_void, l: isize) -> i32 {
+        let (pid, out) = &mut *(l as *mut (u32, Vec<isize>));
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut owner);
+        if owner == *pid && IsWindowVisible(hwnd) != 0 {
+            out.push(hwnd as isize);
+        }
+        1
+    }
+    let mut found: (u32, Vec<isize>) = (pid, Vec::new());
+    // SAFETY: enumerates top-level windows into a local, for the call's duration.
+    unsafe {
+        EnumWindows(each, &mut found as *mut _ as isize);
+    }
+    found.1
+}
+
+/// Let poing-plughost `pid` bring its editor window to the front.
+#[cfg(windows)]
+fn allow_foreground(pid: u32) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn AllowSetForegroundWindow(pid: u32) -> i32;
+    }
+    // SAFETY: a plain Win32 call.
+    unsafe {
+        AllowSetForegroundWindow(pid);
     }
 }
 
@@ -186,13 +628,28 @@ pub fn pump_window_messages() {
         }
     }
 }
-/// Load a plugin on this (the UI) thread: as a lane effect, or (`instrument`)
-/// to play a MIDI lane. Its saved state wins over its saved knob values.
-/// Returns the UI's handle and the rack's share of it.
+
+/// How to load a plugin.
 #[cfg(windows)]
-pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u8]>, instrument: bool) -> Result<(Handle, Shared), String> {
+#[derive(Clone, Copy, Default)]
+pub struct LoadAs {
+    /// To play a MIDI lane (else a lane effect).
+    pub instrument: bool,
+    /// In poing-plughost, not in Poing ("Run in its own process").
+    pub isolated: bool,
+    /// For playback: an isolated plugin gets its bridge worker. An offline
+    /// render calls it directly (it may wait).
+    pub realtime: bool,
+}
+
+/// Load a plugin on this (the UI) thread: as a lane effect, or to play a MIDI
+/// lane. Its saved state wins over its saved knob values. Returns the UI's
+/// handle and the rack's share of it.
+#[cfg(windows)]
+pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u8]>, how: LoadAs) -> Result<(Handle, Shared), String> {
     use vst3_host::audio::{BusDirection, MediaType};
-    let mut host = host_for(sample_rate)?;
+    let instrument = how.instrument;
+    let mut host = host_for(sample_rate, how.isolated)?;
     let mut plugin = host.load_plugin(path).map_err(|e| format!("{} did not load: {e}", path.display()))?;
     let info = plugin.info().clone();
     let is_instrument = info.category.contains("Instrument");
@@ -223,9 +680,30 @@ pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u
     if instrument {
         let _ = plugin.set_playing(true);
     }
-    let shared: Shared = std::sync::Arc::new(std::sync::Mutex::new(plugin));
-    Ok((Handle { plugin: shared.clone(), params, name: info.name, window: None, pending: Vec::new() }, shared))
+    // a state that changed its latency (linear phase) has said so by now
+    let _ = plugin.service_host_requests();
+    let plugin_latency = plugin.latency_samples();
+    let plugin = std::sync::Arc::new(std::sync::Mutex::new(plugin));
+    let bridge = (how.isolated && how.realtime).then(|| Bridge::start(plugin.clone(), instrument, sample_rate));
+    let shared: Shared = std::sync::Arc::new(Hosted { plugin, bridge });
+    let handle = Handle {
+        hosted: shared.clone(),
+        params,
+        name: info.name,
+        isolated: how.isolated,
+        instrument,
+        plugin_latency,
+        last_state: state.map(<[u8]>::to_vec),
+        recoveries: 0,
+        window: None,
+        remote_editor: false,
+        pending: Vec::new(),
+        last_check: std::time::Instant::now(),
+        last_touch: std::time::Instant::now(),
+    };
+    Ok((handle, shared))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +714,351 @@ mod tests {
         let all = [p(0, "Bypass"), p(1, "-"), p(2, "Decay"), p(3, "MIDI CC 1"), p(4, "Mix")];
         let names: Vec<String> = knob_params(&all).into_iter().map(|k| k.name).collect();
         assert_eq!(names, ["Decay", "Mix"]);
+    }
+}
+
+/// By hand on the Windows PC (FabFilter Pro-Q 3 installed, poing-plughost built):
+/// `cargo build --release -p poing --bin poing-plughost`, then
+/// `cargo test --release -p poing --bin poing plugins::bench -- --ignored --nocapture --test-threads 1`
+#[cfg(all(test, windows))]
+mod bench {
+    use super::*;
+    use crate::audio::{mix_into, MixParams, Stem};
+    use crate::fx::{FxControls, FxRack, FxUnit, PLUGIN_BLOCK};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const PRO_Q: &str = "C:/Program Files/Common Files/VST3/FabFilter Pro-Q 3.vst3";
+    /// Pro-Q 3's "Processing Mode": 0 zero latency, 0.5 natural phase, 1 linear phase.
+    const PROCESSING_MODE: u32 = 312;
+    const SR: u32 = 48000;
+
+    fn pro_q(isolated: bool, realtime: bool) -> (Handle, Shared) {
+        let (mut h, s) = load(Path::new(PRO_Q), SR, None, None, LoadAs { instrument: false, isolated, realtime }).unwrap();
+        h.set_param(PROCESSING_MODE, 1.0);
+        // its latency changes with the mode: the pump reads it (as the app's does)
+        let t0 = Instant::now();
+        while h.plugin_latency == 0 && t0.elapsed() < Duration::from_secs(5) {
+            h.last_check = Instant::now() - Duration::from_secs(1);
+            let _ = h.pump();
+        }
+        (h, s)
+    }
+
+    fn click(at: usize, len: usize) -> Arc<Stem> {
+        let mut v = vec![0.0f32; len];
+        v[at] = 1.0;
+        Arc::new(Stem::new(v.clone(), v))
+    }
+
+    /// Lane 0 through Pro-Q (linear phase), lane 1 dry, a click on each.
+    fn rack_with(shared: Shared, latency: u32) -> FxRack {
+        let fx = poing_model::Fx { id: "fx1".into(), name: "Pro-Q 3".into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: Some(PRO_Q.into()), isolate: None };
+        let mut rack = FxRack::new(vec![vec![FxUnit::plugin("fx1", FxControls::for_plugin(&fx), SR)], Vec::new()], Vec::new());
+        assert!(rack.install("fx1", shared).is_ok());
+        rack.compensate(&|id| if id == "fx1" { latency } else { 0 });
+        rack
+    }
+
+    fn mix(gains: [f32; 2]) -> MixParams {
+        MixParams { gains: gains.to_vec(), ..Default::default() }
+    }
+
+    fn loudest(l: &[f32]) -> (usize, f32) {
+        l.iter().enumerate().fold((0, 0.0f32), |(i, m), (j, x)| if x.abs() > m { (j, x.abs()) } else { (i, m) })
+    }
+
+    #[test]
+    #[ignore]
+    fn a_click_through_linear_phase_pro_q_lines_up_with_a_dry_one() {
+        let at = 9600;
+        let stems = vec![click(at, 96000), click(at, 96000)];
+        for isolated in [false, true] {
+            let (h, shared) = pro_q(isolated, false);
+            let lat = h.latency();
+            assert!(lat > 0, "linear phase reports its latency");
+            // without compensation the plugin lane is `lat` late
+            let mut raw = rack_with(shared.clone(), 0);
+            let (mut l, mut r) = (vec![0.0; 48000], vec![0.0; 48000]);
+            mix_into(&stems, &mix([1.0, 0.0]), SR, 0, &mut l, &mut r, Some(&mut raw));
+            let uncompensated = loudest(&l).0;
+            drop(raw);
+            let mut rack = rack_with(shared, lat);
+            let (wet, _) = crate::audio::render_aligned(&stems, &mix([1.0, 0.0]), SR, 48000, &mut rack);
+            let (dry, _) = crate::audio::render_aligned(&stems, &mix([0.0, 1.0]), SR, 48000, &mut rack);
+            let (both, _) = crate::audio::render_aligned(&stems, &mix([1.0, 1.0]), SR, 48000, &mut rack);
+            println!(
+                "{}: latency {lat}, uncompensated click at {uncompensated}; compensated: plugin lane {:?}, dry lane {:?}, both {:?}",
+                if isolated { "isolated" } else { "in-process" },
+                loudest(&wet),
+                loudest(&dry),
+                loudest(&both)
+            );
+            assert_eq!(uncompensated, at + lat as usize);
+            assert_eq!(loudest(&wet).0, at);
+            assert_eq!(loudest(&dry).0, at);
+            assert!(loudest(&both).1 > 1.8, "one click, twice as loud: {:?}", loudest(&both));
+            drop(rack);
+            h.shut_down();
+        }
+    }
+
+    /// Live, as the audio callback runs it: 480-frame blocks in real time, in
+    /// Poing and through the bridge (plugin latency + BRIDGE_DELAY), both
+    /// clicks still one, and nothing missed.
+    #[test]
+    #[ignore]
+    fn live_the_clicks_still_line_up() {
+        for isolated in [false, true] {
+            live(isolated);
+        }
+    }
+
+    fn live(isolated: bool) {
+        let at = 9600;
+        let stems = vec![click(at, 96000), click(at, 96000)];
+        let (h, shared) = pro_q(isolated, true);
+        let lat = h.latency() as usize;
+        let mut rack = rack_with(shared, lat as u32);
+        let missed0 = MISSED_BLOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        let n = 48000;
+        let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+        let block = 480;
+        let t0 = Instant::now();
+        for (k, a) in (0..n).step_by(block).enumerate() {
+            let b = (a + block).min(n);
+            mix_into(&stems, &mix([1.0, 1.0]), SR, a, &mut l[a..b], &mut r[a..b], Some(&mut rack));
+            // the device clock: the next block is due 10 ms after this one
+            let due = Duration::from_micros((k as u64 + 1) * 10_000);
+            if let Some(wait) = due.checked_sub(t0.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+        let missed = MISSED_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) - missed0;
+        let (blocks, worst) = h.bridge_stats().unwrap_or_default();
+        println!("live, isolated {isolated}: latency {lat}, loudest {:?}, missed {missed}, {blocks} round trips, slowest {worst} µs", loudest(&l));
+        assert_eq!(loudest(&l).0, at + lat);
+        assert!(loudest(&l).1 > 1.8);
+        assert_eq!(missed, 0);
+        drop(rack);
+        h.shut_down();
+    }
+
+    fn percentiles(mut us: Vec<u64>) -> (u64, u64, u64) {
+        us.sort_unstable();
+        (us[us.len() / 2], us[us.len() * 99 / 100], us[us.len() - 1])
+    }
+
+    /// The cost of one PLUGIN_BLOCK through Pro-Q 3, in Poing and through
+    /// poing-plughost (a JSON round trip each block).
+    #[test]
+    #[ignore]
+    fn cost_per_block_in_process_and_isolated() {
+        let blocks = 2000;
+        let mut seed = 1u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let input: Vec<f32> = (0..PLUGIN_BLOCK).map(|_| noise()).collect();
+        for mode in [0.0, 1.0] {
+            for isolated in [false, true] {
+                let (mut h, _) = load(Path::new(PRO_Q), SR, None, None, LoadAs { instrument: false, isolated, realtime: false }).unwrap();
+                h.set_param(PROCESSING_MODE, mode);
+                let mut b = vst3_host::audio::AudioBuffers::new(2, 2, PLUGIN_BLOCK, SR as f64);
+                let mut us = Vec::with_capacity(blocks);
+                {
+                    let mut p = h.hosted.plugin.lock().unwrap();
+                    let _ = p.service_host_requests();
+                    for i in 0..blocks + 100 {
+                        b.inputs[0].copy_from_slice(&input);
+                        b.inputs[1].copy_from_slice(&input);
+                        let t = Instant::now();
+                        p.process_audio(&mut b).unwrap();
+                        if i >= 100 {
+                            us.push(t.elapsed().as_micros() as u64);
+                        }
+                    }
+                }
+                let (p50, p99, max) = percentiles(us);
+                println!(
+                    "{} {}: p50 {p50} µs, p99 {p99} µs, max {max} µs per {PLUGIN_BLOCK}-frame block (budget {} µs)",
+                    if mode == 0.0 { "zero latency" } else { "linear phase" },
+                    if isolated { "isolated" } else { "in-process" },
+                    PLUGIN_BLOCK as u64 * 1_000_000 / SR as u64
+                );
+                h.shut_down();
+            }
+        }
+    }
+
+    /// poing-plughost `pid`'s visible windows: (title, answers messages).
+    fn windows_of(pid: u32) -> Vec<(String, bool)> {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowTextW(hwnd: isize, s: *mut u16, n: i32) -> i32;
+            fn SendMessageTimeoutW(hwnd: isize, m: u32, w: usize, l: isize, flags: u32, ms: u32, out: *mut usize) -> isize;
+        }
+        helper_windows(pid)
+            .into_iter()
+            .map(|hwnd| {
+                let mut buf = [0u16; 256];
+                let mut r = 0usize;
+                // SAFETY: plain Win32 calls on a live window handle; WM_NULL answered within 500 ms: its messages are pumped
+                unsafe {
+                    let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 256).max(0) as usize;
+                    (String::from_utf16_lossy(&buf[..n]), SendMessageTimeoutW(hwnd, 0, 0, 0, 2, 500, &mut r) != 0)
+                }
+            })
+            .collect()
+    }
+
+    /// An isolated plugin's editor is a window of poing-plughost, and it is pumped.
+    #[test]
+    #[ignore]
+    fn an_isolated_plugin_s_editor_opens_in_its_process() {
+        let (mut h, _) = pro_q(true, true);
+        let pid = h.helper_pid().unwrap();
+        h.open_editor().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        let open = windows_of(pid);
+        h.open_editor().unwrap(); // again: raised, not a second window
+        std::thread::sleep(Duration::from_millis(300));
+        let again = windows_of(pid);
+        // the user closes it (its close box): Poing notices
+        #[link(name = "user32")]
+        extern "system" {
+            fn PostMessageW(hwnd: isize, m: u32, w: usize, l: isize) -> i32;
+        }
+        // SAFETY: WM_CLOSE to the helper's own window.
+        unsafe { PostMessageW(helper_windows(pid)[0], 0x0010, 0, 0) };
+        std::thread::sleep(Duration::from_millis(500));
+        h.last_check = Instant::now() - Duration::from_secs(1);
+        let noticed = h.pump().closed && !h.editor_open();
+        h.open_editor().unwrap(); // and it opens again
+        std::thread::sleep(Duration::from_millis(800));
+        let reopened = windows_of(pid);
+        h.close_editor();
+        std::thread::sleep(Duration::from_millis(300));
+        let closed = windows_of(pid);
+        println!("helper {pid}: open {open:?}, again {again:?}, user close noticed {noticed}, reopened {reopened:?}, closed {closed:?}");
+        assert!(open.len() == 1 && open[0].0.contains("Pro-Q") && open[0].1, "{open:?}");
+        assert_eq!(again.len(), 1);
+        assert!(noticed);
+        assert_eq!(reopened.len(), 1);
+        assert!(closed.is_empty());
+        h.shut_down();
+    }
+
+    /// A plugin instrument in its own process plays its notes, as late as it says.
+    #[test]
+    #[ignore]
+    fn an_isolated_instrument_plays_its_notes() {
+        use crate::synth::{MidiLane, NoteEvent, PluginSound, Sound};
+        const SERUM: &str = "C:/Program Files/Common Files/VST3/Serum2.vst3";
+        for isolated in [false, true] {
+            let (h, shared) = load(Path::new(SERUM), SR, None, None, LoadAs { instrument: true, isolated, realtime: true }).unwrap();
+            let mut sound = PluginSound::new("midi1", SR);
+            sound.hosted = Some(shared);
+            let note = |frame, on| NoteEvent { frame, pitch: 60, vel: 0.9, on };
+            let mut lane = MidiLane::new(0, vec![note(4800, true), note(28800, false)], Sound::Plugin(sound));
+            let n = 48000;
+            let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            let t0 = Instant::now();
+            for (k, a) in (0..n).step_by(480).enumerate() {
+                lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
+                if let Some(wait) = Duration::from_micros((k as u64 + 1) * 10_000).checked_sub(t0.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
+            let first = l.iter().position(|x| x.abs() > 1e-4);
+            println!("Serum 2, isolated {isolated}: latency {}, first sound at {first:?} (note at 4800)", h.latency());
+            let first = first.expect("it sounds");
+            assert!(first >= 4800 + h.latency() as usize && first < 4800 + h.latency() as usize + 480, "{first}");
+            // a key played live while stopped (render_live): heard as late as the plugin is
+            let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            lane.live_key(64, 100, true);
+            let t0 = Instant::now();
+            for (k, a) in (0..n).step_by(480).enumerate() {
+                lane.render_live(&mut l[a..a + 480], &mut r[a..a + 480]);
+                if let Some(wait) = Duration::from_micros((k as u64 + 1) * 10_000).checked_sub(t0.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
+            lane.live_release();
+            let live = l.iter().position(|x| x.abs() > 1e-4);
+            println!("  live key, isolated {isolated}: first sound at {live:?}");
+            let live = live.expect("the live key sounds");
+            assert!(live >= h.latency() as usize && live < h.latency() as usize + 480, "{live}");
+            drop(lane);
+            h.shut_down();
+        }
+    }
+
+    /// A linear-phase Pro-Q 3 state for an in-app test song: `POING_STATE_OUT=<file>`.
+    #[test]
+    #[ignore]
+    fn write_linear_phase_state() {
+        let Some(out) = std::env::var_os("POING_STATE_OUT") else { return };
+        let (mut h, _) = pro_q(false, false);
+        let mut b = vst3_host::audio::AudioBuffers::new(2, 2, PLUGIN_BLOCK, SR as f64);
+        for _ in 0..8 {
+            h.hosted.plugin.lock().unwrap().process_audio(&mut b).unwrap();
+        }
+        std::fs::write(&out, h.snapshot().unwrap()).unwrap();
+        println!("latency {} written to {out:?}", h.latency());
+        h.shut_down();
+    }
+
+    /// Kill poing-plughost under a playing plugin: the audio side goes quiet,
+    /// the UI sees the crash, and the plugin comes back with its state.
+    #[test]
+    #[ignore]
+    fn a_killed_helper_comes_back_with_its_state() {
+        let (mut h, shared) = pro_q(true, true);
+        let pid = h.helper_pid().unwrap();
+        let mut rack = rack_with(shared, h.latency());
+        let stems = vec![Arc::new(Stem::new(vec![0.25; 480000], vec![0.25; 480000])), click(0, 480000)];
+        let play = |rack: &mut FxRack, from: usize, blocks: usize| -> f32 {
+            let mut loud = 0.0f32;
+            for k in 0..blocks {
+                let (mut l, mut r) = (vec![0.0; 480], vec![0.0; 480]);
+                mix_into(&stems, &mix([1.0, 0.0]), SR, from + k * 480, &mut l, &mut r, Some(rack));
+                loud = loud.max(loudest(&l).1);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            loud
+        };
+        assert!(play(&mut rack, 0, 50) > 0.2, "it plays");
+        // (a knob reaches the plugin's saved state once it has processed)
+        let state = h.snapshot().unwrap();
+        let before = h.hosted.plugin.lock().unwrap().get_parameter(PROCESSING_MODE).unwrap();
+        let killed = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output().unwrap();
+        assert!(killed.status.success(), "{}", String::from_utf8_lossy(&killed.stderr));
+        let t0 = Instant::now();
+        let _ = play(&mut rack, 50 * 480, 30);
+        let mut seen = false;
+        while t0.elapsed() < Duration::from_secs(5) {
+            h.last_check = Instant::now() - Duration::from_secs(1);
+            if h.pump().crashed {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "the crash is seen");
+        let quiet = play(&mut rack, 80 * 480, 20);
+        let t1 = Instant::now();
+        h.recover(Some(&state)).unwrap();
+        let back_in = t1.elapsed();
+        let new_pid = h.helper_pid().unwrap();
+        let after = h.hosted.plugin.lock().unwrap().get_parameter(PROCESSING_MODE).unwrap();
+        let loud = play(&mut rack, 100 * 480, 60);
+        println!("killed {pid}: seen after {:?}, quiet {quiet}, back in {back_in:?} as {new_pid}, mode {before} -> {after}, playing {loud}", t0.elapsed());
+        assert_ne!(pid, new_pid);
+        assert!(quiet < 1e-6, "a dead plugin is silent, not garbage");
+        assert_eq!(before, after, "its state came back");
+        assert!(loud > 0.2, "it plays again");
+        drop(rack);
+        h.shut_down();
     }
 }
