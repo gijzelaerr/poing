@@ -93,6 +93,8 @@ pub struct EditorState {
     pending_insts: Vec<(String, Box<crate::plugins::Hosted>)>,
     /// A plugin to play the MIDI part Claude is writing (named in the Describe).
     pub next_instrument: Option<(String, PathBuf)>,
+    /// A remix asked for when the song was dropped: made once it is understood.
+    pub pending_remix: Option<String>,
 }
 
 impl EditorState {
@@ -169,6 +171,7 @@ impl EditorState {
             #[cfg(windows)]
             pending_insts: Vec::new(),
             next_instrument: None,
+            pending_remix: None,
         }
         .with_fx()
     }
@@ -883,6 +886,88 @@ impl EditorState {
     }
 
     /// The song take being heard, if any.
+    /// Pick the version that is playing (a song take, else version 1) as the
+    /// song of a draft: its audio becomes the original (the one it replaces
+    /// becomes that take) and the draft ends. The caller starts the analysis.
+    pub fn use_version(&mut self) -> Result<String, String> {
+        if !self.project.is_draft() {
+            return Err("this song is already chosen".into());
+        }
+        let mut name = "Version 1".to_string();
+        if let Some((stem_i, take)) = self.song_take().map(|(i, t)| (i, t.clone())) {
+            let dir = self.dir();
+            let orig_track = self.project.track_index("original").ok_or("the song has no original")?;
+            let (a, b, tmp) = (dir.join(&self.project.tracks[orig_track].file), dir.join(&take.file), dir.join("swap.tmp"));
+            std::fs::rename(&a, &tmp).and_then(|_| std::fs::rename(&b, &a)).and_then(|_| std::fs::rename(&tmp, &b)).map_err(|e| format!("swap the versions: {e}"))?;
+            let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+            lanes.swap(orig_track, stem_i);
+            let len = lanes[orig_track].l.len() as f64 / self.sr() as f64;
+            let other = lanes[stem_i].l.len() as f64 / self.sr() as f64;
+            self.publish_stems(Arc::new(lanes));
+            if let Some(k) = self.project.take_index(&take.id) {
+                let t = &mut self.project.takes_mut()[k];
+                name = std::mem::replace(&mut t.prompt, "Version 1".into());
+                t.end = other;
+            }
+            self.project.duration = len;
+            self.active.clear();
+            self.focus = None;
+        }
+        self.project.draft = None;
+        // the files moved: an undo from before would point at the wrong audio
+        self.undo.clear();
+        self.redo.clear();
+        self.push_mix();
+        self.sel_changed = true;
+        self.save()?;
+        Ok(name)
+    }
+
+    /// Copy the remix that is playing over section `i` into a section take:
+    /// remixes line up with the song, so each section can come from another.
+    pub fn use_remix_here(&mut self, i: usize) -> Result<String, String> {
+        let s = self.project.sections().get(i).cloned().ok_or("no such section")?;
+        let (stem_i, remix) = self.song_take().map(|(k, t)| (k, t.clone())).ok_or("play a remix first (click it above the lanes)")?;
+        if remix.engine != "acestep-cover" {
+            return Err(format!("{} does not line up with the song in time, so it cannot fill one section", remix.prompt));
+        }
+        let src = self.stems[stem_i].clone();
+        let sr = self.sr() as f64;
+        // a little either side: the take fades in and out across the section's edges
+        let m = audio::TAKE_RAMP_S * 0.5;
+        let (a, b) = ((s.start - m).max(0.0), (s.end + m).min(self.duration()));
+        let (fa, fb) = ((a * sr) as usize, ((b * sr) as usize).min(src.l.len()));
+        if fb <= fa {
+            return Err("the remix is shorter than that section".into());
+        }
+        let (id, seed) = self.project.next_take();
+        let take = Take {
+            file: format!("takes/{id}.wav"),
+            id,
+            scope: "section".into(),
+            start: a,
+            end: b,
+            engine: "copy".into(),
+            prompt: format!("{} in the {}", remix.prompt, s.label),
+            seed,
+            track: None,
+            blend: None,
+        };
+        audio::write_wav(&self.dir().join(&take.file), &src.l[fa..fb], &src.r[fa..fb], self.sr(), 1.0).map_err(|e| e.to_string())?;
+        let stem = Stem::new(src.l[fa..fb].to_vec(), src.r[fa..fb].to_vec());
+        let what = take.prompt.clone();
+        self.add_take(take, stem)?;
+        // every section picked so far plays together (a song take would hide them)
+        let picked: Vec<String> = self.project.takes().iter().filter(|t| t.engine == "copy").map(|t| t.id.clone()).collect();
+        for id in picked {
+            if !self.take_on(&id) {
+                self.toggle_take(&id);
+            }
+        }
+        self.sel = Selection::Section(i);
+        Ok(format!("{what}: the rest of the song plays as before. Pick another remix and section to combine more."))
+    }
+
     pub fn song_take(&self) -> Option<(usize, &Take)> {
         self.active.iter().filter_map(|id| self.project.take_index(id)).find_map(|i| {
             let t = &self.project.takes()[i];
@@ -1148,4 +1233,10 @@ impl EditorState {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Takes shown by their own name (song versions, remixes, combined sections)
+/// rather than their number.
+pub fn named_take(t: &Take) -> bool {
+    matches!(t.engine.as_str(), "acestep-song" | "acestep-cover" | "copy")
 }

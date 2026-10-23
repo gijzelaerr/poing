@@ -702,10 +702,12 @@ impl DawTimeline {
         if !st.project.takes().is_empty() {
             self.text(cx, left + 14.0, takes_y + 9.0, dim, "Takes");
             let mut x = x0;
-            let names: Vec<(String, Option<String>)> = std::iter::once(("Original".to_string(), None))
+            let original = if st.project.is_draft() { "Version 1" } else { "Original" };
+            let names: Vec<(String, Option<String>)> = std::iter::once((original.to_string(), None))
                 .chain(st.project.takes().iter().map(|t| {
                     let n = t.id.trim_start_matches('t');
                     let label = match (t.scope.as_str(), t.track.as_deref()) {
+                        _ if crate::state::named_take(t) => t.prompt.clone(),
                         ("lane" | "layer", Some(track)) => format!("Take {n} · {track}"),
                         ("section", _) => format!("Take {n} · {:.0}s", t.start),
                         _ => format!("Take {n}"),
@@ -732,7 +734,8 @@ impl DawTimeline {
             self.shape(cx, card, 8.0, rgba(CARD, 1.0), rgba(CARD, 1.0));
             self.shape(cx, Rect { pos: dvec2(left + 6.0, lanes_y), size: dvec2(HEADER_W - 12.0, h) }, 8.0, rgba(HEADER, 1.0), rgba(HEADER, 1.0));
             self.shape(cx, Rect { pos: dvec2(left + 16.0, lanes_y + 14.0), size: dvec2(8.0, 8.0) }, 8.0, rgba(ACCENT, 1.0), rgba(ACCENT, 1.0));
-            self.bold(cx, left + 30.0, lanes_y + 10.0, white, &format!("Take {}", id.trim_start_matches('t')));
+            let name = st.project.take_index(id).map(|k| &st.project.takes()[k]).filter(|t| crate::state::named_take(t)).map(|t| t.prompt.clone());
+            self.bold(cx, left + 30.0, lanes_y + 10.0, white, &name.unwrap_or_else(|| format!("Take {}", id.trim_start_matches('t'))));
             self.text(cx, left + 30.0, lanes_y + 28.0, dim, "the whole song");
             self.wave(cx, st, *stem, lanes_y, h.min(280.0), rgba(ACCENT, 0.9));
         }
@@ -863,7 +866,8 @@ impl DawTimeline {
                 let r = Rect { pos: dvec2(x, y), size: dvec2(tw, h) };
                 self.shape_bordered(cx, r, 8.0, rgba(ACCENT, 0.12), rgba(ACCENT, 0.06), rgba(ACCENT, 0.9), 1.5);
                 if tw > 60.0 {
-                    self.pill(cx, x + 6.0, y + 6.0, 16.0, &format!("Take {}", t.id.trim_start_matches('t')), rgba(ACCENT, 1.0), rgba(0xffffff, 1.0));
+                    let label = if crate::state::named_take(t) { t.prompt.clone() } else { format!("Take {}", t.id.trim_start_matches('t')) };
+                    self.pill(cx, x + 6.0, y + 6.0, 16.0, &label, rgba(ACCENT, 1.0), rgba(0xffffff, 1.0));
                 }
             }
         }

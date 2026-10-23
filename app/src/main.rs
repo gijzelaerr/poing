@@ -13,11 +13,12 @@ mod fx_writer;
 mod plugins;
 mod synth;
 mod midi_writer;
+mod song_writer;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
 
-use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, Stem, Yue2Fixture};
+use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, SongJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
 use makepad_micro_serde::DeJson;
 use model::{default_gain_for, demucs_stem_for, is_master_effect_text, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
@@ -80,6 +81,46 @@ script_mod! {
 
     let Caption = Label{
         draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9}}
+    }
+
+    // The start screen's three ways in.
+    let HomeCard = RoundedView{
+        width: 300 height: 240 flow: Down spacing: 10
+        padding: Inset{left: 18 right: 18 top: 18 bottom: 18}
+        show_bg: true
+        draw_bg +: {color: #x181a20 border_radius: 12.0 border_size: 1.0 border_color: HAIRLINE}
+    }
+    let CardTitle = Label{
+        draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 13}}
+    }
+    let CardText = Label{
+        width: Fill
+        draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9.5}}
+    }
+    let PromptFrame = RoundedView{
+        width: Fill height: 34
+        padding: Inset{left: 12 right: 6 top: 0 bottom: 0}
+        show_bg: true
+        draw_bg +: {color: FIELD border_radius: 17.0 border_size: 1.0 border_color: HAIRLINE}
+    }
+    let PromptInput = TextInputFlat{
+        width: Fill height: 34
+        padding: Inset{left: 2 right: 4 top: 8.2 bottom: 9.8}
+        margin: Inset{left: 0 right: 0 top: 0 bottom: 0}
+        draw_bg +: {
+            border_radius: 0.0 border_size: 0.0
+            color: #00000000 color_hover: #00000000 color_focus: #00000000
+            color_down: #00000000 color_empty: #00000000
+            border_color: #00000000 border_color_hover: #00000000
+            border_color_focus: #00000000 border_color_down: #00000000
+            border_color_empty: #00000000
+        }
+        draw_cursor +: {color: ACCENT}
+        draw_text +: {
+            color: TEXT color_hover: TEXT color_focus: #xffffff
+            color_empty: #x6b717c color_empty_hover: #x7b818c
+            text_style: theme.font_regular{font_size: 10}
+        }
     }
 
     startup() do #(App::script_component(vm)){
@@ -152,6 +193,10 @@ script_mod! {
                                 }
                             }
                         }
+                        songs_btn := PillButton{
+                            margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
+                            text: "Songs"
+                        }
                         render_btn := PillButton{
                             margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
                             text: "Export"
@@ -162,14 +207,42 @@ script_mod! {
                     // The start screen: shown until a song is open.
                     home := View{
                         visible: false
-                        width: Fill height: Fill flow: Down spacing: 10
-                        align: Align{x: 0.5 y: 0.38}
+                        width: Fill height: Fill flow: Down spacing: 14
+                        align: Align{x: 0.5 y: 0.3}
                         Label{
-                            text: "Drop a song here"
+                            text: "Start a song"
                             draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 22}}
                         }
-                        Caption{
-                            text: "MP3, WAV, FLAC or OGG. Poing splits it into parts and finds its sections, chords and words; everything stays next to the song in a .poing folder."
+                        home_cards := View{
+                            width: Fit height: Fit flow: Right spacing: 16
+                            margin: Inset{top: 6 bottom: 0 left: 0 right: 0}
+                            split_card := HomeCard{
+                                CardTitle{text: "Split a song"}
+                                CardText{text: "Drop an MP3, WAV, FLAC or OGG on this card. Poing splits it into parts and finds its sections, chords and words."}
+                                View{width: Fill height: Fill}
+                                Caption{text: "Drop a song here"}
+                            }
+                            remix_card := HomeCard{
+                                CardTitle{text: "Remix a song"}
+                                CardText{text: "Say how, then drop the song on this card. Poing makes three remixes to compare, and you can mix them per section."}
+                                View{width: Fill height: Fill}
+                                PromptFrame{
+                                    remix_input := PromptInput{empty_text: "e.g. 80s disco, Dutch female vocals"}
+                                }
+                            }
+                            new_card := HomeCard{
+                                CardTitle{text: "Make a new song"}
+                                CardText{text: "Say what it is about and how it sounds. Claude writes the words, ACE-Step sings three versions, you pick one."}
+                                View{width: Fill height: Fill}
+                                PromptFrame{
+                                    new_input := PromptInput{empty_text: "e.g. a summer song about the farm"}
+                                }
+                                make_btn := PillButton{text: "Make it"}
+                            }
+                        }
+                        home_status := Label{
+                            text: ""
+                            draw_text +: {color: TEXT_2 text_style: theme.font_regular{font_size: 9.5}}
                         }
                         home_error := Label{
                             text: ""
@@ -228,11 +301,12 @@ script_mod! {
                             align: Align{y: 0.5}
                             section_input := TextInput{width: 200 empty_text: "section name"}
                             merge_btn := PillButton{text: "Merge into previous"}
+                            use_remix_btn := PillButton{text: "Use the playing remix here"}
                         }
                         take_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
-                            take_blend := Slider{width: 300 text: "Blend %" min: 0.0 max: 100.0 step: 1.0 precision: 0 default: 100.0}
+                            take_blend_box := View{width: Fit height: Fit take_blend := Slider{width: 300 text: "Blend %" min: 0.0 max: 100.0 step: 1.0 precision: 0 default: 100.0}}
                             keep_btn := PillButton{text: "Keep as a new song"}
                             delete_take_btn := PillButton{text: "Delete take"}
                         }
@@ -273,6 +347,9 @@ pub struct App {
     /// The songs the start screen lists, in button order.
     #[rust]
     recent: Vec<PathBuf>,
+    /// The start screen is showing (also while a song stays open behind it).
+    #[rust]
+    home_shown: bool,
 }
 
 /// Audio Poing can import (what makepad-audio-decode reads).
@@ -292,7 +369,7 @@ fn typing(ui: &WidgetRef, cx: &Cx) -> bool {
     if focus.is_empty() {
         return false;
     }
-    let fields = [ids!(describe_input), ids!(note_input), ids!(section_input)];
+    let fields = [ids!(describe_input), ids!(note_input), ids!(section_input), ids!(remix_input), ids!(new_input)];
     if fields.iter().any(|id| ui.widget(cx, *id).area() == focus) {
         return true;
     }
@@ -421,6 +498,50 @@ fn song_meta(p: &Project) -> String {
 fn show_title(ui: &WidgetRef, cx: &mut Cx, p: &Project) {
     ui.label(cx, ids!(project_label)).set_text(cx, &p.name);
     ui.label(cx, ids!(project_meta)).set_text(cx, &song_meta(p));
+}
+
+/// The remix asked for when the song was dropped (once it is understood):
+/// three ACE-Step covers, close to free, each a song take.
+fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
+    let Some(prompt) = st.pending_remix.take() else { return String::new() };
+    let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let Some(source) = st.project.source.clone() else { return "This song has no audio to remix".into() };
+    let a = st.project.analysis.clone().unwrap_or_default();
+    let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
+    let how = [(0.6, "close"), (0.45, "looser"), (0.3, "free")];
+    let mut takes = Vec::new();
+    for (k, (_, name)) in how.iter().enumerate() {
+        let (id, seed) = st.project.next_take();
+        takes.push(Take {
+            file: format!("takes/{id}.wav"),
+            id,
+            scope: "song".into(),
+            start: 0.0,
+            end: 0.0,
+            engine: "acestep-cover".into(),
+            prompt: format!("Remix {} · {name}", k + 1),
+            seed,
+            track: None,
+            blend: None,
+        });
+    }
+    let job = SongJob {
+        task: "cover".into(),
+        caption: prompt.clone(),
+        lyrics,
+        bpm: a.tempo.map(f64::round),
+        key: a.key,
+        src: Some(bundle.join(source).to_string_lossy().into_owned()),
+        strengths: Some(how.iter().map(|(s, _)| *s).collect()),
+        seeds: Some(takes.iter().map(|t| t.seed).collect()),
+        ..Default::default()
+    };
+    if !jobs.submit(Job::Remix { bundle, takes, job, sr: st.sr() }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some(("Remix".into(), 0.0));
+    let _ = st.save();
+    format!("Making three remixes as \"{prompt}\" (close, looser, free; a minute or two)...")
 }
 
 /// Describe on the whole song: queue a YuE2 cover take rendered from the
@@ -811,6 +932,17 @@ impl App {
     fn show_song_view(&mut self, cx: &mut Cx, song: bool) {
         let ui = self.ui.clone();
         ui.view(cx, ids!(home)).set_visible(cx, !song);
+        self.home_shown = !song;
+        ui.view(cx, ids!(describe_frame)).set_visible(cx, song);
+        for b in [ids!(render_btn), ids!(songs_btn)] {
+            ui.button(cx, b).set_visible(cx, song);
+        }
+        if !song {
+            ui.button(cx, ids!(play_btn)).set_visible(cx, false);
+            ui.button(cx, ids!(pause_btn)).set_visible(cx, false);
+            ui.label(cx, ids!(project_label)).set_text(cx, "Poing");
+            ui.label(cx, ids!(project_meta)).set_text(cx, "");
+        }
         for id in [ids!(timeline_box), ids!(inspector_box)] {
             ui.view(cx, id).set_visible(cx, song);
         }
@@ -827,7 +959,8 @@ impl App {
                 Open::Audio(audio) => import(&audio, 48000)?.0,
             };
             let mut project = Project::load(&path)?;
-            let analyse = project.source.is_some() && !project.is_analysed();
+            // a draft waits until one of its versions is picked
+            let analyse = project.source.is_some() && !project.is_analysed() && !project.is_draft();
             let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             // A take whose audio is gone is dropped rather than failing the song.
             project.takes_mut().retain(|t| dir.join(&t.file).exists());
@@ -892,13 +1025,55 @@ impl App {
 
     /// Understand the song in the background; lanes fill in when it lands.
     fn start_analysis(&self, st: &mut EditorState) {
-        let (Some(jobs), Some(source)) = (&self.jobs, st.project.source.clone()) else { return };
+        analyse(self.jobs.as_ref(), st);
+    }
+
+    /// The start screen's "Make it": a new song from the prompt.
+    fn make_song(&mut self, cx: &mut Cx, prompt: &str) {
+        let ui = self.ui.clone();
+        ui.label(cx, ids!(home_error)).set_text(cx, "");
+        if prompt.trim().is_empty() {
+            ui.label(cx, ids!(home_error)).set_text(cx, "Say first what the song should be.");
+            return;
+        }
+        let job = Job::Song { prompt: prompt.trim().to_string(), dir: audio::songs_dir(), count: 3, sr: 48000 };
+        let queued = self.jobs.as_ref().is_some_and(|j| j.submit(job));
+        let line = if queued { "Claude is writing the song..." } else { "The job worker is not running" };
+        ui.label(cx, ids!(home_status)).set_text(cx, line);
+        cx.set_key_focus(Area::Empty);
+    }
+
+    /// A song dropped on the Remix card: open it and remix it once understood.
+    fn remix_song(&mut self, cx: &mut Cx, audio: PathBuf) {
+        let ui = self.ui.clone();
+        let prompt = ui.text_input(cx, ids!(remix_input)).text();
+        if prompt.trim().is_empty() {
+            ui.label(cx, ids!(home_error)).set_text(cx, "Say first how to remix it (the field on the Remix card), then drop the song again.");
+            return;
+        }
+        self.open(cx, Open::Audio(audio));
+        let Some(st) = self.state.as_mut() else { return };
+        st.pending_remix = Some(prompt.trim().to_string());
+        let status = match (&self.jobs, st.project.is_analysed()) {
+            (Some(jobs), true) => start_remix(st, jobs),
+            _ => format!("Poing is listening to the song first; then it makes three remixes as \"{}\"", prompt.trim()),
+        };
+        self.set_status(cx, &status);
+    }
+}
+
+/// Understand the song in the background; lanes fill in when it lands.
+fn analyse(jobs: Option<&Jobs>, st: &mut EditorState) {
+    {
+        let (Some(jobs), Some(source)) = (jobs, st.project.source.clone()) else { return };
         let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
         if jobs.submit(Job::Analyze { audio: bundle.join(source), bundle, sr: st.sr() }) {
             st.analysing = Some(("Starting analysis".into(), 0.0));
         }
     }
+}
 
+impl App {
     /// Show the inspector row for the current selection and fill its widgets.
     fn refresh_inspector(&mut self, cx: &mut Cx) {
         let Some(st) = &mut self.state else { return };
@@ -973,6 +1148,8 @@ impl App {
                 let s = st.project.sections()[i].clone();
                 ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Section {}   {:.2}s - {:.2}s   ·   Describe above to repaint it", i + 1, s.start, s.end));
                 ui.text_input(cx, ids!(section_input)).set_text(cx, &s.label);
+                let remix_on = st.song_take().is_some_and(|(_, t)| t.engine == "acestep-cover");
+                ui.button(cx, ids!(use_remix_btn)).set_visible(cx, remix_on);
                 show_section = true;
             }
             _ => match st.focused_take() {
@@ -989,12 +1166,18 @@ impl App {
                         ("layer", Some(track)) => format!("  ·  added to {track}"),
                         _ => String::new(),
                     };
-                    let title = format!("Take {n}  ·  {}{on}  ·  {span}  ·  seed {}", t.prompt, t.seed);
+                    let title = if state::named_take(&t) {
+                        format!("{}  ·  {span}", t.prompt)
+                    } else {
+                        format!("Take {n}  ·  {}{on}  ·  {span}  ·  seed {}", t.prompt, t.seed)
+                    };
                     ui.label(cx, ids!(insp_title)).set_text(cx, &title);
+                    ui.button(cx, ids!(delete_take_btn)).set_visible(cx, true);
                     let blends = t.scope == "lane" || t.scope == "layer";
-                    ui.slider(cx, ids!(take_blend)).set_visible(cx, blends);
+                    ui.view(cx, ids!(take_blend_box)).set_visible(cx, blends);
                     ui.slider(cx, ids!(take_blend)).set_value(cx, (t.blend() * 100.0).round());
                     let keep = match t.scope.as_str() {
+                        "song" if st.project.is_draft() => "Use this version",
                         "song" => "Keep as a new song",
                         "layer" => "Keep as a lane",
                         "lane" => "Keep in the lane",
@@ -1002,6 +1185,14 @@ impl App {
                     };
                     ui.button(cx, ids!(keep_btn)).set_visible(cx, !keep.is_empty());
                     ui.button(cx, ids!(keep_btn)).set_text(cx, keep);
+                    show_take = true;
+                }
+                None if st.project.is_draft() => {
+                    ui.label(cx, ids!(insp_title)).set_text(cx, "Version 1  ·  click the versions above the lanes to compare them, then use the one you like");
+                    ui.view(cx, ids!(take_blend_box)).set_visible(cx, false);
+                    ui.button(cx, ids!(keep_btn)).set_visible(cx, true);
+                    ui.button(cx, ids!(keep_btn)).set_text(cx, "Use this version");
+                    ui.button(cx, ids!(delete_take_btn)).set_visible(cx, false);
                     show_take = true;
                 }
                 None => ui.label(cx, ids!(insp_title)).set_text(cx, HELP),
@@ -1038,11 +1229,38 @@ impl App {
                     if let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) {
                         st.analysing = None;
                     }
+                    if self.home_shown {
+                        self.ui.label(cx, ids!(home_status)).set_text(cx, "");
+                        self.ui.label(cx, ids!(home_error)).set_text(cx, &message);
+                    }
+                    message
+                }
+                JobUpdate::Starting { message, progress } => {
+                    let line = format!("{message}  {:.0}%", progress * 100.0);
+                    self.ui.label(cx, ids!(home_status)).set_text(cx, &line);
+                    line
+                }
+                JobUpdate::SongReady { project } => {
+                    self.ui.label(cx, ids!(home_status)).set_text(cx, "");
+                    if let Some(st) = self.state.as_mut() {
+                        let _ = st.save();
+                    }
+                    self.open(cx, Open::Project(project));
+                    if let Some(st) = self.state.as_mut() {
+                        st.analysing = Some(("Song".into(), 0.4));
+                    }
+                    "Version 1 is here and playing is up to you (Space). The other versions follow; each shows up above the lanes.".into()
+                }
+                JobUpdate::Finished { bundle, message } => {
+                    if let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) {
+                        st.analysing = None;
+                        st.sel_changed = true;
+                    }
                     message
                 }
                 JobUpdate::Progress { bundle, message, progress } => {
                     let Some(st) = self.state.as_mut().filter(|_| mine(&bundle)) else { continue };
-                    let what = if message.starts_with("Take") || message.starts_with("Effect") || message.starts_with("Part") { "" } else { "Analysing  ·  " };
+                    let what = if ["Take", "Effect", "Part", "Remix", "Song"].iter().any(|p| message.starts_with(p)) { "" } else { "Analysing  ·  " };
                     let line = format!("{what}{message}  {:.0}%", progress * 100.0);
                     st.analysing = Some((message, progress));
                     line
@@ -1102,6 +1320,13 @@ impl App {
                         .and_then(|t| Analysis::deserialize_json_lenient(&t).map_err(|e| format!("parse {}: {e:?}", file.display())))
                         .and_then(|a| st.apply_analysis(a, stems));
                     match result {
+                        Ok(()) if st.pending_remix.is_some() => {
+                            show_title(&self.ui, cx, &st.project);
+                            match &self.jobs {
+                                Some(jobs) => format!("Understood. {}", start_remix(st, jobs)),
+                                None => "The job worker is not running".into(),
+                            }
+                        }
                         Ok(()) => {
                             show_title(&self.ui, cx, &st.project);
                             let a = st.project.analysis.as_ref();
@@ -1164,6 +1389,22 @@ impl MatchEvent for App {
                 return;
             }
         }
+        // the start screen
+        let new_prompt = ui.text_input(cx, ids!(new_input)).returned(actions).map(|(t, _)| t);
+        if new_prompt.is_some() || ui.button(cx, ids!(make_btn)).clicked(actions) {
+            let prompt = new_prompt.unwrap_or_else(|| ui.text_input(cx, ids!(new_input)).text());
+            self.make_song(cx, &prompt);
+            return;
+        }
+        if ui.button(cx, ids!(songs_btn)).clicked(actions) {
+            if let Some(st) = self.state.as_mut() {
+                st.shared.set_playing(false);
+                st.sel_changed = true;
+                let _ = st.save();
+            }
+            self.show_home(cx, None);
+            return;
+        }
         let Some(st) = &mut self.state else { return };
         let mut status: Option<String> = None;
 
@@ -1198,7 +1439,15 @@ impl MatchEvent for App {
                 });
             }
         }
-        if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.analysing.is_some() {
+        if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.project.is_draft() {
+            match st.use_version() {
+                Ok(name) => {
+                    analyse(self.jobs.as_ref(), st);
+                    status = Some(format!("{name} it is. Poing is listening to it: parts, sections, chords and words fill in as they come."));
+                }
+                Err(e) => status = Some(format!("Could not use it: {e}")),
+            }
+        } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.analysing.is_some() {
             status = Some("A job is still running; keep the take when it is done.".into());
         } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.focused_take().is_some_and(|t| t.scope != "song") {
             let id = st.focus.clone().unwrap_or_default();
@@ -1289,6 +1538,9 @@ impl MatchEvent for App {
                     st.dirty = true;
                 }
             }
+            if ui.button(cx, ids!(use_remix_btn)).clicked(actions) {
+                status = Some(st.use_remix_here(i).unwrap_or_else(|e| format!("Could not use it here: {e}")));
+            }
             if ui.button(cx, ids!(merge_btn)).clicked(actions) {
                 status = st.delete_selected();
             }
@@ -1342,7 +1594,15 @@ impl AppMain for App {
                     DragItem::FilePath { path, .. } => target_for(Path::new(path)),
                     _ => None,
                 });
-                if let Some(target) = target {
+                // on the start screen, the card it lands on says what to do with it
+                let on_remix = self.home_shown && self.ui.view(cx, ids!(remix_card)).area().rect(cx).contains(e.abs);
+                if let (true, Some(Open::Audio(audio))) = (on_remix, &target) {
+                    if let Some(st) = self.state.as_mut() {
+                        let _ = st.save();
+                    }
+                    self.remix_song(cx, audio.clone());
+                    self.refresh_inspector(cx);
+                } else if let Some(target) = target {
                     if let Some(st) = self.state.as_mut() {
                         let _ = st.save();
                     }

@@ -25,6 +25,9 @@ pub struct Project {
     pub master_fx: Option<Vec<Fx>>,
     /// Effects ever made, so their ids and files never repeat.
     pub fx_made: Option<u64>,
+    /// Made from a prompt: its versions (the original and its song takes) wait
+    /// for one to be picked before the song is analysed.
+    pub draft: Option<bool>,
 }
 
 /// One generated version of part of the song, played over [start, end]:
@@ -506,7 +509,12 @@ impl Project {
             takes_made: None,
             master_fx: None,
             fx_made: None,
+            draft: None,
         }
+    }
+
+    pub fn is_draft(&self) -> bool {
+        self.draft == Some(true)
     }
 
     pub fn is_analysed(&self) -> bool {
@@ -681,6 +689,7 @@ mod tests {
             takes_made: None,
             master_fx: None,
             fx_made: None,
+            draft: None,
         }
     }
 

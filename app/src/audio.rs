@@ -619,6 +619,29 @@ pub enum Job {
     WriteFx { bundle: PathBuf, lane: Option<usize>, request: String, context: String },
     /// A new part: lego plays it, then it is cleaned and fitted into the gaps.
     Layer { bundle: PathBuf, take: Take, lego: LegoJob, clean: LayerJob, sr: u32 },
+    /// A new song from a prompt: Claude writes its sheet, ACE-Step sings
+    /// `count` versions into a new bundle in `dir`.
+    Song { prompt: String, dir: PathBuf, count: usize, sr: u32 },
+    /// Remixes of the song in `bundle` (ACE-Step cover), one song take each.
+    Remix { bundle: PathBuf, takes: Vec<Take>, job: SongJob, sr: u32 },
+}
+
+/// What `sidecar/acestep_song.py` reads.
+#[derive(SerJson, Clone, Default)]
+pub struct SongJob {
+    pub task: String,
+    pub out_dir: String,
+    pub count: usize,
+    pub caption: String,
+    pub lyrics: String,
+    pub language: Option<String>,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    pub duration: Option<f64>,
+    pub src: Option<String>,
+    pub strengths: Option<Vec<f64>>,
+    pub seeds: Option<Vec<u64>>,
+    pub thinking: bool,
 }
 
 /// What `sidecar/acestep_repaint.py` reads (src, out, start and end are filled in by the job).
@@ -662,6 +685,12 @@ pub enum JobUpdate {
     TakeReady { bundle: PathBuf, take: Take, stem: Stem },
     /// A MIDI part Claude wrote, checked and snapped to the grid.
     MidiReady { bundle: PathBuf, name: String, role: String, notes: Vec<poing_model::Note>, request: String, note: String },
+    /// A job for `bundle` is done (its status line says what came of it).
+    Finished { bundle: PathBuf, message: String },
+    /// A song made from a prompt has its first version: open it.
+    SongReady { project: PathBuf },
+    /// Progress of a job that has no song open yet (a new song being made).
+    Starting { message: String, progress: f32 },
     /// An effect Claude wrote and Poing checked, for lane `lane` (None: master).
     FxReady { bundle: PathBuf, lane: Option<usize>, name: String, code: String, request: String, note: String },
 }
@@ -689,6 +718,8 @@ impl Jobs {
                         Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, &up_tx),
                         Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, &up_tx),
                         Job::WriteMidi { bundle, request, role, sheet, bars, range } => write_midi(&bundle, request, &role, &sheet, bars, range, &up_tx),
+                        Job::Song { prompt, dir, count, sr } => make_song(&prompt, &dir, count, sr, &up_tx),
+                        Job::Remix { bundle, takes, job, sr } => remix(&bundle, takes, job, sr, &up_tx),
                     }
                 }
             })
@@ -836,6 +867,9 @@ struct SidecarLine {
     /// Repaint: where the written range starts and ends in the song.
     start: Option<f64>,
     end: Option<f64>,
+    /// A finished version (acestep_song.py): its number and file.
+    index: Option<usize>,
+    path: Option<String>,
 }
 
 /// Run the sidecar on `audio` into `bundle`, relaying its progress, then decode
@@ -1055,6 +1089,8 @@ struct UvScript<'a> {
     envs: Vec<(&'a str, std::ffi::OsString)>,
     /// stderr goes here
     log: PathBuf,
+    /// Sees every progress line (e.g. a finished version) as it comes.
+    on_line: Option<&'a dyn Fn(&SidecarLine)>,
 }
 
 /// Run a script that prints JSON progress lines, mapping its 0..1 into
@@ -1096,6 +1132,9 @@ fn run_uv_script(run: UvScript, progress: &dyn Fn(&str, f32), from: f32, to: f32
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
             let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
+            if let Some(f) = run.on_line {
+                f(&l);
+            }
             let message = l.message.unwrap_or_default();
             match l.stage.as_str() {
                 "error" => error = Some(message),
@@ -1134,6 +1173,7 @@ fn dereverb(bundle: &Path, take: Take, lane: &Path, sr: u32, tx: &Sender<JobUpda
         cwd: None,
         envs: Vec::new(),
         log: work.join("render.log"),
+        on_line: None,
     };
     if let Err(e) = run_uv_script(run, &progress, 0.0, 1.0) {
         return fail(e);
@@ -1197,6 +1237,7 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
         cwd: Some(ace.clone()),
         envs: vec![("POING_ACESTEP", ace.into())],
         log: work.join("lego.log"),
+        on_line: None,
     };
     if let Err(e) = run_uv_script(run, &progress, 0.0, 0.75) {
         return fail(e);
@@ -1208,6 +1249,7 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
         cwd: None,
         envs: Vec::new(),
         log: work.join("layer.log"),
+        on_line: None,
     };
     if let Err(e) = run_uv_script(run, &progress, 0.75, 1.0) {
         return fail(e);
@@ -1255,6 +1297,158 @@ fn write_fx(bundle: &Path, lane: Option<usize>, request: String, context: &str, 
             send(tx, JobUpdate::FxReady { bundle: bundle.to_path_buf(), lane, name: w.name, code: w.code, request, note });
         }
         Ok(w) => fail(w.problems.join("; ")),
+        Err(e) => fail(e),
+    }
+}
+
+/// Where new songs go: `POING_SONGS`, else `Music/Poing` in the home folder.
+pub fn songs_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("POING_SONGS") {
+        return PathBuf::from(d);
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
+    home.join("Music").join("Poing")
+}
+
+/// Run `sidecar/acestep_song.py` on `job` (written next to its versions),
+/// calling `version(i, file)` as each one lands.
+fn run_song_job(job: &SongJob, progress: &dyn Fn(&str, f32), version: &dyn Fn(usize, PathBuf)) -> Result<(), String> {
+    let out = PathBuf::from(&job.out_dir);
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    let job_path = out.join("job.json");
+    std::fs::write(&job_path, job.serialize_json()).map_err(|e| e.to_string())?;
+    let on_line = |l: &SidecarLine| {
+        if let (true, Some(i), Some(p)) = (l.stage == "version", l.index, l.path.as_ref()) {
+            version(i, PathBuf::from(p));
+        }
+    };
+    let ace = acestep_dir();
+    let run = UvScript {
+        project: ace.clone(),
+        script: sidecar_dir().join("acestep_song.py"),
+        args: vec![job_path.into()],
+        cwd: Some(ace.clone()),
+        envs: vec![("POING_ACESTEP", ace.into())],
+        log: out.join("song.log"),
+        on_line: Some(&on_line),
+    };
+    run_uv_script(run, progress, 0.0, 1.0).map(|_| ())
+}
+
+/// A new song from a prompt: Claude writes the sheet, ACE-Step sings
+/// `count` versions. The first becomes the song (a draft: nothing is
+/// analysed until a version is picked), the others its song takes.
+fn make_song(prompt: &str, dir: &Path, count: usize, sr: u32, tx: &Sender<JobUpdate>) {
+    use std::cell::RefCell;
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: PathBuf::new(), message: format!("The song could not be made: {why}") });
+    let bundle_cell: RefCell<Option<PathBuf>> = RefCell::new(None);
+    let progress = |message: &str, progress: f32| match bundle_cell.borrow().clone() {
+        Some(bundle) => send(tx, JobUpdate::Progress { bundle, message: format!("Song  ·  {message}"), progress }),
+        None => send(tx, JobUpdate::Starting { message: message.to_string(), progress }),
+    };
+    progress("Claude is writing the song", 0.0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let sheet = match crate::song_writer::write_sheet(prompt, &dir.join(".drafts").join(stamp.to_string())) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let base = crate::song_writer::folder_name(&sheet.title);
+    let Some(bundle) = (1..1000)
+        .map(|n| dir.join(if n == 1 { format!("{base}.poing") } else { format!("{base} {n}.poing") }))
+        .find(|b| !b.exists())
+    else {
+        return fail("no free folder name".into());
+    };
+    if let Err(e) = std::fs::create_dir_all(bundle.join("takes")) {
+        return fail(format!("create {}: {e}", bundle.display()));
+    }
+    // the words are known: no transcription needed to describe the song later
+    if !sheet.lyrics.trim().is_empty() {
+        let _ = std::fs::write(bundle.join("lyrics.txt"), &sheet.lyrics);
+    }
+    let _ = std::fs::write(bundle.join("sheet.json"), sheet.serialize_json());
+    let _ = std::fs::write(bundle.join("prompt.txt"), prompt);
+    let seeds: Vec<u64> = (0..count as u64).map(|i| (stamp % 100_000) * 13 + i * 7919).collect();
+    let job = SongJob {
+        task: "text2music".into(),
+        out_dir: bundle.join("versions").to_string_lossy().into_owned(),
+        count,
+        caption: sheet.caption.clone(),
+        lyrics: sheet.lyrics.clone(),
+        language: sheet.language.clone(),
+        bpm: sheet.bpm.map(f64::round),
+        key: sheet.key.clone(),
+        duration: sheet.duration,
+        seeds: Some(seeds.clone()),
+        thinking: true,
+        ..Default::default()
+    };
+    progress(&format!("ACE-Step is singing \"{}\" ({count} versions, about {} minutes)", sheet.title, 1 + count * 2 / 3), 0.05);
+    let version = |i: usize, file: PathBuf| {
+        if i == 1 {
+            let original = bundle.join("original.wav");
+            let made = std::fs::rename(&file, &original).map_err(|e| e.to_string()).and_then(|_| load_stem(&original, sr)).and_then(|stem| {
+                let mut p = Project::import(&sheet.title, "original.wav", stem.l.len() as f64 / sr as f64, sr);
+                p.draft = Some(true);
+                p.takes_made = Some(count.saturating_sub(1) as u64);
+                p.save(&bundle.join("project.json"))
+            });
+            match made {
+                Ok(()) => {
+                    *bundle_cell.borrow_mut() = Some(bundle.clone());
+                    send(tx, JobUpdate::SongReady { project: bundle.join("project.json") });
+                }
+                Err(e) => fail(e),
+            }
+            return;
+        }
+        let id = format!("t{}", i - 1);
+        let take = Take {
+            file: format!("takes/{id}.wav"),
+            id,
+            scope: "song".into(),
+            start: 0.0,
+            end: 0.0,
+            engine: "acestep-song".into(),
+            prompt: format!("Version {i}"),
+            seed: seeds.get(i - 1).copied().unwrap_or(0),
+            track: None,
+            blend: None,
+        };
+        let dest = bundle.join(&take.file);
+        match std::fs::rename(&file, &dest).map_err(|e| e.to_string()).and_then(|_| load_stem(&dest, sr)) {
+            Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.clone(), take, stem }),
+            Err(e) => fail(e),
+        }
+    };
+    match run_song_job(&job, &progress, &version) {
+        Ok(()) => send(tx, JobUpdate::Finished { bundle: bundle.clone(), message: format!("\"{}\": {count} versions. Click one above the lanes to hear it; Use this version starts working on it.", sheet.title) }),
+        Err(e) => fail(e),
+    }
+}
+
+/// Remix the song in `bundle` with ACE-Step cover: one song take per strength.
+fn remix(bundle: &Path, takes: Vec<Take>, mut job: SongJob, sr: u32, tx: &Sender<JobUpdate>) {
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The remix could not be made: {why}") });
+    let progress = |message: &str, progress: f32| {
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Remix  ·  {message}"), progress })
+    };
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    job.out_dir = bundle.join("takes").join(format!("remix-{stamp}")).to_string_lossy().into_owned();
+    job.count = takes.len();
+    let version = |i: usize, file: PathBuf| {
+        let Some(take) = takes.get(i - 1).cloned() else { return };
+        let dest = bundle.join(&take.file);
+        match std::fs::rename(&file, &dest).map_err(|e| e.to_string()).and_then(|_| load_stem(&dest, sr)) {
+            Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
+            Err(e) => fail(e),
+        }
+    };
+    match run_song_job(&job, &progress, &version) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&job.out_dir);
+            send(tx, JobUpdate::Finished { bundle: bundle.to_path_buf(), message: format!("{} remixes are ready: click them above the lanes to compare. Select a section and Use this remix here to combine them.", takes.len()) });
+        }
         Err(e) => fail(e),
     }
 }
