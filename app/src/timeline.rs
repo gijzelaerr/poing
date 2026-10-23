@@ -760,8 +760,10 @@ impl DawTimeline {
                 let label = if copy { format!("+ {}", s.label) } else { s.label.clone() };
                 let c = rgba(section_color(&s.label), 0.75);
                 let gw = ((s.end - s.start) * st.pps).clamp(40.0, 220.0);
-                self.shape_bordered(cx, Rect { pos: dvec2(x + 3.0, sy + 3.0), size: dvec2(gw, SECT_H - 6.0) }, 6.0, c, shade(c, 0.82), rgba(0xffffff, 0.9), 1.0);
-                self.bold(cx, x + 11.0, sy + 8.0, white, &cut(&label, ((gw - 14.0) / 6.5) as usize));
+                // beside the mark, on the side that has room
+                let gx = if x + 3.0 + gw > x0 + w { x - 3.0 - gw } else { x + 3.0 };
+                self.shape_bordered(cx, Rect { pos: dvec2(gx, sy + 3.0), size: dvec2(gw, SECT_H - 6.0) }, 6.0, c, shade(c, 0.82), rgba(0xffffff, 0.9), 1.0);
+                self.bold(cx, gx + 8.0, sy + 8.0, white, &cut(&label, ((gw - 14.0) / 6.5) as usize));
             }
         }
 

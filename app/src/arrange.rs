@@ -158,7 +158,11 @@ impl EditorState {
     fn apply_edit(&mut self, edit: &Edit) -> Result<(), String> {
         let sr = self.sr();
         let dir = self.dir();
-        let n = self.project.arranged.unwrap_or(0) + 1;
+        // past any edit undone since (its files stay on disk)
+        let mut n = self.project.arranged.unwrap_or(0) + 1;
+        while self.project.tracks.iter().any(|t| !t.file.is_empty() && dir.join(arranged_file(&t.file, n)).exists()) {
+            n += 1;
+        }
         let xf = (SPLICE_XF_S * sr as f64) as usize;
         let all = frames(&edit.pieces, sr);
         let tracks = self.project.tracks.len();
@@ -214,7 +218,13 @@ impl EditorState {
                 "song" => {
                     // a remix that lined up with the song lines up through a map now
                     if t.engine == "acestep-cover" {
-                        let map = realign.iter().find(|r| r.take == t.id).map(|r| r.pieces.clone()).unwrap_or_else(|| vec![Piece { start: 0.0, end: t.end }]);
+                        // at first it is the song's own time, as far as it goes
+                        let len = stem.l.len() as f64 / sr as f64;
+                        let mut identity = vec![Piece { start: 0.0, end: len.min(old.duration) }];
+                        if old.duration > len {
+                            identity.push(arrange::gap(old.duration - len));
+                        }
+                        let map = realign.iter().find(|r| r.take == t.id).map(|r| r.pieces.clone()).unwrap_or(identity);
                         let pieces = arrange::compose(&map, &edit.pieces);
                         realign.retain(|r| r.take != t.id);
                         realign.push(Realign { take: t.id.clone(), pieces });
@@ -381,21 +391,40 @@ impl EditorState {
         Ok(Arc::new(out))
     }
 
-    /// The remix over [a, b] of the song as it is now: a remix made before an
-    /// arrangement edit is spliced through how it lines up.
-    pub fn remix_range(&self, stem: usize, take: &Take, a: f64, b: f64) -> Option<Stem> {
+    /// The remix over [a, b] of the song as it is now, as far as it reaches:
+    /// (where it starts, where it ends, its audio). A remix made before an
+    /// arrangement edit is spliced through how it lines up now.
+    pub fn remix_range(&self, stem: usize, take: &Take, a: f64, b: f64) -> Option<(f64, f64, Stem)> {
         let src = &self.stems[stem];
         let sr = self.sr();
-        let map = self.project.realign.as_ref().and_then(|r| r.iter().find(|r| r.take == take.id)).map(|r| r.pieces.clone());
-        let pieces = match map {
-            Some(map) => arrange::compose(&map, &[Piece { start: a, end: b }]),
-            None => vec![Piece { start: a, end: b.min(src.l.len() as f64 / sr as f64) }],
-        };
-        if arrange::duration(&pieces) < b - a - 0.05 {
-            return None; // a part of the song the remix never had
+        let len = src.l.len() as f64 / sr as f64;
+        let map = self.project.realign.as_ref().and_then(|r| r.iter().find(|r| r.take == take.id)).map(|r| r.pieces.clone()).unwrap_or_else(|| vec![Piece { start: 0.0, end: len }]);
+        // where the map plays the remix, in song time: (from, to, remix time at from)
+        let spans: Vec<(f64, f64, f64)> = map
+            .iter()
+            .zip(arrange::placed(&map))
+            .filter_map(|(m, d)| {
+                let (s, e) = (a.max(d), b.min(d + m.len()));
+                (e - s > 1e-6 && !m.is_gap()).then_some((s, e, m.start + s - d))
+            })
+            .collect();
+        let (lo, hi) = (spans.first()?.0, spans.last()?.1);
+        if hi - lo < 1.0 {
+            return None;
+        }
+        // silence (past the remix's end) where it has nothing
+        let silence = len + 1.0;
+        let mut pieces = Vec::new();
+        let mut at = lo;
+        for (s, e, from) in spans {
+            if s > at + 1e-6 {
+                pieces.push(Piece { start: silence, end: silence + s - at });
+            }
+            pieces.push(Piece { start: from, end: from + e - s });
+            at = e;
         }
         let (l, r) = splice(&Source { l: &src.l, r: &src.r, offset: 0, fill: None }, &frames(&pieces, sr), (SPLICE_XF_S * sr as f64) as usize);
-        Some(Stem::new(l, r))
+        Some((lo, hi, Stem::new(l, r)))
     }
 
     /// A take that makes the song longer has landed: the song now runs to its
@@ -584,8 +613,12 @@ mod tests {
         assert_eq!(p.takes()[2].file, "takes/t3.wav");
         let map = &p.realign.as_ref().unwrap()[0];
         assert_eq!((map.take.as_str(), map.pieces.len()), ("t3", 2));
-        let chorus = st.remix_range(st.project.tracks.len() + 2, &st.project.takes()[2].clone(), 24.0, 32.0).unwrap();
+        let (a, b, chorus) = st.remix_range(st.project.tracks.len() + 2, &st.project.takes()[2].clone(), 24.0, 32.0).unwrap();
+        assert_eq!((a, b), (24.0, 32.0));
         assert!((chorus.l[100] - (0.4 + 0.0161)).abs() < 1e-4, "the copied chorus plays the remix's chorus");
+        // the copied chorus at the end, through the map
+        let (a, b, _) = st.remix_range(st.project.tracks.len() + 2, &st.project.takes()[2].clone(), 36.0, 40.0).unwrap();
+        assert_eq!((a, b), (36.0, 40.0));
         // cut the verse: the take moves without new audio
         st.arrange(&Op::Delete { section: 1 }).unwrap();
         let t1 = &st.project.takes()[0];

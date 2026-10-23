@@ -1039,6 +1039,10 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
 /// `lyrics.txt` in the bundle (hand-corrected) wins over the transcription.
 fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     let Some(jobs) = jobs else { return "The job worker is not running".into() };
+    // a chord or lyric line is selected to correct its words: Describe works on the song
+    if let Selection::Chord(_) | Selection::Lyric(_) = st.sel {
+        st.select(Selection::None);
+    }
     if !st.project.is_analysed() {
         // Not split (yet, or its download was declined): a range marked on the song can still be repainted.
         if let Some(reg) = match st.sel {
@@ -1833,6 +1837,8 @@ impl App {
         }
         st.sel_changed = false;
         let ui = self.ui.clone();
+        // an arrangement edit changes the song's length
+        show_title(&ui, cx, &st.project);
         let playing = st.shared.playing();
         ui.button(cx, ids!(play_btn)).set_visible(cx, !playing);
         ui.button(cx, ids!(pause_btn)).set_visible(cx, playing);

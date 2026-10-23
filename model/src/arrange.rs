@@ -222,20 +222,44 @@ pub fn runs(pieces: &[Piece], a: f64, b: f64, reach: f64) -> Vec<(f64, Vec<Piece
     out
 }
 
-/// A remix's pieces that line up with the song after `edit`, from the ones
-/// that lined up before (`map`: in the remix's time, played in order).
+/// Where a remix has nothing (the song runs on past it): a piece in a time
+/// it never has, `len` long. A gap never runs on into a real piece.
+pub fn gap(len: f64) -> Piece {
+    Piece { start: GAP_AT - len, end: GAP_AT }
+}
+
+const GAP_AT: f64 = -1000.0;
+
+impl Piece {
+    pub fn is_gap(&self) -> bool {
+        self.end <= GAP_AT
+    }
+}
+
+/// A remix's pieces (in its own time, gaps where it has nothing) that line up
+/// with the song after `edit`, from the ones that lined up before (`map`,
+/// covering the song before the edit).
 pub fn compose(map: &[Piece], edit: &[Piece]) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
+    let push = |out: &mut Vec<Piece>, p: Piece| match out.last_mut() {
+        Some(last) if !p.is_gap() && !last.is_gap() && (last.end - p.start).abs() < 1e-9 => last.end = p.end,
+        Some(last) if p.is_gap() && last.is_gap() => *last = gap(last.len() + p.len()),
+        _ => out.push(p),
+    };
     for e in edit {
+        let mut at = e.start;
         for (m, d) in map.iter().zip(placed(map)) {
             let (s, t) = (e.start.max(d), e.end.min(d + m.len()));
             if t - s > 1e-9 {
-                let p = Piece { start: m.start + s - d, end: m.start + t - d };
-                match out.last_mut() {
-                    Some(last) if (last.end - p.start).abs() < 1e-9 => last.end = p.end,
-                    _ => out.push(p),
+                if s > at + 1e-9 {
+                    push(&mut out, gap(s - at));
                 }
+                push(&mut out, Piece { start: m.start + s - d, end: m.start + t - d });
+                at = t;
             }
+        }
+        if e.end > at + 1e-9 {
+            push(&mut out, gap(e.end - at));
         }
     }
     out
@@ -510,6 +534,7 @@ pub fn says(op: &Op, sections: &[Section]) -> String {
         t => format!("before the {}", name(t)),
     };
     match *op {
+        Op::Move { section, to } if to == 0 || to >= sections.len() => format!("Moved the {} to the {}", name(section), if to == 0 { "start" } else { "end" }),
         Op::Move { section, to } => format!("Moved the {} {}", name(section), place(to)),
         Op::Duplicate { section, to } if to == section + 1 => format!("Repeated the {}", name(section)),
         Op::Duplicate { section, to } => format!("Repeated the {} {}", name(section), place(to)),
@@ -638,6 +663,14 @@ mod tests {
         // then the first 8 s of the new song are cut
         let m = compose(&m, &[Piece { start: 8.0, end: 48.0 }]);
         assert_eq!(m, vec![Piece { start: 8.0, end: 24.0 }, Piece { start: 16.0, end: 40.0 }]);
+        // a remix a little shorter than the song: the song keeps its time, with a gap
+        let short = [Piece { start: 0.0, end: 39.9 }, gap(0.1)];
+        let m = compose(&short, &[Piece { start: 0.0, end: 40.0 }, Piece { start: 30.0, end: 50.0 }]);
+        assert_eq!(m.len(), 4);
+        assert_eq!((m[0], m[2]), (Piece { start: 0.0, end: 39.9 }, Piece { start: 30.0, end: 39.9 }));
+        assert!(m[1].is_gap() && (m[1].len() - 0.1).abs() < 1e-9);
+        assert!(m[3].is_gap() && (m[3].len() - 10.1).abs() < 1e-9, "past its end and the song's old end: nothing");
+        assert!((duration(&m) - 60.0).abs() < 1e-9, "every second of the song is in the map");
     }
 
     #[test]

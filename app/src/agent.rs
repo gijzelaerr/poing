@@ -197,7 +197,9 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         Selection::Region(i) => format!("region {i}"),
         Selection::Fx(Some(l), i) => format!("effect {i} on lane {l}"),
         Selection::Fx(None, i) => format!("master effect {i}"),
-        _ => "nothing".into(),
+        Selection::Chord(i) => format!("chord {i}"),
+        Selection::Lyric(i) => format!("lyric line {i}"),
+        Selection::None => "nothing".into(),
     };
     json::obj(vec![
         ("name", json::s(p.name.clone())),

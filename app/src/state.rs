@@ -1165,7 +1165,7 @@ impl EditorState {
         let m = audio::TAKE_RAMP_S * 0.5;
         let (a, b) = ((s.start - m).max(0.0), (s.end + m).min(self.project.duration));
         // (through how it lines up now, if the song was rearranged since)
-        let part = self.remix_range(stem_i, &remix, a, b).filter(|p| !p.l.is_empty()).ok_or("the remix does not reach that section")?;
+        let (a, b, part) = self.remix_range(stem_i, &remix, a, b).filter(|(lo, hi, _)| *lo <= s.start + 0.1 && *hi >= s.end - 0.1).ok_or("the remix does not reach that section")?;
         let prompt = format!("{} in the {}", remix.prompt, s.label);
         // the same remix in the same section again: that take, not a copy of it
         let same = self.project.takes().iter().rev().find(|t| t.engine == "copy" && t.prompt == prompt && (t.start - a).abs() < 0.01 && (t.end - b).abs() < 0.01).map(|t| t.id.clone());
