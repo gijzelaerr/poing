@@ -1618,7 +1618,7 @@ fn finish_take(bundle: &Path, take: Take, rendered: &Path, sr: u32, tx: &Sender<
 
 /// The ACE-Step 1.5 checkout (a uv project): `POING_ACESTEP`, else
 /// `ACE-Step-1.5` next to this repository.
-fn acestep_dir() -> PathBuf {
+pub fn acestep_dir() -> PathBuf {
     std::env::var_os("POING_ACESTEP")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("ACE-Step-1.5"))

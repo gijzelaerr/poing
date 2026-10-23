@@ -233,6 +233,11 @@ pub fn makepad_remote() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Is Claude Code (`claude`) installed here?
+pub fn claude_installed() -> bool {
+    on_path("claude").is_some()
+}
+
 /// Why Claude cannot work on the song here (None: it can).
 pub fn unavailable() -> Option<String> {
     if on_path("claude").is_none() {

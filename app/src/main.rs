@@ -22,7 +22,7 @@ mod timeline;
 
 use audio::{Job, JobUpdate, Jobs, LayerJob, LegoJob, RepaintJob, SongJob, Stem, Yue2Fixture};
 use makepad_widgets::*;
-use makepad_micro_serde::DeJson;
+use makepad_micro_serde::{DeJson, DeJsonErr, DeJsonState, SerJson, SerJsonState};
 use model::{default_gain_for, demucs_stem_for, is_master_effect_text, lane_intent, snap_to_downbeats, Analysis, LaneIntent, Project, Take, LEGO_TRACKS, REGION_KINDS};
 use state::{EditorState, Selection};
 use std::path::{Path, PathBuf};
@@ -144,6 +144,14 @@ script_mod! {
         draw_bg +: {color: ACCENT}
     }
 
+    // One setting: its name on the left, what it is and how to change it on the right.
+    let SettingsRow = RoundedView{
+        width: Fill height: Fit flow: Right spacing: 20
+        padding: Inset{left: 18 right: 18 top: 14 bottom: 14}
+        show_bg: true
+        draw_bg +: {color: #x181a20 border_radius: 10.0 border_size: 1.0 border_color: HAIRLINE}
+    }
+
     // The start screen's three ways in.
     let HomeCard = RoundedView{
         width: 300 height: 240 flow: Down spacing: 10
@@ -258,6 +266,10 @@ script_mod! {
                             margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
                             text: "Export"
                         }
+                        settings_btn := PillButton{
+                            margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
+                            text: "Settings"
+                        }
                     }
                     // Open songs, one tab each: click to switch (playing on, at the same time), x to close.
                     tab_strip := SolidView{
@@ -350,6 +362,50 @@ script_mod! {
                         }
                     }
 
+                    // Settings: what Poing plays through, where its AI runs, what it found.
+                    settings := View{
+                        visible: false
+                        width: Fill height: Fill flow: Down spacing: 18
+                        padding: Inset{left: 60 right: 60 top: 36 bottom: 24}
+                        Label{
+                            text: "Settings"
+                            draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 20}}
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Sound"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                out_dd := DropDown{width: 420 labels: ["Default output"]}
+                                out_status := Caption{width: Fill text: ""}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "AI"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                ai_status := CardText{text: ""}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Compute"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                compute_status := CardText{text: "This PC: analysis, remixes and new songs run here."}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Plugins"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                plugins_status := CardText{text: ""}
+                                rescan_btn := PillButton{text: "Look for plugins again"}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Models"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                models_status := CardText{text: ""}
+                            }
+                        }
+                        settings_done := PillButton{text: "Done"}
+                    }
+
                     timeline_box := View{
                         width: Fill height: Fill flow: Down
                         timeline := mod.widgets.DawTimeline{}
@@ -409,7 +465,12 @@ script_mod! {
                             fx_bypass := CheckBox{text: "Bypass"}
                             fx_remove := PillButton{text: "Remove"}
                         }
-                        status_label := Caption{text: ""}
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 10
+                            align: Align{y: 0.5}
+                            status_label := Caption{text: ""}
+                            redo_btn := PillButton{visible: false text: "Make it again"}
+                        }
                     }
                     }
                 }
@@ -437,6 +498,24 @@ pub struct App {
     /// The start screen is showing (also while a song stays open behind it).
     #[rust]
     home_shown: bool,
+    /// The Settings panel is showing (over the start screen or a song).
+    #[rust]
+    settings_shown: bool,
+    /// Audio devices as the system last reported them.
+    #[rust]
+    audio_devices: Vec<AudioDeviceDesc>,
+    /// Jobs finished so far (the worker's JobDone numbers).
+    #[rust]
+    jobs_done: u64,
+    /// A close was refused because a job runs: closing again soon quits.
+    #[rust]
+    close_armed: Option<std::time::Instant>,
+    /// Requests whose job has not finished: (song folder, request).
+    #[rust]
+    requests: Vec<(PathBuf, Request)>,
+    /// Requests of an earlier run, cut off when Poing closed, for "Make it again".
+    #[rust]
+    interrupted: Vec<(PathBuf, Request)>,
     /// Poing's tools for an agent (Claude Code over `makepad-remote mcp poing`).
     #[rust]
     ai_port: Option<makepad_ai_services::port::AiServicePort>,
@@ -527,6 +606,83 @@ fn same_song(a: &Path, b: &Path) -> bool {
 
 /// Audio Poing can import (what makepad-audio-decode reads).
 const AUDIO_EXT: [&str; 4] = ["mp3", "wav", "flac", "ogg"];
+
+/// A request whose job has not finished, kept in the song's folder
+/// (`jobs/pending.json`) so one cut off by closing Poing can be made again.
+#[derive(SerJson, DeJson, Clone, Debug)]
+pub struct Request {
+    /// The Poing run that asked (requests of another run were cut off).
+    pub run: u64,
+    /// The job number; u64::MAX while it waits (a remix waits for the analysis).
+    pub seq: u64,
+    /// "describe" (the Describe bar, on `lane` / `section` / the song) or "remix".
+    pub kind: String,
+    pub text: String,
+    pub lane: Option<String>,
+    pub section: Option<usize>,
+}
+
+/// Keep a request until its job is done (`seq_before`: the last job number
+/// before it was made; nothing new submitted, nothing to keep). A remix
+/// waits for its song's analysis (seq u64::MAX until it is submitted).
+#[allow(clippy::too_many_arguments)]
+fn note_request_in(requests: &mut Vec<(PathBuf, Request)>, jobs: Option<&Jobs>, bundle: &Path, seq_before: u64, kind: &str, text: &str, lane: Option<String>, section: Option<usize>) {
+    let seq = match (jobs, kind) {
+        (_, "remix") => u64::MAX,
+        (Some(jobs), _) if jobs.last_seq() > seq_before => jobs.last_seq(),
+        _ => return,
+    };
+    requests.push((bundle.to_path_buf(), Request { run: run_id(), seq, kind: kind.into(), text: text.into(), lane, section }));
+    let mine: Vec<Request> = requests.iter().filter(|(b, _)| b == bundle).map(|(_, r)| r.clone()).collect();
+    write_requests(bundle, &mine);
+}
+
+/// This run of Poing (its start time and process id).
+fn run_id() -> u64 {
+    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        t.wrapping_mul(1000).wrapping_add(std::process::id() as u64)
+    })
+}
+
+fn requests_file(bundle: &Path) -> PathBuf {
+    bundle.join("jobs").join("pending.json")
+}
+
+fn read_requests(bundle: &Path) -> Vec<Request> {
+    std::fs::read_to_string(requests_file(bundle)).ok().and_then(|t| Vec::<Request>::deserialize_json_lenient(&t).ok()).unwrap_or_default()
+}
+
+fn write_requests(bundle: &Path, list: &[Request]) {
+    let file = requests_file(bundle);
+    if list.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, list.to_vec().serialize_json());
+}
+
+/// Poing's own settings (`settings.json` in its config folder).
+#[derive(SerJson, DeJson, Clone, Debug, Default)]
+pub struct Settings {
+    /// The sound output by name (None: the system default).
+    pub audio_output: Option<String>,
+}
+
+fn load_settings() -> Settings {
+    config_dir().and_then(|d| std::fs::read_to_string(d.join("settings.json")).ok()).and_then(|t| Settings::deserialize_json_lenient(&t).ok()).unwrap_or_default()
+}
+
+fn save_settings(s: &Settings) {
+    if let Some(d) = config_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let _ = std::fs::write(d.join("settings.json"), s.serialize_json());
+    }
+}
 
 /// What the command line asks to open: a project, or a song to import.
 enum Open {
@@ -1288,6 +1444,7 @@ impl App {
         }
         self.show_song_view(cx, true);
         self.refresh_tabs(cx);
+        self.offer_interrupted(cx);
     }
 
     fn open_failed(&mut self, cx: &mut Cx, e: &str) {
@@ -1427,6 +1584,8 @@ impl App {
     fn start_remix_of(&mut self, cx: &mut Cx, target: Open, prompt: String) {
         self.ui.view(cx, ids!(remix_choice)).set_visible(cx, false);
         self.open(cx, target);
+        let Some(bundle) = self.state.as_ref().and_then(|st| st.path.parent().map(Path::to_path_buf)) else { return };
+        self.note_request(&bundle, 0, "remix", &prompt, None, None);
         let Some(st) = self.state.as_mut() else { return };
         st.pending_remix = Some(prompt.clone());
         let status = match (&self.jobs, st.project.is_analysed()) {
@@ -1434,6 +1593,7 @@ impl App {
             _ => format!("Poing is listening to the song first; then it makes three remixes as \"{prompt}\""),
         };
         self.set_status(cx, &status);
+        self.sync_waiting_requests();
     }
 }
 
@@ -1598,6 +1758,8 @@ impl App {
         let mine = |b: &Path| open_bundle.as_deref() == Some(b);
         for u in updates {
             if let JobUpdate::JobDone { seq } = u {
+                self.jobs_done = self.jobs_done.max(seq);
+                self.request_done(seq);
                 let status = self.ui.label(cx, ids!(status_label)).text();
                 let (done, waiting): (Vec<_>, Vec<_>) = self.parked.drain(..).partition(|(_, s)| *s <= seq);
                 self.parked = waiting;
@@ -1749,6 +1911,7 @@ impl App {
                 }
             }
         }
+        self.sync_waiting_requests();
         self.refresh_tabs(cx);
         self.ui.widget(cx, ids!(timeline)).redraw(cx);
     }
@@ -2028,6 +2191,167 @@ impl App {
     }
 }
 
+impl App {
+    /// Keep a request until its job is done (`seq_before`: the last job
+    /// number before it was made; nothing new submitted, nothing to keep).
+    fn note_request(&mut self, bundle: &Path, seq_before: u64, kind: &str, text: &str, lane: Option<String>, section: Option<usize>) {
+        note_request_in(&mut self.requests, self.jobs.as_ref(), bundle, seq_before, kind, text, lane, section);
+    }
+
+    fn save_requests(&self, bundle: &Path) {
+        let mine: Vec<Request> = self.requests.iter().filter(|(b, _)| b == bundle).map(|(_, r)| r.clone()).collect();
+        write_requests(bundle, &mine);
+    }
+
+    /// Job `seq` is done: its request is kept no longer.
+    fn request_done(&mut self, seq: u64) {
+        let bundles: Vec<PathBuf> = self.requests.iter().filter(|(_, r)| r.seq == seq).map(|(b, _)| b.clone()).collect();
+        self.requests.retain(|(_, r)| r.seq != seq);
+        for b in bundles {
+            self.save_requests(&b);
+        }
+    }
+
+    /// A remix waits for its song's analysis; once it is submitted it gets its job number.
+    fn sync_waiting_requests(&mut self) {
+        let Some(last) = self.jobs.as_ref().map(|j| j.last_seq()) else { return };
+        let mut changed = Vec::new();
+        for (b, r) in self.requests.iter_mut().filter(|(_, r)| r.seq == u64::MAX) {
+            let waiting = self.state.iter().chain(self.others.iter()).find(|st| st.path.parent() == Some(b.as_path())).is_some_and(|st| st.pending_remix.is_some());
+            if !waiting {
+                r.seq = last;
+                changed.push(b.clone());
+            }
+        }
+        for b in changed {
+            self.save_requests(&b);
+        }
+    }
+
+    /// What Poing is still busy with, if anything (closing would stop it).
+    fn busy(&self) -> Option<String> {
+        if self.agent_rx.is_some() {
+            return Some("Claude is working on a request".into());
+        }
+        let running = self.jobs.as_ref().is_some_and(|j| j.last_seq() > self.jobs_done);
+        if !running {
+            return None;
+        }
+        let what = self.state.iter().chain(self.others.iter()).find_map(|st| st.analysing.as_ref().map(|(w, p)| format!("{} ({w}, {:.0}%)", st.project.name, p * 100.0)));
+        Some(what.unwrap_or_else(|| "a job".into()))
+    }
+
+    /// Requests of an earlier run left in this song's folder: offer them again (once).
+    fn offer_interrupted(&mut self, cx: &mut Cx) {
+        let Some(bundle) = self.state.as_ref().and_then(|st| st.path.parent().map(Path::to_path_buf)) else { return };
+        let all = read_requests(&bundle);
+        let (stale, current): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| r.run != run_id());
+        if stale.is_empty() {
+            return;
+        }
+        write_requests(&bundle, &current);
+        let what = match stale.first() {
+            Some(r) if r.kind == "remix" => format!("The remix \"{}\"", r.text),
+            Some(r) => format!("\"{}\"", r.text),
+            None => String::new(),
+        };
+        let more = if stale.len() > 1 { format!(" (and {} more)", stale.len() - 1) } else { String::new() };
+        self.interrupted = stale.into_iter().map(|r| (bundle.clone(), r)).collect();
+        self.set_status(cx, &format!("{what}{more} stopped when Poing closed before it was done."));
+        self.ui.button(cx, ids!(redo_btn)).set_visible(cx, true);
+    }
+
+    /// "Make it again": the interrupted requests of the song in front, asked again.
+    fn redo_interrupted(&mut self, cx: &mut Cx) {
+        self.ui.button(cx, ids!(redo_btn)).set_visible(cx, false);
+        let Some(bundle) = self.state.as_ref().and_then(|st| st.path.parent().map(Path::to_path_buf)) else { return };
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.interrupted).into_iter().partition(|(b, _)| *b == bundle);
+        self.interrupted = rest;
+        let mut said = Vec::new();
+        for (_, r) in mine {
+            let Some(st) = self.state.as_mut() else { break };
+            let before = self.jobs.as_ref().map_or(0, |j| j.last_seq());
+            if r.kind == "remix" {
+                st.pending_remix = Some(r.text.clone());
+                let line = match (&self.jobs, st.project.is_analysed()) {
+                    (Some(jobs), true) => start_remix(st, jobs),
+                    _ => format!("Poing is listening to the song first; then it makes the remixes as \"{}\"", r.text),
+                };
+                said.push(line);
+            } else {
+                let sel = match (&r.lane, r.section) {
+                    (Some(id), _) => st.project.track_index(id).map(Selection::Track).unwrap_or(Selection::None),
+                    (None, Some(i)) if i < st.project.sections().len() => Selection::Section(i),
+                    _ => Selection::None,
+                };
+                st.select(sel);
+                said.push(describe(st, self.jobs.as_ref(), &r.text));
+            }
+            self.note_request(&bundle, before, &r.kind, &r.text, r.lane.clone(), r.section);
+        }
+        self.sync_waiting_requests();
+        self.set_status(cx, &said.join("  ·  "));
+        self.refresh_inspector(cx);
+    }
+
+    /// Show or hide the Settings panel (over the start screen or the song).
+    fn show_settings(&mut self, cx: &mut Cx, on: bool) {
+        let ui = self.ui.clone();
+        self.settings_shown = on;
+        ui.view(cx, ids!(settings)).set_visible(cx, on);
+        if on {
+            ui.view(cx, ids!(home)).set_visible(cx, false);
+            for id in [ids!(timeline_box), ids!(inspector_box)] {
+                ui.view(cx, id).set_visible(cx, false);
+            }
+            self.refresh_settings(cx);
+        } else {
+            let song = self.state.is_some() && !self.home_shown;
+            self.show_song_view(cx, song);
+        }
+        ui.redraw(cx);
+    }
+
+    fn refresh_settings(&mut self, cx: &mut Cx) {
+        let ui = self.ui.clone();
+        let outputs: Vec<&AudioDeviceDesc> = self.audio_devices.iter().filter(|d| d.device_type.is_output()).collect();
+        let saved = load_settings().audio_output;
+        let mut labels = vec!["The system's default output".to_string()];
+        labels.extend(outputs.iter().map(|d| d.name.clone()));
+        let chosen = saved.as_ref().and_then(|n| outputs.iter().position(|d| &d.name == n)).map_or(0, |i| i + 1);
+        ui.drop_down(cx, ids!(out_dd)).set_labels(cx, labels);
+        ui.drop_down(cx, ids!(out_dd)).set_selected_item(cx, chosen);
+        let now = match (&saved, outputs.iter().find(|d| d.is_default)) {
+            (Some(n), _) if chosen > 0 => format!("Playing through {n}."),
+            (Some(n), _) => format!("{n} is not connected: playing through the default output."),
+            (None, Some(d)) => format!("Playing through the default output ({}).", d.name),
+            (None, None) => "No sound output found.".into(),
+        };
+        ui.label(cx, ids!(out_status)).set_text(cx, &now);
+        let ai = match (agent::claude_installed(), agent::unavailable()) {
+            (true, None) => "Claude Code is installed: written effects, MIDI parts, new songs and free-form requests in the Describe bar can use it.".to_string(),
+            (true, Some(why)) => format!("Claude Code is installed: written effects, MIDI parts and new songs use it. Free-form requests in the Describe bar also need Makepad's makepad-remote: {why}."),
+            (false, _) => "Claude Code is not installed. Splitting, remixing, repainting and plugins work without it; a local model for the written parts is coming, so nothing needs a subscription.".to_string(),
+        };
+        ui.label(cx, ids!(ai_status)).set_text(cx, &ai);
+        let plugins = self.state.as_ref().map(|st| st.plugin_library.len()).unwrap_or_else(|| plugins::library().len());
+        let ptext = if cfg!(windows) {
+            format!("{plugins} VST3 plugins found in the standard folders. Name one in the Describe bar to use it.")
+        } else {
+            "Plugin hosting is Windows-only for now.".to_string()
+        };
+        ui.label(cx, ids!(plugins_status)).set_text(cx, &ptext);
+        let ace = std::fs::canonicalize(audio::acestep_dir()).map(|p| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"))).unwrap_or_else(|_| audio::acestep_dir());
+        let models = format!(
+            "ACE-Step 1.5 (remix, repaint, new songs, added parts): {}.\nYuE2 (whole-song covers): {}.\nNew songs are saved in {}.",
+            if ace.join("pyproject.toml").exists() { format!("found in {}", ace.display()) } else { "not found (set POING_ACESTEP)".into() },
+            if audio::yue2_available() { "ready" } else { "not set up (remixes use ACE-Step instead)" },
+            audio::songs_dir().display()
+        );
+        ui.label(cx, ids!(models_status)).set_text(cx, &models);
+    }
+}
+
 impl MatchEvent for App {
     /// Play through the system's default output (the audio callback only
     /// runs once an output device is opened).
@@ -2035,7 +2359,10 @@ impl MatchEvent for App {
         for d in &devices.descs {
             log!("poing: audio device {d}");
         }
-        let out = devices.default_output();
+        self.audio_devices = devices.descs.clone();
+        // the output chosen in Settings, while it is connected; else the default
+        let chosen = load_settings().audio_output.map(|n| devices.descs.iter().filter(|d| d.device_type.is_output() && !d.has_failed && d.name == n).map(|d| d.device_id).collect::<Vec<_>>()).filter(|v| !v.is_empty());
+        let out = chosen.unwrap_or_else(|| devices.default_output());
         log!("poing: playing through {:?}", out);
         // The device list can come empty first and complete a moment later.
         let none = "No audio output is available (is another app holding the sound card?): playback stays silent until one is free. Export still works.";
@@ -2073,6 +2400,38 @@ impl MatchEvent for App {
         if new_prompt.is_some() || ui.button(cx, ids!(make_btn)).clicked(actions) {
             let prompt = new_prompt.unwrap_or_else(|| ui.text_input(cx, ids!(new_input)).text());
             self.make_song(cx, &prompt);
+            return;
+        }
+        // Settings
+        if ui.button(cx, ids!(settings_btn)).clicked(actions) {
+            self.show_settings(cx, !self.settings_shown);
+            return;
+        }
+        if ui.button(cx, ids!(settings_done)).clicked(actions) {
+            self.show_settings(cx, false);
+            return;
+        }
+        if let Some(i) = ui.drop_down(cx, ids!(out_dd)).changed(actions) {
+            let outputs: Vec<AudioDeviceDesc> = self.audio_devices.iter().filter(|d| d.device_type.is_output()).cloned().collect();
+            let mut settings = load_settings();
+            settings.audio_output = if i == 0 { None } else { outputs.get(i - 1).map(|d| d.name.clone()) };
+            save_settings(&settings);
+            let id = match i {
+                0 => AudioDevicesEvent { descs: self.audio_devices.clone() }.default_output(),
+                _ => outputs.get(i - 1).map(|d| vec![d.device_id]).unwrap_or_default(),
+            };
+            cx.use_audio_outputs(&id);
+            self.refresh_settings(cx);
+        }
+        if ui.button(cx, ids!(rescan_btn)).clicked(actions) {
+            let found = plugins::library();
+            for st in self.state.iter_mut().chain(self.others.iter_mut()) {
+                st.plugin_library = found.clone();
+            }
+            self.refresh_settings(cx);
+        }
+        if ui.button(cx, ids!(redo_btn)).clicked(actions) {
+            self.redo_interrupted(cx);
             return;
         }
         // a remix of a song that already has a project: the answer
@@ -2178,9 +2537,18 @@ impl MatchEvent for App {
             if self.agent_rx.is_some() && !text.trim().is_empty() {
                 status = Some("Claude is still working on the last request.".into());
             } else if !text.trim().is_empty() {
+                let before = self.jobs.as_ref().map_or(0, |j| j.last_seq());
+                let lane = match st.sel {
+                    Selection::Track(i) => st.project.tracks.get(i).map(|t| t.id.clone()),
+                    Selection::Region(r) => st.project.regions().get(r).map(|g| g.track.clone()),
+                    _ => None,
+                };
+                let section = if let Selection::Section(i) = st.sel { Some(i) } else { None };
+                let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
                 st.agent_ok = true;
                 status = Some(describe(st, self.jobs.as_ref(), text.trim()));
                 st.agent_ok = false;
+                note_request_in(&mut self.requests, self.jobs.as_ref(), &bundle, before, "describe", text.trim(), lane, section);
                 ui.text_input(cx, ids!(describe_input)).set_text(cx, "");
                 if let Some(request) = st.ask_agent.take() {
                     // one undo step for the whole pass
@@ -2351,7 +2719,26 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        if let Event::Signal = event {
+        if let Event::WindowCloseRequested(e) = event {
+            // a job still running stops with Poing: say so once; closing again quits
+            let armed = self.close_armed.is_some_and(|t| t.elapsed().as_secs_f64() < 10.0);
+            match self.busy() {
+                Some(what) if !armed => {
+                    e.accept_close.set(false);
+                    self.close_armed = Some(std::time::Instant::now());
+                    let line = format!("Poing is still working on {what}. Close again to quit anyway: it stops, and you can make it again next time.");
+                    self.set_status(cx, &line);
+                    self.ui.label(cx, ids!(home_status)).set_text(cx, &line);
+                    self.ui.redraw(cx);
+                    return;
+                }
+                _ => {
+                    for st in self.state.iter_mut().chain(self.others.iter_mut()) {
+                        let _ = st.save();
+                    }
+                }
+            }
+        }        if let Event::Signal = event {
             self.drain_jobs(cx);
             self.drain_agent(cx);
         }

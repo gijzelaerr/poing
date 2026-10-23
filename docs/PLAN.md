@@ -155,3 +155,22 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 | Model quality varies per take (lyric WER 5–40 % across seeds) | Takes + automatic quality badges + best-of-N in the background |
 | Licences of model weights (YuE2 CC BY-NC, BS-RoFormer academic) | Code MIT; weights downloaded separately with notices; MIT models (ACE-Step) as defaults where a product is ever sold |
 | macOS/Metal paths can't be verified on the Windows dev box | A Mac test machine or self-hosted runner |
+
+## Road to 1.0 (2026-10-23)
+
+1.0 means *a solid tool for us* (Gijs, Megan, Rik and friends): unsigned builds and non-commercial models are fine, and **every feature works without a subscription** (a local model by default, Claude Code optional).
+
+| | Workstream | State |
+|---|---|---|
+| D | Job safety + Settings: closing warns while a job runs, interrupted requests offered again ("Make it again"), Settings panel (sound output, AI, compute, plugins, models) | done |
+| B | Installer I1: Windows installer, model manager, bundled uv | in progress |
+| C | Native lyrics on the MelBand vocal stem | in progress |
+| L | Local AI: song sheets, MIDI parts, effects and the Describe assistant on a local Qwen model; Claude optional | proposed |
+| A | Remote compute: UI on the Mac, AI and compute on a Windows node (`poing-node`, Makepad AI hub discovery and credentials) | proposed |
+| G+K | Export: stems, MIDI files, DAWproject; DJ export (rekordbox XML with beatgrid, key, section cues) for rekordbox and the OMNIS-DUO | next |
+| E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | after D |
+| F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | after D |
+| H | Plugins phase 2: latency compensation, plugins in a helper process | after A or G |
+| QA | End-to-end on the Mac UI against the Windows node, then tag v1.0 | last |
+
+Later, not 1.0: signed installers, licence-clean default models, native ACE-Step cover/repaint/lego, AU/CLAP on macOS, live jam.
