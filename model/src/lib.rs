@@ -5,6 +5,8 @@
 use makepad_micro_serde::*;
 use std::path::{Path, PathBuf};
 
+pub mod arrange;
+
 #[derive(SerJson, DeJson, Clone, Debug)]
 pub struct Project {
     pub name: String,
@@ -28,6 +30,10 @@ pub struct Project {
     /// Made from a prompt: its versions (the original and its song takes) wait
     /// for one to be picked before the song is analysed.
     pub draft: Option<bool>,
+    /// Arrangement edits ever made, so the audio files they write never repeat.
+    pub arranged: Option<u64>,
+    /// Remixes made before an arrangement edit, and how they line up now.
+    pub realign: Option<Vec<arrange::Realign>>,
 }
 
 /// One generated version of part of the song, played over [start, end]:
@@ -510,6 +516,8 @@ impl Project {
             master_fx: None,
             fx_made: None,
             draft: None,
+            arranged: None,
+            realign: None,
         }
     }
 
@@ -690,6 +698,8 @@ mod tests {
             master_fx: None,
             fx_made: None,
             draft: None,
+            arranged: None,
+            realign: None,
         }
     }
 
