@@ -8,8 +8,8 @@
 //! errors on sung vocals), and a Hugging Face mirror of the Beat This!
 //! checkpoint for when its home server is down. Both carry the size and
 //! SHA-256 the downloader checks. large-v3 is then converted to Q8_0 here
-//! (`stt/ggml-large-v3-q8_0.bin`, same lyrics on the test songs, half the
-//! time and less GPU memory) and the f16 download is removed.
+//! (`stt/ggml-large-v3-q8_0.bin`, same lyrics on the test songs in about
+//! half the time) and the f16 download is removed.
 
 use crate::emit;
 use makepad_ai_hub::backend::CancelToken;
