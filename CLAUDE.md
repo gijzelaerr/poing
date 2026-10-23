@@ -30,6 +30,15 @@ target/release/poing-engine install --accept-licence   # ~2.3 GB into ~/.makepad
 target/release/poing-engine status
 ``` A `project.json` comes from the Python prep step in claude-space `projects/music-gen/build_project.py` until M2 brings import into the app.
 
+**Installer and models** ([docs/INSTALL.md](docs/INSTALL.md)). `app/src/paths.rs` is the one resolver: dev overrides (`POING_SIDECAR`, `POING_ACESTEP`, `POING_UV`), then `sidecar/` and `uv.exe` beside an installed `poing.exe`, then the model manager's packs (`app/models.json`, `app/src/models.rs`, in `%LOCALAPPDATA%\Poing\models` or `POING_MODELS`). A build run from the repository still uses the repository's `sidecar/` and `../ACE-Step-1.5`. To build the Windows installer (CI does this on a `v*` tag, `.github/workflows/release.yml`):
+
+```sh
+cargo build --release --workspace
+# the pinned uv from release.yml (UV_VERSION, UV_SHA256), unzipped into target/packaging/uv/
+cargo install cargo-packager --version 0.11.8 --locked
+cargo packager -p poing --release      # target/release/poing_<version>_x64-setup.exe, ~21 MB
+```
+
 ## Context
 
 Earlier hands-on work that this plan comes from (pipelines, measurements, model notes) is in `gijzelaerr/claude-space` under `projects/music-gen/`. The prototype app is `apps/daw` on branch `daw` of `gijzelaerr/makepad`.

@@ -34,7 +34,7 @@ pub fn gate(st: &mut EditorState, feature: &'static str, resume: Resume) -> Opti
         Readiness::CantRun(why) => Some(why),
         Readiness::Needs(..) => {
             st.needs_download = Some((feature, resume));
-            models::offer_text(feature)
+            Some("That needs a download first: see the bar at the top.".into())
         }
     }
 }

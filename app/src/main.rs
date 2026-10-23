@@ -1675,7 +1675,10 @@ impl App {
 /// Understand the song in the background; lanes fill in when it lands.
 fn analyse(jobs: Option<&Jobs>, st: &mut EditorState) {
     if let Some(note) = model_view::gate(st, "analysis", model_view::Resume::Analyse(st.path.clone())) {
-        st.notice = Some(note);
+        // a download on offer shows in the offer bar; a reason it can't run, here
+        if st.needs_download.is_none() {
+            st.notice = Some(note);
+        }
         return;
     }
     {
