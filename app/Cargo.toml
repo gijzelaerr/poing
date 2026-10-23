@@ -21,6 +21,8 @@ makepad-zip-file.workspace = true
 # credentials, TLS front and LAN beacon (above), TLS and sha256.
 makepad-network.workspace = true
 makepad-core-util.workspace = true
+# Keys played live: lock-free queues to and from the audio thread.
+crossbeam-queue = "0.3"
 
 # The Windows PC's side of a Mac UI: Poing's GPU jobs served over the LAN.
 [[bin]]

@@ -1176,6 +1176,7 @@ source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261021#9
 name = "poing"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "makepad-ai-hub",
  "makepad-ai-services",
  "makepad-audio-decode",

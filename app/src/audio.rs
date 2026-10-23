@@ -469,6 +469,29 @@ pub fn mix_metered(
     }
     meter(meters, MASTER_METER, peak_of(&out_l[..n], &out_r[..n]));
 }
+/// The song stopped: only MIDI lane `lane`'s instrument (what the keys play),
+/// at the lane's level, through its effects and the master, into l/r (overwrites).
+pub fn mix_live(rack: &mut FxRack, mix: &MixParams, lane: usize, out_l: &mut [f32], out_r: &mut [f32], meters: Option<&[AtomicU32]>) {
+    let n = out_l.len().min(out_r.len());
+    let gain = mix.gains.get(lane).copied().unwrap_or(1.0);
+    let mut done = 0;
+    while done < n {
+        let k = (n - done).min(LANE_FRAMES);
+        rack.render_live(lane, k);
+        for i in 0..k {
+            rack.lane_l[i] *= gain;
+            rack.lane_r[i] *= gain;
+        }
+        rack.process_lane(lane, k);
+        out_l[done..done + k].copy_from_slice(&rack.lane_l[..k]);
+        out_r[done..done + k].copy_from_slice(&rack.lane_r[..k]);
+        meter(meters, lane, peak_of(&rack.lane_l[..k], &rack.lane_r[..k]));
+        rack.process_master(&mut out_l[done..done + k], &mut out_r[done..done + k]);
+        meter(meters, MASTER_METER, peak_of(&out_l[done..done + k], &out_r[done..done + k]));
+        done += k;
+    }
+}
+
 /// State shared with the audio callback: transport flags and the published mix.
 /// The callback only `try_lock`s `mix` and keeps its own copy when the UI holds it.
 pub struct Shared {
@@ -491,6 +514,8 @@ pub struct Shared {
     pub loop_on: AtomicBool,
     pub loop_a: AtomicU64,
     pub loop_b: AtomicU64,
+    /// Keys played live into a MIDI lane, and recording them.
+    pub live: crate::live::Live,
 }
 
 impl Shared {
@@ -508,6 +533,7 @@ impl Shared {
             loop_on: AtomicBool::new(false),
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
+            live: crate::live::Live::default(),
         }
     }
     pub fn pos(&self) -> usize {
@@ -535,6 +561,8 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
     let mut rack = Box::new(FxRack::empty());
     let mut was_playing = false;
+    let mut last_live: Option<usize> = None;
+    let mut click = crate::live::Click::new(sr);
     cx.audio_output(0, move |info, out| {
         out.zero();
         // A new effects rack: adopt the old one's state, hand the old one back
@@ -568,45 +596,97 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
             Some(k) => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
             None => lanes,
         };
-        if !shared.playing() {
-            was_playing = false;
-            return;
-        }
-        if !was_playing {
-            // resumed: notes held when it paused are let go
-            rack.midi_jumped();
-            was_playing = true;
-        }
-        let mut start = shared.pos();
-        // A loop: wrap back to its start; the block is cut at its end below.
-        let looping = shared.loop_on.load(Ordering::Relaxed);
-        let (loop_a, loop_b) = (shared.loop_a.load(Ordering::Relaxed) as usize, shared.loop_b.load(Ordering::Relaxed) as usize);
-        let looping = looping && loop_b > loop_a + 64 && loop_b <= total;
-        if looping && (start >= loop_b || start < loop_a) {
-            start = loop_a;
-        }
-        if start >= total {
-            shared.set_playing(false);
-            return;
-        }
-        // Device frames map 1:1 to stem frames only at the stem rate; at another
-        // device rate step through the stems by the ratio (nearest frame, fine
-        // for monitoring; the render is exact).
         let ratio = sr as f64 / info.sample_rate.max(1.0);
         let dev_frames = out.frame_count();
-        let n_src = ((dev_frames as f64 * ratio).ceil() as usize).min(total - start);
-        l.resize(n_src, 0.0);
-        r.resize(n_src, 0.0);
-        let mut next = start + n_src;
-        if looping && start + n_src > loop_b {
-            // up to the loop end, then on from its start
-            let first = loop_b - start;
-            mix_metered(&stems, &cache, sr, start, &mut l[..first], &mut r[..first], Some(&mut rack), Some(&shared.meters));
-            mix_metered(&stems, &cache, sr, loop_a, &mut l[first..], &mut r[first..], Some(&mut rack), Some(&shared.meters));
-            next = loop_a + (n_src - first);
-        } else {
-            mix_metered(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack), Some(&shared.meters));
+        // Keys played live go to the selected MIDI lane's instrument; a lane
+        // that loses them lets go of what they hold.
+        let live_lane = shared.live.lane().filter(|l| rack.has_midi(*l));
+        if live_lane != last_live {
+            if let Some(old) = last_live {
+                rack.live_release(old);
+            }
+            last_live = live_lane;
         }
+        let counting = shared.playing() && shared.live.counting_in();
+        let n_src = if !shared.playing() || counting {
+            was_playing = false;
+            // Stopped, or counting in: only what the keys play, on their lane.
+            let pos = shared.pos() as u64;
+            while let Some(k) = shared.live.keys.pop() {
+                if let Some(lane) = live_lane {
+                    rack.live_key(lane, k.pitch, k.vel, k.on);
+                }
+                shared.live.heard(pos, k);
+            }
+            if live_lane.is_none() && !counting {
+                return;
+            }
+            let n_src = ((dev_frames as f64 * ratio).ceil() as usize).max(1);
+            l.resize(n_src, 0.0);
+            r.resize(n_src, 0.0);
+            match live_lane {
+                Some(lane) => mix_live(&mut rack, &cache, lane, &mut l, &mut r, Some(&shared.meters)),
+                None => {
+                    l.fill(0.0);
+                    r.fill(0.0);
+                }
+            }
+            if counting {
+                shared.live.count(&mut click, &mut l, &mut r);
+            }
+            n_src
+        } else {
+            if !was_playing {
+                // resumed: notes held when it paused are let go
+                rack.midi_jumped();
+                was_playing = true;
+            }
+            let mut start = shared.pos();
+            // A loop: wrap back to its start; the block is cut at its end below.
+            let looping = shared.loop_on.load(Ordering::Relaxed);
+            let (loop_a, loop_b) = (shared.loop_a.load(Ordering::Relaxed) as usize, shared.loop_b.load(Ordering::Relaxed) as usize);
+            let looping = looping && loop_b > loop_a + 64 && loop_b <= total;
+            if looping && (start >= loop_b || start < loop_a) {
+                start = loop_a;
+            }
+            if start >= total {
+                shared.set_playing(false);
+                return;
+            }
+            // the keys are heard from this block's first frame
+            while let Some(k) = shared.live.keys.pop() {
+                if let Some(lane) = live_lane {
+                    rack.live_key(lane, k.pitch, k.vel, k.on);
+                }
+                shared.live.heard(start as u64, k);
+            }
+            let clicking = shared.live.state() == crate::live::RECORDING;
+            // Device frames map 1:1 to stem frames only at the stem rate; at another
+            // device rate step through the stems by the ratio (nearest frame, fine
+            // for monitoring; the render is exact).
+            let n_src = ((dev_frames as f64 * ratio).ceil() as usize).min(total - start);
+            l.resize(n_src, 0.0);
+            r.resize(n_src, 0.0);
+            let mut next = start + n_src;
+            if looping && start + n_src > loop_b {
+                // up to the loop end, then on from its start
+                let first = loop_b - start;
+                mix_metered(&stems, &cache, sr, start, &mut l[..first], &mut r[..first], Some(&mut rack), Some(&shared.meters));
+                mix_metered(&stems, &cache, sr, loop_a, &mut l[first..], &mut r[first..], Some(&mut rack), Some(&shared.meters));
+                if clicking {
+                    click.beats(&rack.clicks, start as u64, &mut l[..first], &mut r[..first]);
+                    click.beats(&rack.clicks, loop_a as u64, &mut l[first..], &mut r[first..]);
+                }
+                next = loop_a + (n_src - first);
+            } else {
+                mix_metered(&stems, &cache, sr, start, &mut l, &mut r, Some(&mut rack), Some(&shared.meters));
+                if clicking {
+                    click.beats(&rack.clicks, start as u64, &mut l, &mut r);
+                }
+            }
+            shared.seek(next);
+            n_src
+        };
         if !muted {
             let chans = out.channel_count();
             for i in 0..dev_frames {
@@ -622,7 +702,6 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
                 }
             }
         }
-        shared.seek(next);
     });
 }
 

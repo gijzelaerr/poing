@@ -106,8 +106,9 @@ impl Synth {
         }
     }
 
-    pub fn all_off(&mut self) {
-        for v in self.voices.iter_mut().filter(|v| v.gate) {
+    /// Release every held voice but those on a `keep` pitch.
+    pub fn all_off_but(&mut self, keep: &[bool; 128]) {
+        for v in self.voices.iter_mut().filter(|v| v.gate && !keep[v.pitch.clamp(0, 127) as usize]) {
             self.shader.note_off(&mut v.state);
             v.gate = false;
         }
@@ -247,13 +248,14 @@ impl Sound {
             Sound::Plugin(p) => p.send(pitch, 0.0, false),
         }
     }
-    fn all_off(&mut self) {
+    /// Release what sounds, but the pitches in `keep` (keys held live).
+    fn all_off_but(&mut self, keep: &[bool; 128]) {
         match self {
-            Sound::Splash(s) => s.all_off(),
+            Sound::Splash(s) => s.all_off_but(keep),
             #[cfg(windows)]
             Sound::Plugin(p) => {
                 for pitch in 0..128u8 {
-                    if p.held[pitch as usize] {
+                    if p.held[pitch as usize] && !keep[pitch as usize] {
                         p.send(pitch, 0.0, false);
                     }
                 }
@@ -277,11 +279,13 @@ pub struct MidiLane {
     /// The frame the last block ended at (u64::MAX: nothing played yet).
     last_end: u64,
     cursor: usize,
+    /// Keys held live (a MIDI keyboard): a jump does not release them.
+    live: [bool; 128],
 }
 
 impl MidiLane {
     pub fn new(track: usize, events: Vec<NoteEvent>, sound: Sound) -> Self {
-        MidiLane { track, events, sound, last_end: u64::MAX, cursor: 0 }
+        MidiLane { track, events, sound, last_end: u64::MAX, cursor: 0, live: [false; 128] }
     }
 
     /// Something other than the next block follows (a seek, a loop, a pause).
@@ -295,8 +299,8 @@ impl MidiLane {
         l[..n].fill(0.0);
         r[..n].fill(0.0);
         if start != self.last_end {
-            // a jump: release what sounds, carry on from the new place
-            self.sound.all_off();
+            // a jump: release what sounds (but keys held live), carry on from the new place
+            self.sound.all_off_but(&self.live);
             self.cursor = self.events.partition_point(|e| e.frame < start);
         }
         let end = start + n as u64;
@@ -321,6 +325,39 @@ impl MidiLane {
             self.sound.render(&mut l[at..n], &mut r[at..n]);
         }
         self.last_end = end;
+    }
+}
+
+impl MidiLane {
+    /// A key played live: sounds from the next rendered frame.
+    pub fn live_key(&mut self, pitch: u8, vel: u8, on: bool) {
+        let p = pitch.min(127);
+        if on {
+            self.sound.note_on(p, vel.clamp(1, 127) as f32 / 127.0);
+        } else {
+            self.sound.note_off(p);
+        }
+        self.live[p as usize] = on;
+    }
+
+    /// Let go of every key held live (the keys moved to another lane).
+    pub fn live_release(&mut self) {
+        for p in 0..128u8 {
+            if std::mem::take(&mut self.live[p as usize]) {
+                self.sound.note_off(p);
+            }
+        }
+    }
+
+    /// Only the instrument, no notes of the lane (the song is stopped):
+    /// what the keys play, into l/r (overwrites).
+    pub fn render_live(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let n = l.len().min(r.len());
+        l[..n].fill(0.0);
+        r[..n].fill(0.0);
+        self.sound.render(&mut l[..n], &mut r[..n]);
+        // playback starts afresh from wherever it is next
+        self.last_end = u64::MAX;
     }
 }
 
@@ -372,5 +409,26 @@ mod tests {
         lane.render(0, &mut l2, &mut r2);
         // (the 80 ms release tail fades; then silence until the note's time again)
         assert!(l2[3800..].iter().all(|x| x.abs() < 1e-2), "released on the jump: {}", l2[3800..].iter().fold(0.0f32, |m, x| m.max(x.abs())));
+    }
+
+    #[test]
+    fn a_live_key_sounds_stopped_and_survives_a_jump() {
+        let mut lane = MidiLane::new(0, Vec::new(), Sound::Splash(synth(BUILTIN[1].2)));
+        let (mut l, mut r) = (vec![0.0f32; 2000], vec![0.0f32; 2000]);
+        lane.render_live(&mut l, &mut r);
+        assert!(l.iter().all(|x| *x == 0.0), "nothing played yet");
+        lane.live_key(60, 100, true);
+        lane.render_live(&mut l, &mut r);
+        assert!(l.iter().any(|x| x.abs() > 0.01), "the key sounds while stopped");
+        // playback starts (a jump): the held key keeps sounding
+        for k in 0..20u64 {
+            lane.render(k * 2000, &mut l, &mut r);
+        }
+        assert!(l.iter().any(|x| x.abs() > 0.01), "still held after the jump");
+        lane.live_key(60, 0, false);
+        for k in 20..40u64 {
+            lane.render(k * 2000, &mut l, &mut r);
+        }
+        assert!(l.iter().all(|x| x.abs() < 1e-3), "let go: quiet");
     }
 }

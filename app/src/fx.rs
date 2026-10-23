@@ -191,6 +191,8 @@ pub struct FxRack {
     pub master: Vec<FxUnit>,
     /// MIDI lanes' instruments and notes.
     pub midi: Vec<crate::synth::MidiLane>,
+    /// The song's beats (frame, starts a bar) for the metronome.
+    pub clicks: Vec<(u64, bool)>,
     /// The song this rack plays (0: none): state and plugin instances only
     /// carry over between racks of one song.
     pub song: u64,
@@ -203,7 +205,7 @@ pub struct FxRack {
 impl FxRack {
     pub fn new(lanes: Vec<Vec<FxUnit>>, master: Vec<FxUnit>) -> Self {
         let tmp = aot::MAX_FRAMES as usize;
-        FxRack { lanes, master, midi: Vec::new(), song: 0, lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
+        FxRack { lanes, master, midi: Vec::new(), clicks: Vec::new(), song: 0, lane_l: vec![0.0; LANE_FRAMES], lane_r: vec![0.0; LANE_FRAMES], tmp_l: vec![0.0; tmp], tmp_r: vec![0.0; tmp] }
     }
 
     pub fn empty() -> Self {
@@ -218,6 +220,27 @@ impl FxRack {
     pub(crate) fn render_midi(&mut self, lane: usize, start: u64, n: usize) {
         if let Some(m) = self.midi.iter_mut().find(|m| m.track == lane) {
             m.render(start, &mut self.lane_l[..n], &mut self.lane_r[..n]);
+        }
+    }
+
+    /// A key played live on MIDI lane `lane`.
+    pub fn live_key(&mut self, lane: usize, pitch: u8, vel: u8, on: bool) {
+        if let Some(m) = self.midi.iter_mut().find(|m| m.track == lane) {
+            m.live_key(pitch, vel, on);
+        }
+    }
+
+    /// Let go of the keys held live on `lane`.
+    pub fn live_release(&mut self, lane: usize) {
+        if let Some(m) = self.midi.iter_mut().find(|m| m.track == lane) {
+            m.live_release();
+        }
+    }
+
+    /// Only MIDI lane `lane`'s instrument (what the keys play) into the lane buffer.
+    pub(crate) fn render_live(&mut self, lane: usize, n: usize) {
+        if let Some(m) = self.midi.iter_mut().find(|m| m.track == lane) {
+            m.render_live(&mut self.lane_l[..n], &mut self.lane_r[..n]);
         }
     }
 
