@@ -33,6 +33,7 @@ target/release/poing-node                      # serves on port 8125 (--port N, 
 
   The beacon is outgoing UDP broadcast on port 41830, so it needs no rule on the PC.
 - Revoke a machine with `poing-node revoke mac`, then restart the node.
+- The front bans an address for 15 minutes after 5 refused credentials in 10 minutes. A banned Mac sees "not reachable", even once it has a good credential again. After re-pairing, restart poing-node to clear the ban.
 
 ## On the Mac
 
@@ -76,4 +77,5 @@ To check that it works, open a song (analysis runs on the PC, and the lanes fill
 
 - Jobs are not cancelled when the Mac goes away: the node finishes the job, and its files stay in its mirror.
 - A job that was cut off is not resumed. Run it again; its inputs are already on the node.
+- The mirror only adds and updates files on the node. A file the Mac deletes from a song stays in the node's copy (delete `bundles/` on the PC to start over).
 - The beacon only advertises the node. Poing never switches to a node on its own; choose one with `join`, `POING_NODE` or Settings.

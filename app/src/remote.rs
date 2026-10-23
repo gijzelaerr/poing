@@ -9,8 +9,8 @@
 //! request carrying a proof of this machine's fleet credential bound to that
 //! certificate (`makepad_ai_hub::fleet_auth`). The credential comes from
 //! `poing-node pair` on the PC: `POING_NODE_CREDENTIAL`, else
-//! `~/.makepad/ai-hub/poing.credential`, else the hub's own client
-//! credential.
+//! `~/.makepad/ai-hub/poing.credential` (not the hub's `client.credential`:
+//! that one is for another fleet's key).
 //!
 //! The target: `POING_NODE` (`host:port`, or `local`), else what Settings
 //! chose ([`set_target`], kept in Poing's config folder as `node.txt`),
@@ -28,7 +28,7 @@ use makepad_network::SocketStream;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -181,7 +181,6 @@ pub fn credential() -> Option<Credential> {
         .ok()
         .or_else(|| std::fs::read_to_string(fleet_auth::client_dir().join(CREDENTIAL_FILE)).ok())
         .and_then(|t| Credential::parse(&t))
-        .or_else(fleet_auth::own_credential)
 }
 
 /// Keep the credential `poing-node pair` printed (`mkc2.…`).
@@ -443,9 +442,10 @@ fn run_on(node: &Node, name: &str, bundle: &Path, sr: u32, outbound: wire::Outbo
     }
     // the job: its updates as they come
     let request = JobRequest { sr, job: outbound.job };
-    let response = node.request("POST", &format!("/bundle/{id}/job"), wire::line(&request).as_bytes(), SILENCE)?;
-    let mut body = response.body;
-    read_events(&mut body, &mut |event| {
+    // the socket's own timeout is only a backstop: silence is timed on the lines
+    let response = node.request("POST", &format!("/bundle/{id}/job"), wire::line(&request).as_bytes(), SILENCE * 3)?;
+    let lines = line_reader(response.body);
+    read_events(&lines, SILENCE, &mut |event| {
         match wire::inbound(event, bundle) {
             Inbound::Alive => {}
             Inbound::End => return Ok(false),
@@ -496,18 +496,40 @@ fn run_on(node: &Node, name: &str, bundle: &Path, sr: u32, outbound: wire::Outbo
     })
 }
 
-/// Read the node's update lines until `End`, handing each to `on` (which
-/// says whether to go on). Silence past the stream's read timeout, or the
-/// stream ending without `End`, means the node is gone.
-pub fn read_events(body: &mut dyn BufRead, on: &mut dyn FnMut(WireEvent) -> Result<bool, Lost>) -> Result<(), Lost> {
-    let mut line = String::new();
-    loop {
-        line.clear();
+/// The lines of a response, read on their own thread (whatever the TLS
+/// layer does with a socket timeout, the reader times the silence).
+pub fn line_reader(mut body: impl BufRead + Send + 'static) -> Receiver<Result<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("poing-node-lines".into()).spawn(move || loop {
+        let mut line = String::new();
         match body.read_line(&mut line) {
-            Ok(0) => return Err(Lost::Unreachable("the Windows PC stopped mid-job".into())),
-            Ok(_) => {}
-            Err(e) => return Err(Lost::Unreachable(format!("no word from the Windows PC ({e})"))),
+            Ok(0) => return,
+            Ok(_) => {
+                if tx.send(Ok(line)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
         }
+    });
+    rx
+}
+
+/// Hand the node's update lines to `on` (which says whether to go on) until
+/// `End`. `silence` without a line (the node pings every few seconds), or
+/// the stream ending without `End`, means the node is gone.
+pub fn read_events(lines: &Receiver<Result<String, String>>, silence: Duration, on: &mut dyn FnMut(WireEvent) -> Result<bool, Lost>) -> Result<(), Lost> {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        let line = match lines.recv_timeout(silence) {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(Lost::Unreachable(format!("no word from the Windows PC ({e})"))),
+            Err(RecvTimeoutError::Timeout) => return Err(Lost::Unreachable(format!("no word from the Windows PC for {} s", silence.as_secs()))),
+            Err(RecvTimeoutError::Disconnected) => return Err(Lost::Unreachable("the Windows PC stopped mid-job".into())),
+        };
         let Ok(event) = WireEvent::deserialize_json(line.trim()) else { continue };
         if !on(event)? {
             return Ok(());
@@ -570,7 +592,8 @@ mod tests {
     }
 
     /// A node that goes quiet mid-job (its PC asleep, the cable out) ends
-    /// the job within the read timeout, and a node that dies ends it at once.
+    /// the job after `silence`, even when the socket never times out, and a
+    /// node that dies ends it at once.
     #[test]
     fn a_silent_or_dead_node_ends_the_job() {
         use std::net::{TcpListener, TcpStream};
@@ -587,20 +610,19 @@ mod tests {
             std::thread::sleep(Duration::from_secs(2));
             drop(a);
         });
-        let quiet = TcpStream::connect(addr).unwrap();
-        quiet.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        // no socket timeout at all: the reader alone notices
+        let quiet = line_reader(BufReader::new(TcpStream::connect(addr).unwrap()));
         let mut seen = Vec::new();
         let t0 = Instant::now();
-        let r = read_events(&mut BufReader::new(quiet), &mut |e| {
+        let r = read_events(&quiet, Duration::from_millis(300), &mut |e| {
             seen.push(format!("{e:?}"));
             Ok(true)
         });
         assert!(matches!(r, Err(Lost::Unreachable(_))), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(seen.len(), 1);
-        let dead = TcpStream::connect(addr).unwrap();
-        dead.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let r = read_events(&mut BufReader::new(dead), &mut |_| Ok(true));
+        let dead = line_reader(BufReader::new(TcpStream::connect(addr).unwrap()));
+        let r = read_events(&dead, Duration::from_secs(5), &mut |_| Ok(true));
         assert_eq!(r, Err(Lost::Unreachable("the Windows PC stopped mid-job".into())));
         assert_eq!(Lost::Unreachable(String::new()).message(), UNREACHABLE);
         server.join().unwrap();
@@ -610,7 +632,7 @@ mod tests {
     fn end_stops_reading() {
         let text = format!("{}garbage\n{}{}", wire::line(&WireEvent::Ping { at: 1 }), wire::line(&WireEvent::End { at: 2 }), wire::line(&WireEvent::Ping { at: 3 }));
         let mut n = 0;
-        let r = read_events(&mut text.as_bytes(), &mut |e| {
+        let r = read_events(&line_reader(std::io::Cursor::new(text.into_bytes())), Duration::from_secs(5), &mut |e| {
             n += 1;
             Ok(!matches!(e, WireEvent::End { .. }))
         });

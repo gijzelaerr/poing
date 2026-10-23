@@ -139,9 +139,16 @@ pub fn input_name(path: &Path) -> String {
     format!("{INPUTS}/{}{ext}", &hash[..16])
 }
 
-/// A song's bundle id on the node: its local path, hashed.
+/// A song's bundle id on the node: its local path, hashed (the same folder
+/// however it was spelled: canonical, `/`, and lowercase where file names
+/// ignore case).
 pub fn bundle_id(bundle: &Path) -> String {
-    makepad_core_util::sha256::sha256_hex(bundle.to_string_lossy().as_bytes())[..16].to_string()
+    let path = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    if cfg!(any(windows, target_os = "macos")) {
+        text = text.to_lowercase();
+    }
+    makepad_core_util::sha256::sha256_hex(text.as_bytes())[..16].to_string()
 }
 
 pub fn valid_bundle_id(id: &str) -> bool {
@@ -597,6 +604,11 @@ mod tests {
         assert_eq!(rel_path(b, Path::new("/songs/b.mp3")), None);
         assert_eq!(rel_path(b, b), None);
         assert!(valid_bundle_id(&bundle_id(b)));
+        let real = tmp("bundle-id");
+        std::fs::create_dir_all(real.join("x")).unwrap();
+        let other_spelling = PathBuf::from(real.to_string_lossy().replace('\\', "/")).join("x").join("..");
+        assert_eq!(bundle_id(&real), bundle_id(&other_spelling));
+        let _ = std::fs::remove_dir_all(&real);
         assert!(!valid_bundle_id("../../etc"));
         assert!(input_name(Path::new("/music/Song.MP3")).starts_with("_inputs/") && input_name(Path::new("/music/Song.MP3")).ends_with(".mp3"));
     }
