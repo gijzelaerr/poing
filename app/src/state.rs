@@ -930,7 +930,7 @@ impl EditorState {
     pub fn add_take(&mut self, take: Take, stem: Stem) -> Result<(), String> {
         self.checkpoint();
         let id = take.id.clone();
-        self.grow_for(&take);
+        self.grow_for(&take, &stem);
         self.project.takes_mut().push(take);
         let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
         lanes.push(Arc::new(stem));
@@ -1437,6 +1437,9 @@ impl EditorState {
         };
         let before = self.project.duration;
         let now = (std::mem::replace(&mut self.project, project), Some(self.stems.clone()));
+        // the words or their sections changed back: so do the sung lyrics
+        let sung = |p: &Project| (p.sections.as_ref().map(|s| s.iter().map(|s| (s.start, s.end, s.label.clone())).collect::<Vec<_>>()), p.analysis.as_ref().and_then(|a| a.lyrics.as_ref()).map(|l| l.iter().map(|l| (l.start, l.end, l.text.clone())).collect::<Vec<_>>()));
+        let words_changed = sung(&self.project) != sung(&now.0);
         if redo {
             self.undo.push(now);
         } else {
@@ -1468,7 +1471,9 @@ impl EditorState {
                 self.seek(0.0);
             }
         }
-        self.write_lyrics();
+        if words_changed {
+            self.write_lyrics();
+        }
         self.forget_old_audio();
         let _ = self.save();
         Some(if redo { "Redone".into() } else { "Undone  ·  Ctrl+Shift+Z to redo".into() })

@@ -843,6 +843,9 @@ pub fn render(stems: &[Arc<Stem>], mix: &MixParams, mut rack: Box<FxRack>, sr: u
     send(tx, JobUpdate::Status("Rendering mix...".into()));
     // The song as it plays: its lanes, or the song take being heard.
     let lanes = stems.iter().take(mix.gains.len()).map(|s| s.l.len()).max().unwrap_or(0);
+    // a take past the lanes' end (one that made the song longer) is heard to its end
+    let takes = mix.takes.iter().flatten().filter(|k| k.kind != TakeKind::Song).map(|k| (k.end * sr as f64) as usize).max().unwrap_or(0);
+    let lanes = lanes.max(takes);
     let frames = match mix.song_take() {
         Some(k) => stems.get(k.stem).map_or(lanes, |s| s.l.len()),
         None => lanes,

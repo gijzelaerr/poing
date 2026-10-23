@@ -145,6 +145,13 @@ impl EditorState {
             self.undo.pop();
             return Err(e);
         }
+        // a whole-song remix keeps its own order: the lanes are what changed
+        let songs: Vec<String> = self.project.takes().iter().filter(|t| t.scope == "song").map(|t| t.id.clone()).collect();
+        if self.active.iter().any(|a| songs.contains(a)) {
+            self.active.retain(|a| !songs.contains(a));
+            self.focus = None;
+            self.push_mix();
+        }
         self.set_loop(None);
         self.pps = 0.0;
         self.select(select.map_or(Selection::None, Selection::Section));
@@ -429,11 +436,12 @@ impl EditorState {
 
     /// A take that makes the song longer has landed: the song now runs to its
     /// end, with an outro section there and the beat going on.
-    pub(crate) fn grow_for(&mut self, take: &Take) {
+    pub(crate) fn grow_for(&mut self, take: &Take, audio: &Stem) {
         if take.engine != EXTEND || take.end <= self.project.duration + 0.5 {
             return;
         }
         let (from, to) = (self.project.duration, take.end);
+        self.extend_source(take, audio);
         let grid = poing_model::BeatGrid::of(&self.project);
         let per_bar = grid.per_bar.max(1) as f64;
         if let Some(a) = self.project.analysis.as_mut() {
@@ -444,10 +452,65 @@ impl EditorState {
             a.beats.get_or_insert_with(Vec::new).extend(beats);
             a.downbeats.get_or_insert_with(Vec::new).extend(downs);
         }
-        let last_end = self.project.sections().last().map(|s| s.end).unwrap_or(0.0);
-        self.project.sections_mut().push(poing_model::Section { start: last_end.min(from), end: to, label: "outro".into() });
+        // an end made earlier hands over to this one (whose first second is it)
+        for t in self.project.takes_mut().iter_mut().filter(|t| t.engine == EXTEND && t.end > take.start) {
+            t.end = take.start + audio::TAKE_RAMP_S;
+        }
+        match self.project.sections_mut().last_mut() {
+            Some(last) if last.label == "outro" => last.end = to,
+            last => {
+                let start = last.map(|s| s.end).unwrap_or(0.0).min(from);
+                self.project.sections_mut().push(poing_model::Section { start, end: to, label: "outro".into() });
+            }
+        }
         self.project.duration = to;
         self.pps = 0.0;
+    }
+
+    /// The source (what repaints, remixes and the next extension read) goes
+    /// on with the new end, as a new file; so does the Original lane playing it.
+    fn extend_source(&mut self, take: &Take, audio: &Stem) {
+        let Some(src) = self.project.source.clone() else { return };
+        let (dir, sr) = (self.dir(), self.sr());
+        let lane = self.project.tracks.iter().position(|t| t.file == src);
+        let old = match lane {
+            Some(i) => self.stems[i].clone(),
+            None => match audio::load_stem(&dir.join(&src), sr) {
+                Ok(s) => Arc::new(s),
+                Err(_) => return,
+            },
+        };
+        // the take's first second is the song itself: the new end follows on from it
+        let at = ((take.start.max(0.0) * sr as f64) as usize).min(old.l.len());
+        let (mut l, mut r) = (old.l[..at].to_vec(), old.r[..at].to_vec());
+        l.extend_from_slice(&audio.l);
+        r.extend_from_slice(&audio.r);
+        let mut n = self.project.arranged.unwrap_or(0) + 1;
+        while dir.join(arranged_file(&src, n)).exists() {
+            n += 1;
+        }
+        let file = arranged_file(&src, n);
+        if audio::write_wav(&dir.join(&file), &l, &r, sr, 1.0).is_err() {
+            return;
+        }
+        self.project.arranged = Some(n);
+        self.project.source = Some(file.clone());
+        if let Some(i) = lane {
+            self.project.tracks[i].file = file;
+            let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
+            lanes[i] = Arc::new(Stem::new(l, r));
+            self.publish_stems(Arc::new(lanes));
+        }
+    }
+
+    /// A song made longer plays its new end again when it is reopened.
+    pub fn restore_extensions(&mut self) {
+        let ids: Vec<String> = self.project.takes().iter().filter(|t| t.engine == EXTEND).map(|t| t.id.clone()).collect();
+        for id in ids {
+            if !self.take_on(&id) {
+                self.toggle_take(&id);
+            }
+        }
     }
 
     /// Correct a lyric line's words (the transcription mishears).
@@ -660,6 +723,50 @@ mod tests {
         assert_eq!(st.project.duration, 32.0);
         assert_eq!(st.stems[0].l.len(), 32_000);
         assert!((st.stems[0].l[20_000] - 0.020).abs() < 1e-4, "24-bit audio read back");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_song_made_longer_twice_hands_over_and_its_source_goes_on() {
+        let dir = std::env::temp_dir().join(format!("poing-arrange-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = song(&dir);
+        let extend = |id: &str, start: f64, end: f64| Take {
+            id: id.into(),
+            scope: "section".into(),
+            start,
+            end,
+            engine: EXTEND.into(),
+            prompt: "make it longer".into(),
+            seed: 1,
+            file: format!("takes/{id}.wav"),
+            track: None,
+            blend: None,
+        };
+        let audio = |len: f64, k: f32| Stem::new(vec![k; (len * 1000.0) as usize], vec![k; (len * 1000.0) as usize]);
+        st.project.analysis = Some(crate::model::Analysis {
+            tempo: Some(120.0),
+            beats: Some((0..64).map(|b| b as f64 * 0.5).collect()),
+            downbeats: Some((0..16).map(|b| b as f64 * 2.0).collect()),
+            ..Default::default()
+        });
+        st.add_take(extend("t4", 27.0, 40.0), audio(13.0, 0.5)).unwrap();
+        assert_eq!(st.project.duration, 40.0);
+        assert_eq!(st.project.sections().last().map(|s| (s.start, s.end, s.label.as_str())), Some((24.0, 40.0, "outro")), "its own outro goes on");
+        // the source (lane a here) is the song to its new end, read by the next one
+        assert_eq!(st.project.source.as_deref(), Some("stems/a.a1.wav"));
+        assert_eq!(st.stems[0].l.len(), 40_000);
+        assert_eq!((st.stems[0].l[26_000], st.stems[0].l[30_000]), (0.026, 0.5));
+        let a = st.project.analysis.as_ref().unwrap();
+        assert_eq!(a.beats.as_ref().map(|b| (b.len(), b[79])), Some((80, 39.5)), "the beat goes on");
+        assert_eq!(a.downbeats.as_ref().and_then(|d| d.last().copied()), Some(38.0), "so do the bars");
+        st.add_take(extend("t5", 37.0, 50.0), audio(13.0, 0.7)).unwrap();
+        assert_eq!(st.project.duration, 50.0);
+        assert_eq!(st.project.sections().iter().filter(|s| s.label == "outro").count(), 1, "the outro grows");
+        let t4 = &st.project.takes()[st.project.take_index("t4").unwrap()];
+        assert_eq!(t4.end, 37.0 + audio::TAKE_RAMP_S, "the first end hands over where the second starts");
+        assert!(st.take_on("t4") && st.take_on("t5"));
+        assert_eq!(st.project.source.as_deref(), Some("stems/a.a2.wav"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

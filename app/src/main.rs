@@ -1218,6 +1218,12 @@ fn extend_song(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, secs: f64, te
         return note;
     }
     let end = st.project.duration;
+    // the source goes on to the song's end (an extension made before Poing kept it so does not)
+    if let Some(i) = st.project.tracks.iter().position(|t| t.file == source) {
+        if (st.stems[i].l.len() as f64) < (end - 1.0) * st.sr() as f64 {
+            return "The song's source audio stops before its end, so ACE-Step has nothing to go on from. Undo back to before it was made longer, then make it longer in one go.".into();
+        }
+    }
     let a = st.project.analysis.clone().unwrap_or_default();
     // from a downbeat a few seconds before the end: the song carries on rather than stopping and starting again
     let from = a.downbeats.iter().flatten().copied().filter(|d| *d <= end - 4.0 && *d >= end - 12.0).last().unwrap_or((end - 6.0).max(0.0));
@@ -1617,6 +1623,7 @@ impl App {
             }
         }
         st.restore_combined();
+        st.restore_extensions();
         // Analysed while another song was open: apply it from disk, no second run.
         if analyse {
             if let Some((analysis, stems)) = finished_analysis(&dir, sr) {

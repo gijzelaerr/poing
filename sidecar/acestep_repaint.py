@@ -71,8 +71,8 @@ def main():
         m = int(min(margin, 0.5 * (b - a)) * sr)
         # a range past the song's end (making it longer) has only the margin before it
         idx = np.r_[0:m, len(take) - m:len(take)] if len(ref) == len(take) else np.r_[0:m]
-        x, y = ref[idx].ravel(), take[idx].ravel()
-        if len(ref) >= m and np.dot(x, x) > 0:
+        x, y = (ref[idx].ravel(), take[idx].ravel()) if 0 < m <= len(ref) else (np.zeros(1), np.zeros(1))
+        if np.dot(x, x) > 0:
             gain = float(np.dot(x, y) / np.dot(x, x))
             if 0.5 < gain < 2.0:
                 take = take / gain
