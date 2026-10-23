@@ -76,7 +76,9 @@ pub struct Feature {
     pub id: String,
     pub title: String,
     pub packs: Vec<String>,
-    /// Packs that make it better but are not needed (offered in Models).
+    /// Packs that make it better but are not needed: the Models page lists every
+    /// pack, so only the registry test reads this.
+    #[allow(dead_code)]
     pub optional: Option<Vec<String>>,
 }
 
@@ -267,7 +269,7 @@ pub fn offer_text(feature_id: &str) -> Option<String> {
 // ------------------------------------------------------------- downloading
 
 pub enum Update {
-    Progress(String, f32),
+    Progress(String),
     /// Every pack of the feature is in.
     Done(String),
     Failed(String),
@@ -332,8 +334,8 @@ impl Downloads {
     }
 }
 
-fn say(tx: &Sender<Update>, text: String, progress: f32) {
-    let _ = tx.send(Update::Progress(text, progress));
+fn say(tx: &Sender<Update>, text: String) {
+    let _ = tx.send(Update::Progress(text));
     makepad_widgets::SignalToUI::set_ui_signal();
 }
 
@@ -371,7 +373,7 @@ fn install(p: &Pack, tx: &Sender<Update>, cancel: &CancelToken) -> Result<(), St
             if last.elapsed() >= Duration::from_millis(250) {
                 last = Instant::now();
                 let done = before + d.done;
-                say(tx, format!("Downloading {}: {} of {}", p.title, gb(done), gb(total)), done as f32 / total.max(1) as f32);
+                say(tx, format!("Downloading {}: {} of {} ({:.0}%)", p.title, gb(done), gb(total), 100.0 * done as f64 / total.max(1) as f64));
             }
         };
         downloader.ensure_file(&spec, &dir, &mut progress, cancel).map_err(|e| {
@@ -401,7 +403,7 @@ fn install(p: &Pack, tx: &Sender<Update>, cancel: &CancelToken) -> Result<(), St
 fn build_env(p: &Pack, setup: &Setup, dir: &Path, tx: &Sender<Update>, cancel: &CancelToken) -> Result<(), String> {
     let project = if setup.project == "@sidecar" { paths::sidecar_dir() } else { dir.join(&setup.project) };
     if let Some(zip) = &setup.unzip {
-        say(tx, format!("Unpacking {}", p.title), 1.0);
+        say(tx, format!("Unpacking {}", p.title));
         unzip(&dir.join(zip), &project)?;
     }
     let log_path = dir.join("setup.log");
@@ -421,7 +423,7 @@ fn build_env(p: &Pack, setup: &Setup, dir: &Path, tx: &Sender<Update>, cancel: &
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    say(tx, format!("Setting up {} (several minutes)", p.title), 1.0);
+    say(tx, format!("Setting up {} (several minutes)", p.title));
     let mut child = cmd.spawn().map_err(|e| format!("uv did not start ({e}): {}", paths::uv().display()))?;
     if let Some(err) = child.stderr.take() {
         use std::io::{BufRead, BufReader, Write};
@@ -433,7 +435,7 @@ fn build_env(p: &Pack, setup: &Setup, dir: &Path, tx: &Sender<Update>, cancel: &
             }
             let line = line.trim();
             if !line.is_empty() {
-                say(tx, format!("Setting up {}: {line}", p.title), 1.0);
+                say(tx, format!("Setting up {}: {line}", p.title));
             }
         }
     }
@@ -444,7 +446,7 @@ fn build_env(p: &Pack, setup: &Setup, dir: &Path, tx: &Sender<Update>, cancel: &
     if !ok {
         return Err(format!("Setting up {} failed (see {})", p.title, log_path.display()));
     }
-    say(tx, format!("Checking {}", p.title), 1.0);
+    say(tx, format!("Checking {}", p.title));
     let mut smoke = Command::new(paths::venv_python(dir));
     smoke.arg("-c").arg(&setup.smoke).current_dir(&project);
     #[cfg(windows)]

@@ -98,7 +98,7 @@ pub fn python(rt: Runtime) -> Result<Command, String> {
     match rt {
         Runtime::Analysis if dev_sidecar() => Ok(uv_run(&sidecar_dir())),
         Runtime::Analysis => {
-            let pack = models::installed_pack("py-analysis").ok_or("understanding songs needs a download (Models)")?;
+            let pack = models::installed_pack("py-analysis").ok_or("understanding songs needs a download (Settings → Models)")?;
             let mut cmd = Command::new(venv_python(&pack));
             // The scripts fetch their own weights (torch hub, Hugging Face) on first
             // use: into the pack, so removing it frees them too.
@@ -113,8 +113,8 @@ pub fn python(rt: Runtime) -> Result<Command, String> {
                 cmd.current_dir(&ace).env("POING_ACESTEP", &ace);
                 return Ok(cmd);
             }
-            let runtime = models::installed_pack("py-acestep").ok_or("ACE-Step needs a download (Models)")?;
-            let weights = models::installed_pack("acestep-turbo").ok_or("ACE-Step needs a download (Models)")?;
+            let runtime = models::installed_pack("py-acestep").ok_or("ACE-Step needs a download (Settings → Models)")?;
+            let weights = models::installed_pack("acestep-turbo").ok_or("ACE-Step needs a download (Settings → Models)")?;
             let src = runtime.join("src");
             let mut cmd = Command::new(venv_python(&runtime));
             cmd.current_dir(&src)
