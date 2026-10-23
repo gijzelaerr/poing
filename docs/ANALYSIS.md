@@ -69,7 +69,7 @@ Native ports live in Makepad `libs/ai/models`. The `poing-engine` crate is in PR
 |---|---|---|
 | Stems | Demucs htdemucs_ft (Python) | BS-RoFormer `stems/` (in poing-engine) |
 | Beats, downbeats, tempo | SheetSage2 | Beat This! `beats/` (in poing-engine; F 0.98–0.99 against SheetSage2) |
-| Lyrics transcription | Whisper large-v3 (transformers) | Whisper `speech/src/whisper`: `transcribe_aligned` gives word times, `transcribe` with `prompt` gives segment times; greedy only, as used here |
+| Lyrics transcription | Whisper large-v3 (transformers) | Whisper `speech/src/whisper` in poing-engine (large-v3 Q8_0): `transcribe` on the GPU, then `force_align` on the decoded tokens for word times (segment times when the alignment collapses); `transcribe` with `prompt` for the retries; greedy only, as used here |
 | Pause chunking, silence gate, hallucination filter, line splitting | Python logic | none needed: plain logic, ported to `engine/src/lyrics.rs` (energy gate; Silero VAD is available in `speech/src/vad.rs`) |
 | Known-lyrics alignment | edit distance over transcribed words | logic ports directly; `text_align.rs` (teacher-forced DTW) can refine word times within a line |
 | Language detection | Whisper | native Whisper detects the language |
