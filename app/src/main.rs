@@ -9,6 +9,8 @@ pub use makepad_widgets;
 
 mod agent;
 mod audio;
+mod djexport;
+mod export;
 mod fx;
 mod fx_writer;
 mod listen;
@@ -406,6 +408,65 @@ script_mod! {
                         settings_done := PillButton{text: "Done"}
                     }
 
+                    // Export: the mix, stems, MIDI files, a DAWproject, or for DJ (rekordbox).
+                    export_sheet := View{
+                        visible: false
+                        width: Fill height: Fill flow: Down spacing: 14
+                        padding: Inset{left: 60 right: 60 top: 36 bottom: 24}
+                        Label{
+                            text: "Export"
+                            draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 20}}
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Mix"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                CardText{text: "The song as it plays: a WAV and an MP3 mastered to -14 LUFS."}
+                                export_mix_btn := PillButton{text: "Export the mix"}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "Stems"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                CardText{text: "Each lane alone as it sounds in the mix (its level, takes and effects), as WAVs that add up to the mix before the master effects."}
+                                export_stems_btn := PillButton{text: "Export stems"}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "MIDI"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                export_midi_text := CardText{text: ""}
+                                export_midi_btn := PillButton{text: "Export MIDI"}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "DAWproject"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                CardText{text: "Open the song in Bitwig, Studio One or Cubase: every lane with its takes and effects, MIDI lanes as notes, the sections as markers, the tempo map."}
+                                export_daw_btn := PillButton{text: "Export DAWproject"}
+                            }
+                        }
+                        SettingsRow{
+                            CardTitle{width: 160 text: "For DJ"}
+                            View{width: Fill height: Fit flow: Down spacing: 6
+                                CardText{text: "For rekordbox and the OMNIS-DUO: the song as it plays plus the versions ticked here, with its beatgrid, key, a memory cue at every section and hot cues on intro, chorus, bridge and outro. In rekordbox, show the rekordbox xml pane (Preferences, View) and point it at Poing.xml in the folder named below."}
+                                View{width: Fill height: Fit flow: Right spacing: 12
+                                    dj_v0 := CheckBox{text: ""}
+                                    dj_v1 := CheckBox{text: ""}
+                                    dj_v2 := CheckBox{text: ""}
+                                    dj_v3 := CheckBox{text: ""}
+                                    dj_v4 := CheckBox{text: ""}
+                                    dj_v5 := CheckBox{text: ""}
+                                }
+                                View{width: Fill height: Fit flow: Right spacing: 12 align: Align{y: 0.5}
+                                    dj_format := DropDown{width: 200 labels: ["WAV, 44.1 kHz" "MP3, 320 kbps"]}
+                                    export_dj_btn := PillButton{text: "Export for rekordbox"}
+                                }
+                            }
+                        }
+                        export_status := Caption{width: Fill text: ""}
+                        export_done := PillButton{text: "Done"}
+                    }
+
                     timeline_box := View{
                         width: Fill height: Fill flow: Down
                         timeline := mod.widgets.DawTimeline{}
@@ -501,6 +562,9 @@ pub struct App {
     /// The Settings panel is showing (over the start screen or a song).
     #[rust]
     settings_shown: bool,
+    /// The Export sheet is showing (over the song).
+    #[rust]
+    export_shown: bool,
     /// Audio devices as the system last reported them.
     #[rust]
     audio_devices: Vec<AudioDeviceDesc>,
@@ -1329,6 +1393,8 @@ impl App {
         let ui = self.ui.clone();
         ui.view(cx, ids!(home)).set_visible(cx, !song);
         self.home_shown = !song;
+        self.export_shown = false;
+        ui.view(cx, ids!(export_sheet)).set_visible(cx, false);
         ui.view(cx, ids!(describe_frame)).set_visible(cx, song);
         ui.button(cx, ids!(render_btn)).set_visible(cx, song);
         if !song {
@@ -1744,6 +1810,10 @@ impl App {
     fn set_status(&mut self, cx: &mut Cx, s: &str) {
         self.ui.label(cx, ids!(status_label)).set_text(cx, s);
         self.status_at = Some(std::time::Instant::now());
+        // the Export sheet covers the song: it shows how an export is going too
+        if self.export_shown {
+            self.ui.label(cx, ids!(export_status)).set_text(cx, s);
+        }
     }
 
     fn drain_jobs(&mut self, cx: &mut Cx) {
@@ -2300,6 +2370,8 @@ impl App {
         self.settings_shown = on;
         ui.view(cx, ids!(settings)).set_visible(cx, on);
         if on {
+            self.export_shown = false;
+            ui.view(cx, ids!(export_sheet)).set_visible(cx, false);
             ui.view(cx, ids!(home)).set_visible(cx, false);
             for id in [ids!(timeline_box), ids!(inspector_box)] {
                 ui.view(cx, id).set_visible(cx, false);
@@ -2310,6 +2382,56 @@ impl App {
             self.show_song_view(cx, song);
         }
         ui.redraw(cx);
+    }
+
+    /// Show or hide the Export sheet (over the song).
+    fn show_export(&mut self, cx: &mut Cx, on: bool) {
+        let ui = self.ui.clone();
+        if !on || self.state.is_none() {
+            self.show_song_view(cx, self.state.is_some() && !self.home_shown);
+            return;
+        }
+        self.settings_shown = false;
+        ui.view(cx, ids!(settings)).set_visible(cx, false);
+        self.export_shown = true;
+        ui.view(cx, ids!(export_sheet)).set_visible(cx, true);
+        for id in [ids!(timeline_box), ids!(inspector_box)] {
+            ui.view(cx, id).set_visible(cx, false);
+        }
+        let Some(st) = self.state.as_ref() else { return };
+        let midi = st.project.tracks.iter().filter(|t| t.is_midi()).count();
+        ui.button(cx, ids!(export_midi_btn)).set_visible(cx, midi > 0);
+        let text = if midi > 0 {
+            "Each MIDI lane as a .mid file on the song's tempo, so it lines up with the audio."
+        } else {
+            "This song has no MIDI lanes yet."
+        };
+        ui.label(cx, ids!(export_midi_text)).set_text(cx, text);
+        let versions = export::dj_versions(st);
+        for (i, id) in [ids!(dj_v0), ids!(dj_v1), ids!(dj_v2), ids!(dj_v3), ids!(dj_v4), ids!(dj_v5)].into_iter().enumerate() {
+            let cb = ui.check_box(cx, id);
+            cb.set_visible(cx, i < versions.len());
+            if let Some((_, label)) = versions.get(i) {
+                cb.set_text(label);
+                cb.set_active(cx, false, Animate::No);
+            }
+        }
+        ui.label(cx, ids!(export_status)).set_text(cx, "");
+        ui.redraw(cx);
+    }
+
+    /// Start an export from the sheet: the worker renders, the status line follows.
+    fn export(&mut self, cx: &mut Cx, kind: export::Kind) {
+        let Some(st) = self.state.as_mut() else { return };
+        let line = match export::start(st, kind) {
+            Ok((None, line)) => line,
+            Ok((Some(job), line)) => match self.jobs.as_ref().map(|j| j.submit(Job::Export(Box::new(job)))) {
+                Some(true) => line,
+                _ => "The export worker is not running".into(),
+            },
+            Err(e) => format!("Export: {e}"),
+        };
+        self.set_status(cx, &line);
     }
 
     fn refresh_settings(&mut self, cx: &mut Cx) {
@@ -2521,6 +2643,32 @@ impl MatchEvent for App {
             st.toggle_play();
         }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
+            let on = !self.export_shown;
+            self.show_export(cx, on);
+            return;
+        }
+        if ui.button(cx, ids!(export_done)).clicked(actions) {
+            self.show_export(cx, false);
+            return;
+        }
+        let kind = if ui.button(cx, ids!(export_stems_btn)).clicked(actions) {
+            Some(export::Kind::Stems)
+        } else if ui.button(cx, ids!(export_midi_btn)).clicked(actions) {
+            Some(export::Kind::Midi)
+        } else if ui.button(cx, ids!(export_daw_btn)).clicked(actions) {
+            Some(export::Kind::DawProject)
+        } else if ui.button(cx, ids!(export_dj_btn)).clicked(actions) {
+            let ticked = [ids!(dj_v0), ids!(dj_v1), ids!(dj_v2), ids!(dj_v3), ids!(dj_v4), ids!(dj_v5)].map(|id| ui.check_box(cx, id).active(cx));
+            let versions = export::dj_versions(st).into_iter().zip(ticked).filter(|(_, on)| *on).map(|((id, _), _)| id).collect();
+            Some(export::Kind::Dj { versions, mp3: ui.drop_down(cx, ids!(dj_format)).selected_item() == 1 })
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            self.export(cx, kind);
+            return;
+        }
+        if ui.button(cx, ids!(export_mix_btn)).clicked(actions) {
             let out_dir = st.path.parent().map(|p| p.join("renders")).unwrap_or_else(|| PathBuf::from("renders"));
             // plugins get a second instance for the render
             let (rack, missing) = st.make_render_rack();
