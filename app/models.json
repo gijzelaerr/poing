@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "note": "Poing's model registry, compiled into the app. A pack is one folder under the models folder; it counts as installed when its pack.json is there. URLs pin a commit, never main. A runtime pack (setup) builds a Python env with the bundled uv after its files are in.",
+  "packs": [
+    {
+      "id": "py-acestep",
+      "title": "ACE-Step runtime",
+      "what": "Python 3.12, PyTorch CUDA 12.8 and ACE-Step 1.5's code, built with uv from its lockfile",
+      "licence": "MIT",
+      "licence_url": "https://github.com/ACE-Step/ACE-Step-1.5/blob/main/LICENSE",
+      "commercial": true,
+      "needs": {
+        "gpu": "cuda",
+        "vram_gb": 8,
+        "driver": "528.33"
+      },
+      "files": [
+        {
+          "url": "https://codeload.github.com/ACE-Step/ACE-Step-1.5/zip/ca1e85fe9430179831e6bc6be790c332190a3866",
+          "path": "src.zip",
+          "size": 9148700,
+          "sha256": "108e45dffc7eb62af98d781c4159aa63a2b7a241186734e3e065279da7fc198d"
+        }
+      ],
+      "setup": {
+        "unzip": "src.zip",
+        "project": "src",
+        "smoke": "import torch, acestep; assert torch.cuda.is_available(), 'PyTorch sees no CUDA GPU'",
+        "bytes": 6200000000
+      }
+    },
+    {
+      "id": "acestep-turbo",
+      "title": "ACE-Step 1.5 turbo",
+      "what": "the turbo DiT, its VAE and the Qwen3 text encoder",
+      "licence": "MIT",
+      "licence_url": "https://huggingface.co/ACE-Step/Ace-Step1.5",
+      "commercial": true,
+      "needs": {
+        "gpu": "cuda",
+        "vram_gb": 8,
+        "driver": "528.33"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/added_tokens.json",
+          "path": "Qwen3-Embedding-0.6B/added_tokens.json",
+          "size": 707,
+          "sha256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/chat_template.jinja",
+          "path": "Qwen3-Embedding-0.6B/chat_template.jinja",
+          "size": 4116,
+          "sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/config.json",
+          "path": "Qwen3-Embedding-0.6B/config.json",
+          "size": 1359,
+          "sha256": "bb23c1607cfe059a58d8f0196cf1cebb52082b1056b8e358a579da80a5759420"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/merges.txt",
+          "path": "Qwen3-Embedding-0.6B/merges.txt",
+          "size": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/model.safetensors",
+          "path": "Qwen3-Embedding-0.6B/model.safetensors",
+          "size": 1191586416,
+          "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/special_tokens_map.json",
+          "path": "Qwen3-Embedding-0.6B/special_tokens_map.json",
+          "size": 613,
+          "sha256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/tokenizer.json",
+          "path": "Qwen3-Embedding-0.6B/tokenizer.json",
+          "size": 11423705,
+          "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/tokenizer_config.json",
+          "path": "Qwen3-Embedding-0.6B/tokenizer_config.json",
+          "size": 5404,
+          "sha256": "443bfa629eb16387a12edbf92a76f6a6f10b2af3b53d87ba1550adfcf45f7fa0"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/Qwen3-Embedding-0.6B/vocab.json",
+          "path": "Qwen3-Embedding-0.6B/vocab.json",
+          "size": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/config.json",
+          "path": "acestep-v15-turbo/config.json",
+          "size": 1968,
+          "sha256": "74745ff704ea49164c3d2d1c99fc0670f3fc635a869f0aec2d1311e6a52d400a"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/configuration_acestep_v15.py",
+          "path": "acestep-v15-turbo/configuration_acestep_v15.py",
+          "size": 13130,
+          "sha256": "b89870c5c7a7ce060eb0bcdbb5ffc86b0b1a324ca325a26be552ea1b42496dc5"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/model.safetensors",
+          "path": "acestep-v15-turbo/model.safetensors",
+          "size": 4787825604,
+          "sha256": "3f6e0797fad420a39bd33979eb6e840e30989e34a3794e843d23b60ec6e422d7"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/modeling_acestep_v15_turbo.py",
+          "path": "acestep-v15-turbo/modeling_acestep_v15_turbo.py",
+          "size": 96036,
+          "sha256": "c1ab0dd547124fee7ada449b2b86eae8201dc7d15889932643bbb67e3c982444"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-v15-turbo/silence_latent.pt",
+          "path": "acestep-v15-turbo/silence_latent.pt",
+          "size": 3841215,
+          "sha256": "a778e9dd942f5e8b2c09c55370782d318834432b03dabbcdf70e6ed49ad6358b"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/vae/config.json",
+          "path": "vae/config.json",
+          "size": 425,
+          "sha256": "14e019904df567f26df750317a70e2bd08f9f8f3c40ff4a24c97d1cd3f20ccd2"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/vae/diffusion_pytorch_model.safetensors",
+          "path": "vae/diffusion_pytorch_model.safetensors",
+          "size": 337431388,
+          "sha256": "da17edb604c40deaf09e9b24974e590d1ca83a374070e5d0884cfa4bed9a99b0"
+        }
+      ]
+    },
+    {
+      "id": "acestep-lm",
+      "title": "ACE-Step song planner",
+      "what": "the 1.7B 5 Hz language model that plans a new song before it is sung",
+      "licence": "MIT",
+      "licence_url": "https://huggingface.co/ACE-Step/Ace-Step1.5",
+      "commercial": true,
+      "needs": {
+        "gpu": "cuda",
+        "vram_gb": 8,
+        "driver": "528.33"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/added_tokens.json",
+          "path": "acestep-5Hz-lm-1.7B/added_tokens.json",
+          "size": 2217787,
+          "sha256": "db08b66a515fb5d6acca0b3492d25bb44e0deda6241fc1113ac0679d40558c48"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/chat_template.jinja",
+          "path": "acestep-5Hz-lm-1.7B/chat_template.jinja",
+          "size": 4168,
+          "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/config.json",
+          "path": "acestep-5Hz-lm-1.7B/config.json",
+          "size": 1385,
+          "sha256": "73515ca4bfd86a5b56f28bf680311d1911e159c85d7f7ceb2188e310007c9010"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/merges.txt",
+          "path": "acestep-5Hz-lm-1.7B/merges.txt",
+          "size": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/model.safetensors",
+          "path": "acestep-5Hz-lm-1.7B/model.safetensors",
+          "size": 3708521528,
+          "sha256": "f161689da73e5ecefa28ff780d51c2d92a00f056d021d7933c779ed5c6cd7db8"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/special_tokens_map.json",
+          "path": "acestep-5Hz-lm-1.7B/special_tokens_map.json",
+          "size": 1824199,
+          "sha256": "76e233bfc357b0b03d7b6e6ba8e799244f358552575a7cdadb78d3d19106b298"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/tokenizer.json",
+          "path": "acestep-5Hz-lm-1.7B/tokenizer.json",
+          "size": 24321939,
+          "sha256": "35af56c3f5cb3ea2cc578aa28a8937770981d504f183ac5c8c38baf4bbd4af4d"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/tokenizer_config.json",
+          "path": "acestep-5Hz-lm-1.7B/tokenizer_config.json",
+          "size": 14072925,
+          "sha256": "6cd70cdd89425971794f5235562edcc608b0629a6c4686ae51a8b8c8b8ba5e95"
+        },
+        {
+          "url": "https://huggingface.co/ACE-Step/Ace-Step1.5/resolve/19671f406d603126926c1b7e2adc169acbcade22/acestep-5Hz-lm-1.7B/vocab.json",
+          "path": "acestep-5Hz-lm-1.7B/vocab.json",
+          "size": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ]
+    },
+    {
+      "id": "py-analysis",
+      "title": "Analysis runtime",
+      "what": "Python 3.11, PyTorch CUDA 12.6, Demucs, SheetSage2 and Whisper; their weights (about 5.8 GB) download on the first analysis",
+      "licence": "CC BY-NC 4.0",
+      "licence_url": "https://huggingface.co/m-a-p/SheetSage2",
+      "commercial": false,
+      "needs": {},
+      "files": [],
+      "setup": {
+        "project": "@sidecar",
+        "smoke": "import torch, demucs, transformers",
+        "bytes": 12500000000
+      }
+    }
+  ],
+  "features": [
+    {
+      "id": "analysis",
+      "title": "Splitting and understanding a song",
+      "packs": [
+        "py-analysis"
+      ]
+    },
+    {
+      "id": "repaint",
+      "title": "Repainting a range",
+      "packs": [
+        "py-acestep",
+        "acestep-turbo"
+      ]
+    },
+    {
+      "id": "remix",
+      "title": "Remixing a song",
+      "packs": [
+        "py-acestep",
+        "acestep-turbo"
+      ]
+    },
+    {
+      "id": "new-song",
+      "title": "Making a new song",
+      "packs": [
+        "py-acestep",
+        "acestep-turbo"
+      ],
+      "optional": [
+        "acestep-lm"
+      ]
+    }
+  ]
+}

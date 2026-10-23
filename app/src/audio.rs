@@ -890,13 +890,7 @@ pub fn render(stems: &[Arc<Stem>], mix: &MixParams, mut rack: Box<FxRack>, sr: u
 
 // ------------------------------------------------------------ analysis sidecar
 
-/// Where the analysis sidecar (a uv project) lives: `POING_SIDECAR`, else the
-/// repository's `sidecar/` next to this crate (development builds).
-pub fn sidecar_dir() -> PathBuf {
-    std::env::var_os("POING_SIDECAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("sidecar"))
-}
+use crate::paths::{self, sidecar_dir, Runtime};
 
 /// One progress line the sidecar prints on stdout.
 #[derive(makepad_micro_serde::DeJson)]
@@ -941,15 +935,17 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
     };
     let full_sidecar = |why: String| {
         note(&format!("native analysis: {why}; using the Python sidecar for all of it"));
-        run_lines(sidecar_command(audio, bundle), &log, (0.0, 1.0), &progress).and_then(LinesOutcome::done)
+        run_lines(sidecar_command(audio, bundle)?, &log, (0.0, 1.0), &progress).and_then(LinesOutcome::done)
     };
     let result = match native {
         Ok(LinesOutcome::Done) => {
-            let mut cmd = sidecar_command(audio, bundle);
-            cmd.arg("--only").arg("structure");
             // The native half stands on its own: a song with stems, beats and
             // lyrics but no sections is better than no analysis.
-            if let Err(why) = run_lines(cmd, &log, (0.7, 1.0), &progress).and_then(LinesOutcome::done) {
+            let structure = sidecar_command(audio, bundle).and_then(|mut cmd| {
+                cmd.arg("--only").arg("structure");
+                run_lines(cmd, &log, (0.7, 1.0), &progress).and_then(LinesOutcome::done)
+            });
+            if let Err(why) = structure {
                 note(&format!("sections, key and chords skipped: {why}"));
             }
             Ok(())
@@ -972,11 +968,10 @@ fn analyze(audio: &Path, bundle: &Path, sr: u32, tx: &Sender<JobUpdate>) {
     send(tx, JobUpdate::Analyzed { bundle: bundle.to_path_buf(), stems });
 }
 
-/// `uv run … poing_analyze.py <audio> <bundle>` in the sidecar project.
-fn sidecar_command(audio: &Path, bundle: &Path) -> Command {
-    let dir = sidecar_dir();
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("--project").arg(&dir).arg("python").arg(dir.join("poing_analyze.py")).arg(audio).arg(bundle)
+/// `python poing_analyze.py <audio> <bundle>` in the analysis runtime.
+fn sidecar_command(audio: &Path, bundle: &Path) -> Result<Command, String> {
+    let mut cmd = paths::python(Runtime::Analysis)?;
+    cmd.arg(sidecar_dir().join("poing_analyze.py")).arg(audio).arg(bundle)
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1");
     // SheetSage2 decodes audio with the ffmpeg CLI; put the one we found on PATH.
@@ -988,7 +983,7 @@ fn sidecar_command(audio: &Path, bundle: &Path) -> Command {
             cmd.env("PATH", joined);
         }
     }
-    cmd
+    Ok(cmd)
 }
 
 /// The native engine (`poing-engine`, built next to poing): `POING_ENGINE`,
@@ -1227,13 +1222,11 @@ fn generate(bundle: &Path, take: Take, fixture: &Yue2Fixture, sr: u32, tx: &Send
     }
 }
 
-/// One run of a Poing script under `uv run --project <project>`.
+/// One run of a Poing script in one of its Python runtimes.
 struct UvScript<'a> {
-    project: PathBuf,
+    runtime: Runtime,
     script: PathBuf,
     args: Vec<std::ffi::OsString>,
-    cwd: Option<PathBuf>,
-    envs: Vec<(&'a str, std::ffi::OsString)>,
     /// stderr goes here
     log: PathBuf,
     /// Sees every progress line (e.g. a finished version) as it comes.
@@ -1248,19 +1241,13 @@ fn run_uv_script(run: UvScript, progress: &dyn Fn(&str, f32), from: f32, to: f32
     use std::process::Stdio;
 
     let log = std::fs::File::create(&run.log).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("--project").arg(&run.project).arg("python").arg(&run.script).args(&run.args)
+    let mut cmd = paths::python(run.runtime)?;
+    cmd.arg(&run.script).args(&run.args)
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log));
-    for (k, v) in &run.envs {
-        cmd.env(k, v);
-    }
-    if let Some(dir) = &run.cwd {
-        cmd.current_dir(dir);
-    }
     // Demucs and SheetSage2 decode with the ffmpeg CLI; put the one we found on PATH.
     if let Some(ff) = ffmpeg().and_then(|f| f.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()) {
         let mut paths = vec![ff];
@@ -1274,7 +1261,7 @@ fn run_uv_script(run: UvScript, progress: &dyn Fn(&str, f32), from: f32, to: f32
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd.spawn().map_err(|e| format!("needs `uv` on PATH ({e})"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("{} did not start ({e})", cmd.get_program().to_string_lossy()))?;
     let (mut range, mut error) = (None, None);
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
@@ -1312,13 +1299,10 @@ fn dereverb(bundle: &Path, take: Take, lane: &Path, sr: u32, tx: &Sender<JobUpda
     if let Err(e) = std::fs::create_dir_all(&work) {
         return fail(e.to_string());
     }
-    let project = sidecar_dir().join("dereverb");
     let run = UvScript {
-        script: project.join("poing_dereverb.py"),
-        project,
+        runtime: Runtime::Dereverb,
+        script: sidecar_dir().join("dereverb").join("poing_dereverb.py"),
         args: vec![lane.into(), work.clone().into(), take.start.to_string().into(), take.end.to_string().into()],
-        cwd: None,
-        envs: Vec::new(),
         log: work.join("render.log"),
         on_line: None,
     };
@@ -1376,13 +1360,10 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
     if let Err(e) = std::fs::write(&lego_json, lego.serialize_json()).and_then(|_| std::fs::write(&layer_json, clean.serialize_json())) {
         return fail(e.to_string());
     }
-    let ace = acestep_dir();
     let run = UvScript {
-        project: ace.clone(),
+        runtime: Runtime::AceStep,
         script: sidecar_dir().join("acestep_lego.py"),
         args: vec![lego_json.into()],
-        cwd: Some(ace.clone()),
-        envs: vec![("POING_ACESTEP", ace.into())],
         log: work.join("lego.log"),
         on_line: None,
     };
@@ -1390,11 +1371,9 @@ fn layer(bundle: &Path, take: Take, mut lego: LegoJob, mut clean: LayerJob, sr: 
         return fail(e);
     }
     let run = UvScript {
-        project: sidecar_dir(),
+        runtime: Runtime::Analysis,
         script: sidecar_dir().join("poing_layer.py"),
         args: vec![layer_json.into()],
-        cwd: None,
-        envs: Vec::new(),
         log: work.join("layer.log"),
         on_line: None,
     };
@@ -1469,13 +1448,10 @@ fn run_song_job(job: &SongJob, progress: &dyn Fn(&str, f32), version: &dyn Fn(us
             version(i, PathBuf::from(p));
         }
     };
-    let ace = acestep_dir();
     let run = UvScript {
-        project: ace.clone(),
+        runtime: Runtime::AceStep,
         script: sidecar_dir().join("acestep_song.py"),
         args: vec![job_path.into()],
-        cwd: Some(ace.clone()),
-        envs: vec![("POING_ACESTEP", ace.into())],
         log: out.join("song.log"),
         on_line: Some(&on_line),
     };
@@ -1616,14 +1592,6 @@ fn finish_take(bundle: &Path, take: Take, rendered: &Path, sr: u32, tx: &Sender<
     }
 }
 
-/// The ACE-Step 1.5 checkout (a uv project): `POING_ACESTEP`, else
-/// `ACE-Step-1.5` next to this repository.
-pub fn acestep_dir() -> PathBuf {
-    std::env::var_os("POING_ACESTEP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("ACE-Step-1.5"))
-}
-
 /// Repaint one range with ACE-Step (`sidecar/acestep_repaint.py` in its uv
 /// project), relaying progress; the take covers the range plus its margins.
 fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u32, tx: &Sender<JobUpdate>) {
@@ -1647,15 +1615,15 @@ fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u
     if let Err(e) = std::fs::write(&job_path, job.serialize_json()) {
         return fail(e.to_string());
     }
-    let ace = acestep_dir();
     let log = match std::fs::File::create(work.join("render.log")) {
         Ok(f) => f,
         Err(e) => return fail(e.to_string()),
     };
-    let mut cmd = Command::new("uv");
-    cmd.arg("run").arg("--project").arg(&ace).arg("python").arg(sidecar_dir().join("acestep_repaint.py")).arg(&job_path)
-        .current_dir(&ace)
-        .env("POING_ACESTEP", &ace)
+    let mut cmd = match paths::python(Runtime::AceStep) {
+        Ok(cmd) => cmd,
+        Err(e) => return fail(e),
+    };
+    cmd.arg(sidecar_dir().join("acestep_repaint.py")).arg(&job_path)
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
@@ -1668,7 +1636,7 @@ fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return fail(format!("repaint needs `uv` on PATH ({e})")),
+        Err(e) => return fail(format!("{} did not start ({e})", cmd.get_program().to_string_lossy())),
     };
     let (mut range, mut error) = (None, None);
     if let Some(out) = child.stdout.take() {

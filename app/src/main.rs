@@ -15,6 +15,8 @@ mod listen;
 mod plugins;
 mod synth;
 mod midi_writer;
+mod models;
+mod paths;
 mod song_writer;
 pub(crate) use poing_model as model;
 mod state;
