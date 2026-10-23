@@ -655,9 +655,10 @@ pub struct App {
     /// Services open plugin windows (and knob moves waiting for a busy plugin).
     #[rust]
     plugin_pump: Timer,
-    /// Takes in a MIDI recording's keys while it runs.
+    /// While the keys play a MIDI lane: shows its meter moving (also stopped)
+    /// and takes in a recording's keys.
     #[rust]
-    rec_pump: Timer,
+    keys_pump: Timer,
     /// MIDI keyboards plugged in (none: the computer keyboard plays).
     #[rust]
     midi_inputs: usize,
@@ -1589,7 +1590,7 @@ fn promote_take(st: &EditorState) -> Result<PathBuf, String> {
     Ok(project_file)
 }
 
-const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  L loop selection  ·  F fit  ·  B split section  ·  Ctrl+wheel zoom  ·  Del delete  ·  Ctrl+Z undo";
+const HELP: &str = "Click a lane, section or take  ·  drag across a lane to mark a region  ·  Space play  ·  L loop selection  ·  F fit  ·  B split section  ·  R record a MIDI lane  ·  Ctrl+wheel zoom  ·  Del delete  ·  Ctrl+Z undo";
 
 impl App {
     fn load(&mut self, cx: &mut Cx) {
@@ -3251,21 +3252,25 @@ impl AppMain for App {
         self.drain_ai_port(cx, event);
         if let Some(st) = self.state.as_mut() {
             st.sync_keys();
-            if st.recording() && self.rec_pump.is_empty() {
-                self.rec_pump = cx.start_interval(0.03);
+            if st.keys_lane().is_some() && self.keys_pump.is_empty() {
+                self.keys_pump = cx.start_interval(0.03);
             }
         }
-        if self.rec_pump.is_event(event).is_some() {
-            match self.state.as_mut().filter(|st| st.recording()) {
+        if self.keys_pump.is_event(event).is_some() {
+            match self.state.as_mut().filter(|st| st.keys_lane().is_some()) {
                 Some(st) => {
                     if let Some(note) = st.pump_recording() {
                         st.notice = Some(note);
                     }
-                    self.ui.widget(cx, ids!(timeline)).redraw(cx);
+                    // the meters are read when the timeline draws: it draws while they move
+                    let heard = st.shared.meters.iter().any(|m| m.load(std::sync::atomic::Ordering::Relaxed) != 0);
+                    if heard || st.recording() {
+                        self.ui.widget(cx, ids!(timeline)).redraw(cx);
+                    }
                 }
                 None => {
-                    cx.stop_timer(self.rec_pump);
-                    self.rec_pump = Timer::empty();
+                    cx.stop_timer(self.keys_pump);
+                    self.keys_pump = Timer::empty();
                 }
             }
         }
@@ -3331,6 +3336,8 @@ impl AppMain for App {
             let inputs = ports.all_inputs();
             cx.use_midi_inputs(&inputs);
             self.midi_inputs = inputs.len();
+            let names: Vec<&str> = ports.descs.iter().filter(|d| d.port_type.is_input()).map(|d| d.name.as_str()).collect();
+            log!("poing: MIDI inputs: {}", if names.is_empty() { "none (A to K play)".into() } else { names.join(", ") });
         }
         let piano = self.piano(cx, event);
         // Shortcuts work anywhere but in a text field (which keeps its own keys).

@@ -162,6 +162,8 @@ pub fn summary(st: &EditorState, status: &str) -> String {
                 ("mute", Value::Bool(t.muted())),
                 ("solo", Value::Bool(t.soloed())),
                 ("effects", chain(Some(i))),
+                // the lane's meter as shown (dBFS; -inf is silence)
+                ("level_db", f(st.meter_show.get(i).map_or(-120.0, |v| (20.0 * v.max(1e-6).log10()).round() as f64))),
             ];
             if let Some(notes) = &t.notes {
                 fields.push(("midi_notes", Value::Int(notes.len() as i64)));
@@ -215,6 +217,11 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         ("playing", Value::Bool(st.shared.playing())),
         ("playhead", f(st.playhead())),
         ("selected", json::s(selected)),
+        ("recording", match &st.rec {
+            Some(r) if st.shared.live.counting_in() => json::s(format!("counting in on lane {}", r.lane)),
+            Some(r) => json::s(format!("lane {}", r.lane)),
+            None => Value::Bool(false),
+        }),
         #[cfg(windows)]
         ("plugin_missed_blocks", Value::Int(crate::plugins::MISSED_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) as i64)),
         ("lanes", Value::Arr(lanes)),
