@@ -72,6 +72,12 @@ pub fn manifest() -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(tool(
+        "arrange",
+        "Change the song's order by section (indices as in `song`): `move` section `section` to before section `to` (the section count puts it at the end), `duplicate` it (a copy before `to`, by default right after itself), `delete` it, or `extend` the song by `seconds` at its end (ACE-Step goes on past the end: a job, see `song.busy`). Every lane, take, MIDI note, chord, lyric line and region in the section goes with it, spliced on downbeats; the user can undo each edit. Sections are renumbered after an edit: read `song` again.",
+        r#"{"type":"object","properties":{"op":{"type":"string","enum":["move","duplicate","delete","extend"]},"section":{"type":"integer","minimum":0},"to":{"type":"integer","minimum":0},"seconds":{"type":"number","minimum":5,"maximum":120}},"required":["op"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
         "transport",
         "Play or pause, jump to a time in seconds, or loop a range ([start, end] seconds; null stops looping).",
         r#"{"type":"object","properties":{"play":{"type":"boolean"},"seek":{"type":"number","minimum":0},"loop":{"type":["array","null"],"items":{"type":"number"},"minItems":2,"maxItems":2}},"additionalProperties":false}"#,
@@ -193,7 +199,9 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         Selection::Region(i) => format!("region {i}"),
         Selection::Fx(Some(l), i) => format!("effect {i} on lane {l}"),
         Selection::Fx(None, i) => format!("master effect {i}"),
-        _ => "nothing".into(),
+        Selection::Chord(i) => format!("chord {i}"),
+        Selection::Lyric(i) => format!("lyric line {i}"),
+        Selection::None => "nothing".into(),
     };
     json::obj(vec![
         ("name", json::s(p.name.clone())),
@@ -263,6 +271,7 @@ const BRIEF: &str = r#"You are the assistant inside Poing, a music workstation. 
 - Listen before you change the sound and again after: pick a representative range (a chorus, or the section the request is about; up to 30 s) and call `compare` (every lane and the mix, with which lanes lead each band) or `listen` (the mix, or one lane). Prefer a range where no section take plays (a result's `notes` say where one does): there the lanes are what you hear. Use the numbers to decide what to change and by how much: who is loud in low_mid when it is muddy, how far the vocals sit under the other lanes in high_mid and presence when they are buried, true peak and clipping before raising anything. Then measure the same range again to check the change did what was asked.
 - Change the mix with set_lane (`change_db` moves a level from where it is: prefer small moves of 1-3 dB unless the measurements call for more), effect (knobs by name, bypass), take, combine and transport.
 - To add an instrument part (bass line, chords, drums, a melody) use `add_part`. Use `describe` to have Poing make other new things: an effect written for a lane, a lane played again as another instrument, a section repaint, or whole-song remixes (only when the person asks for a new version of the whole song: a remix replaces every lane while it plays). Both run a job and return when it is done (that can take minutes).
+- To change the song's order ("repeat the chorus", "cut the second verse", "move the bridge after the last chorus", "make it 30 s longer") use `arrange`; read `song` again after each edit, the sections are renumbered.
 - `song.status` is the last message Poing showed, not a request.
 - Do not export unless asked. Do not undo the person's earlier choices unless the request says so.
 - Finish with at most two short plain sentences (about 40 words; Poing shows them in its status line): what you changed and what it measured before and after, for example "Bass -2 dB: low-mids -1.8 dB in the verse; vocals +2 dB, now 3 dB over the guitars at 2-4 kHz." Add a few words when something stands in the way (clipping, a plugin the measurement left out). No markdown, no lists."#;

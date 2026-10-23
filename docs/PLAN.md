@@ -168,7 +168,7 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 | L | Local AI: song sheets, MIDI parts, effects and the Describe assistant on a local Qwen model; Claude optional | proposed |
 | A | Remote compute: UI on the Mac, AI and compute on a Windows node (`poing-node`, Makepad AI hub discovery and credentials) | proposed |
 | G+K | Export: stems, MIDI files, DAWproject; DJ export (rekordbox XML with beatgrid, key, section cues) for rekordbox and the OMNIS-DUO | next |
-| E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | after D |
+| E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | PR |
 | F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | after D |
 | H | Plugins phase 2: latency compensation, plugins in a helper process | after A or G |
 | QA | End-to-end on the Mac UI against the Windows node, then tag v1.0 | last |

@@ -12,12 +12,20 @@ use std::time::{Instant, SystemTime};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+pub mod arrange {
+    include!("arrange.rs");
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Selection {
     None,
     Track(usize),
     Region(usize),
     Section(usize),
+    /// A chord of the analysis (its name can be corrected).
+    Chord(usize),
+    /// A lyric line of the analysis (its words can be corrected).
+    Lyric(usize),
     /// An effect: its lane (None: the master) and place in the chain.
     Fx(Option<usize>, usize),
 }
@@ -54,9 +62,12 @@ pub struct EditorState {
     /// Effects that do not compile right now, with why.
     pub fx_errors: HashMap<String, String>,
     fx_polled: Instant,
-    /// Song states before each edit (Ctrl+Z) and after each undo (Ctrl+Shift+Z).
-    undo: Vec<(Project, Stems)>,
-    redo: Vec<(Project, Stems)>,
+    /// Song states before each edit (Ctrl+Z) and after each undo (Ctrl+Shift+Z);
+    /// audio long replaced by arrangement edits is read back from its files.
+    undo: Vec<(Project, Option<Stems>)>,
+    redo: Vec<(Project, Option<Stems>)>,
+    /// The chord or lyric line whose words are being corrected (one undo step).
+    pub editing_words: Option<Selection>,
     /// A message for the status line from an edit made in the timeline.
     pub notice: Option<String>,
     /// The timeline's area: key focus there (or nowhere) means shortcuts apply.
@@ -171,6 +182,7 @@ impl EditorState {
             fx_polled: Instant::now(),
             undo: Vec::new(),
             redo: Vec::new(),
+            editing_words: None,
             notice: None,
             timeline_area: makepad_widgets::Area::Empty,
             meter_show: vec![0.0; audio::METER_LANES + 1],
@@ -918,6 +930,7 @@ impl EditorState {
     pub fn add_take(&mut self, take: Take, stem: Stem) -> Result<(), String> {
         self.checkpoint();
         let id = take.id.clone();
+        self.grow_for(&take, &stem);
         self.project.takes_mut().push(take);
         let mut lanes: Vec<Arc<Stem>> = self.stems.iter().cloned().collect();
         lanes.push(Arc::new(stem));
@@ -1148,15 +1161,11 @@ impl EditorState {
         if remix.engine != "acestep-cover" {
             return Err(format!("{} does not line up with the song in time, so it cannot fill one section", remix.prompt));
         }
-        let src = self.stems[stem_i].clone();
-        let sr = self.sr() as f64;
         // a little either side: the take fades in and out across the section's edges
         let m = audio::TAKE_RAMP_S * 0.5;
-        let (a, b) = ((s.start - m).max(0.0), (s.end + m).min(self.duration()));
-        let (fa, fb) = ((a * sr) as usize, ((b * sr) as usize).min(src.l.len()));
-        if fb <= fa {
-            return Err("the remix is shorter than that section".into());
-        }
+        let (a, b) = ((s.start - m).max(0.0), (s.end + m).min(self.project.duration));
+        // (through how it lines up now, if the song was rearranged since)
+        let (a, b, part) = self.remix_range(stem_i, &remix, a, b).filter(|(lo, hi, _)| *lo <= s.start + 0.1 && *hi >= s.end - 0.1).ok_or("the remix does not reach that section")?;
         let prompt = format!("{} in the {}", remix.prompt, s.label);
         // the same remix in the same section again: that take, not a copy of it
         let same = self.project.takes().iter().rev().find(|t| t.engine == "copy" && t.prompt == prompt && (t.start - a).abs() < 0.01 && (t.end - b).abs() < 0.01).map(|t| t.id.clone());
@@ -1181,8 +1190,8 @@ impl EditorState {
             track: None,
             blend: None,
         };
-        audio::write_wav(&self.dir().join(&take.file), &src.l[fa..fb], &src.r[fa..fb], self.sr(), 1.0).map_err(|e| e.to_string())?;
-        let stem = Stem::new(src.l[fa..fb].to_vec(), src.r[fa..fb].to_vec());
+        audio::write_wav(&self.dir().join(&take.file), &part.l, &part.r, self.sr(), 1.0).map_err(|e| e.to_string())?;
+        let stem = part;
         let what = take.prompt.clone();
         self.add_take(take, stem)?;
         // every section picked so far plays together (a song take would hide them)
@@ -1334,20 +1343,23 @@ impl EditorState {
                 self.push_mix();
                 format!("Removed the {} region", r.kind)
             }
-            Selection::Section(i) if self.project.sections().len() > 1 && i < self.project.sections().len() => {
+            // a section is cut from the song, with everything in it
+            Selection::Section(i) if i < self.project.sections().len() => {
+                return Some(self.arrange(&poing_model::arrange::Op::Delete { section: i }).unwrap_or_else(|e| format!("Could not cut it: {e}")));
+            }
+            // a misheard line or a chord that is not there
+            Selection::Lyric(i) if self.project.analysis.as_ref().and_then(|a| a.lyrics.as_ref()).is_some_and(|l| i < l.len()) => {
                 self.checkpoint();
-                // merge into the previous section (or the next one if it is the first)
-                let secs = self.project.sections_mut();
-                let removed = secs.remove(i);
-                let into = if i > 0 {
-                    secs[i - 1].end = removed.end;
-                    secs[i - 1].label.clone()
-                } else {
-                    secs[0].start = removed.start;
-                    secs[0].label.clone()
-                };
+                let l = self.project.analysis.as_mut().and_then(|a| a.lyrics.as_mut()).map(|l| l.remove(i))?;
                 self.dirty = true;
-                format!("Merged the {} into the {into} before it", removed.label)
+                self.write_lyrics();
+                format!("Removed the line \"{}\"", l.text.trim())
+            }
+            Selection::Chord(i) if self.project.analysis.as_ref().and_then(|a| a.chords.as_ref()).is_some_and(|c| i < c.len()) => {
+                self.checkpoint();
+                let c = self.project.analysis.as_mut().and_then(|a| a.chords.as_mut()).map(|c| c.remove(i))?;
+                self.dirty = true;
+                format!("Removed the {} chord", c.label)
             }
             Selection::Track(i) if i < self.project.tracks.len() => {
                 if self.project.tracks.len() == 1 {
@@ -1397,7 +1409,7 @@ impl EditorState {
 
     /// Remember the song as it is, before an edit (for Ctrl+Z).
     pub fn checkpoint(&mut self) {
-        self.undo.push((self.project.clone(), self.stems.clone()));
+        self.undo.push((self.project.clone(), Some(self.stems.clone())));
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
@@ -1407,12 +1419,27 @@ impl EditorState {
     /// Step back one edit (or forward again with `redo`).
     pub fn undo(&mut self, redo: bool) -> Option<String> {
         let (project, stems) = if redo { self.redo.pop()? } else { self.undo.pop()? };
+        let stems = match stems {
+            Some(s) => s,
+            None => match self.load_stems(&project) {
+                Ok(s) => s,
+                Err(e) => {
+                    // put it back: nothing changed
+                    if redo { self.redo.push((project, None)) } else { self.undo.push((project, None)) }
+                    return Some(format!("Could not undo: {e}"));
+                }
+            },
+        };
         // a selected lane stays selected (a note edit undone keeps its piano roll open)
         let lane = match self.sel {
             Selection::Track(i) => self.project.tracks.get(i).map(|t| t.id.clone()),
             _ => None,
         };
-        let now = (std::mem::replace(&mut self.project, project), self.stems.clone());
+        let before = self.project.duration;
+        let now = (std::mem::replace(&mut self.project, project), Some(self.stems.clone()));
+        // the words or their sections changed back: so do the sung lyrics
+        let sung = |p: &Project| (p.sections.as_ref().map(|s| s.iter().map(|s| (s.start, s.end, s.label.clone())).collect::<Vec<_>>()), p.analysis.as_ref().and_then(|a| a.lyrics.as_ref()).map(|l| l.iter().map(|l| (l.start, l.end, l.text.clone())).collect::<Vec<_>>()));
+        let words_changed = sung(&self.project) != sung(&now.0);
         if redo {
             self.undo.push(now);
         } else {
@@ -1436,6 +1463,18 @@ impl EditorState {
         let keep = lane.and_then(|id| self.project.track_index(&id));
         self.note_sel = None;
         self.select(keep.map_or(Selection::None, Selection::Track));
+        if (self.project.duration - before).abs() > 1e-6 {
+            // an arrangement edit undone: the song has its old length again
+            self.pps = 0.0;
+            self.set_loop(None);
+            if self.playhead() > self.duration() {
+                self.seek(0.0);
+            }
+        }
+        if words_changed {
+            self.write_lyrics();
+        }
+        self.forget_old_audio();
         let _ = self.save();
         Some(if redo { "Redone".into() } else { "Undone  ·  Ctrl+Shift+Z to redo".into() })
     }

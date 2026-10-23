@@ -110,6 +110,11 @@ enum Drag {
     MoveRegion { region: usize, grab: f64 },
     ResizeRegion { region: usize, left: bool },
     SectionEdge { index: usize },
+    /// A section grabbed in the section row: dragged sideways it moves
+    /// (Alt: a copy goes) to `to`, the edge it is let go at.
+    SectionMove { index: usize, x0: f64, copy: bool, to: Option<usize> },
+    /// Retiming a chord (`chord`) or a lyric line by one edge.
+    WordsEdge { chord: bool, index: usize, left: bool, saved: bool },
     /// Moving a note: where in it it was grabbed (beats).
     NoteMove { lane: usize, idx: usize, grab: f64 },
     /// Changing a note's length by its right edge.
@@ -326,6 +331,46 @@ impl DawTimeline {
     fn section_edge_at(&self, st: &EditorState, x: f64) -> Option<usize> {
         let secs = st.project.sections();
         (1..secs.len()).find(|&i| (self.x_of(st, secs[i].start) - x).abs() <= EDGE_PX)
+    }
+
+    /// Where a dragged section would go: before section k (the count: at the end).
+    fn section_drop_at(&self, st: &EditorState, x: f64) -> usize {
+        let t = self.t_of(st, x);
+        let secs = st.project.sections();
+        secs.iter().position(|s| t < 0.5 * (s.start + s.end)).unwrap_or(secs.len())
+    }
+
+    /// The strip along the vocals lane where the lyrics are written: its top.
+    fn lyric_y(&self, st: &EditorState) -> Option<f64> {
+        let v = st.project.track_index("vocals").filter(|&v| st.song_take().is_none() && v < self.geo.n && self.lane_shown(v))?;
+        Some(self.lane_y(v) + self.lane_hh(v) - LANE_GAP - 17.0)
+    }
+
+    /// The chord or lyric line at x (`chord`: in the chord row), and which of
+    /// its edges is under the pointer (selected ones only: Some(true) left).
+    fn words_at(&self, st: &EditorState, chord: bool, x: f64) -> Option<(usize, Option<bool>)> {
+        let a = st.project.analysis.as_ref()?;
+        let spans: Vec<(f64, f64)> = if chord {
+            a.chords.as_ref()?.iter().map(|c| if c.label == "N" { (0.0, 0.0) } else { (c.start, c.end) }).collect()
+        } else {
+            a.lyrics.as_ref()?.iter().map(|l| (l.start, l.end)).collect()
+        };
+        let selected = match st.sel {
+            Selection::Chord(i) if chord => Some(i),
+            Selection::Lyric(i) if !chord => Some(i),
+            _ => None,
+        };
+        if let Some(i) = selected.filter(|&i| i < spans.len()) {
+            let (a, b) = (self.x_of(st, spans[i].0), self.x_of(st, spans[i].1));
+            if (x - a).abs() <= EDGE_PX {
+                return Some((i, Some(true)));
+            }
+            if (x - b).abs() <= EDGE_PX {
+                return Some((i, Some(false)));
+            }
+        }
+        let t = self.t_of(st, x);
+        spans.iter().position(|(a, b)| t >= *a && t < *b).map(|i| (i, None))
     }
 
     fn rect(&mut self, cx: &mut Cx2d, x: f64, y: f64, w: f64, h: f64, color: Vec4f) {
@@ -703,6 +748,25 @@ impl DawTimeline {
             }
         }
 
+        // a section being dragged: where it would go, and it under the pointer
+        if let Drag::SectionMove { index, copy, to: Some(to), .. } = self.drag {
+            let secs = st.project.sections();
+            if let Some(s) = secs.get(index).cloned() {
+                let at = secs.get(to).map_or(st.project.duration, |n| n.start);
+                let x = self.x_of(st, at);
+                if x >= x0 - 1.0 && x <= x0 + w + 1.0 {
+                    self.rect(cx, x - 1.0, sy, 3.0, SECT_H, rgba(0xffffff, 0.95));
+                }
+                let label = if copy { format!("+ {}", s.label) } else { s.label.clone() };
+                let c = rgba(section_color(&s.label), 0.75);
+                let gw = ((s.end - s.start) * st.pps).clamp(40.0, 220.0);
+                // beside the mark, on the side that has room
+                let gx = if x + 3.0 + gw > x0 + w { x - 3.0 - gw } else { x + 3.0 };
+                self.shape_bordered(cx, Rect { pos: dvec2(gx, sy + 3.0), size: dvec2(gw, SECT_H - 6.0) }, 6.0, c, shade(c, 0.82), rgba(0xffffff, 0.9), 1.0);
+                self.bold(cx, gx + 8.0, sy + 8.0, white, &cut(&label, ((gw - 14.0) / 6.5) as usize));
+            }
+        }
+
         // background job progress: a thin accent line under the sections
         if let Some((_, p)) = st.analysing.clone() {
             self.shape(cx, Rect { pos: dvec2(x0, sy + SECT_H - 2.0), size: dvec2(w, 2.0) }, 1.0, rgba(HAIRLINE, 1.0), rgba(HAIRLINE, 1.0));
@@ -721,6 +785,9 @@ impl DawTimeline {
                 }
                 if let Some((x, cw)) = self.span(st, c.start, c.end) {
                     let on = cur == Some(i);
+                    if st.sel == Selection::Chord(i) {
+                        self.shape_bordered(cx, Rect { pos: dvec2(x, chord_y + 1.0), size: dvec2(cw.max(4.0), CHORD_H - 2.0) }, 4.0, rgba(ACCENT, 0.3), rgba(ACCENT, 0.25), rgba(0xffffff, 0.9), 1.5);
+                    }
                     if cw >= 18.0 {
                         self.rect(cx, x, chord_y + 5.0, 1.0, CHORD_H - 10.0, rgba(HAIRLINE, 1.0));
                     }
@@ -863,6 +930,11 @@ impl DawTimeline {
         if let Some(v) = st.project.track_index("vocals").filter(|&v| song_take.is_none() && v < n && self.lane_shown(v)) {
             let y = self.lane_y(v) + self.lane_hh(v) - LANE_GAP - 17.0;
             let mut right = f64::MIN;
+            if let Selection::Lyric(i) = st.sel {
+                if let Some((x, lw)) = lyrics.get(i).and_then(|l| self.span(st, l.start, l.end)) {
+                    self.shape_bordered(cx, Rect { pos: dvec2(x, y - 2.0), size: dvec2(lw.max(4.0), 16.0) }, 4.0, rgba(ACCENT, 0.3), rgba(ACCENT, 0.25), rgba(0xffffff, 0.9), 1.5);
+                }
+            }
             for l in &lyrics {
                 let x = self.x_of(st, l.start).max(x0);
                 if x >= x0 + w || self.x_of(st, l.end) < x0 || x < right {
@@ -1032,6 +1104,7 @@ impl Widget for DawTimeline {
                             let start = st.project.sections()[i].start;
                             st.select(Selection::Section(i));
                             st.seek(start);
+                            self.drag = Drag::SectionMove { index: i, x0: x, copy: fe.modifiers.alt, to: None };
                         }
                     }
                 } else if y >= self.geo.takes_y && y < self.geo.lanes_y {
@@ -1045,8 +1118,25 @@ impl Widget for DawTimeline {
                     }
                 } else if self.in_chords(y) {
                     if in_wave {
-                        st.seek(self.t_of(st, x));
-                        self.drag = Drag::Seek;
+                        match self.words_at(st, true, x) {
+                            Some((i, Some(left))) => self.drag = Drag::WordsEdge { chord: true, index: i, left, saved: false },
+                            Some((i, None)) => {
+                                st.select(Selection::Chord(i));
+                                st.seek(self.t_of(st, x));
+                            }
+                            None => {
+                                st.seek(self.t_of(st, x));
+                                self.drag = Drag::Seek;
+                            }
+                        }
+                    }
+                } else if let Some((i, edge)) = self.lyric_y(st).filter(|ly| in_wave && y >= ly - 3.0 && y < ly + 15.0).and_then(|_| self.words_at(st, false, x)) {
+                    match edge {
+                        Some(left) => self.drag = Drag::WordsEdge { chord: false, index: i, left, saved: false },
+                        None => {
+                            st.select(Selection::Lyric(i));
+                            st.seek(self.t_of(st, x));
+                        }
                     }
                 } else if let Some(lane) = self.lane_at(y).filter(|&l| in_wave && st.project.tracks[l].is_midi()) {
                     self.note_down(st, lane, x, y);
@@ -1154,6 +1244,56 @@ impl Widget for DawTimeline {
                         }
                         st.dirty = true;
                     }
+                    Drag::SectionMove { index, x0, copy, to } => {
+                        if to.is_some() || (x - x0).abs() > 6.0 {
+                            let k = self.section_drop_at(st, x);
+                            // a move to where it is already is no move
+                            let to = (copy || (k != index && k != index + 1)).then_some(k);
+                            self.drag = Drag::SectionMove { index, x0, copy, to: to.or(Some(usize::MAX)) };
+                        }
+                    }
+                    Drag::WordsEdge { chord, index, left, saved } => {
+                        if !saved {
+                            st.checkpoint();
+                            self.drag = Drag::WordsEdge { chord, index, left, saved: true };
+                        }
+                        if let Some(a) = st.project.analysis.as_mut() {
+                            // the neighbour that touches this edge moves with it
+                            let mut spans: Vec<(f64, f64)> = if chord {
+                                a.chords.iter().flatten().map(|c| (c.start, c.end)).collect()
+                            } else {
+                                a.lyrics.iter().flatten().map(|l| (l.start, l.end)).collect()
+                            };
+                            if index < spans.len() {
+                                let (lo, hi) = (if index > 0 { spans[index - 1].0 + 0.1 } else { 0.0 }, spans.get(index + 1).map_or(f64::MAX, |n| n.1 - 0.1));
+                                let t = t.clamp(lo, hi);
+                                if left {
+                                    let old = spans[index].0;
+                                    spans[index].0 = t.min(spans[index].1 - 0.1);
+                                    if index > 0 && (spans[index - 1].1 - old).abs() < 0.02 {
+                                        spans[index - 1].1 = spans[index].0;
+                                    }
+                                } else {
+                                    let old = spans[index].1;
+                                    spans[index].1 = t.max(spans[index].0 + 0.1);
+                                    if index + 1 < spans.len() && (spans[index + 1].0 - old).abs() < 0.02 {
+                                        spans[index + 1].0 = spans[index].1;
+                                    }
+                                }
+                                if chord {
+                                    for (c, (a, b)) in a.chords.iter_mut().flatten().zip(spans) {
+                                        (c.start, c.end) = (a, b);
+                                    }
+                                } else {
+                                    for (l, (a, b)) in a.lyrics.iter_mut().flatten().zip(spans) {
+                                        (l.start, l.end) = (a, b);
+                                    }
+                                }
+                                st.dirty = true;
+                                st.sel_changed = true;
+                            }
+                        }
+                    }
                     Drag::SectionEdge { index } => {
                         let secs = st.project.sections_mut();
                         let t = t.clamp(secs[index - 1].start + 0.5, secs[index].end - 0.5);
@@ -1173,6 +1313,16 @@ impl Widget for DawTimeline {
                         st.select(Selection::Track(track));
                     }
                     Drag::NewRegion { .. } => st.sel_changed = true,
+                    // a section let go elsewhere: moved (or repeated) there
+                    Drag::SectionMove { index, copy, to: Some(to), .. } if to != usize::MAX => {
+                        let op = if copy { poing_model::arrange::Op::Duplicate { section: index, to } } else { poing_model::arrange::Op::Move { section: index, to } };
+                        st.notice = Some(st.arrange(&op).unwrap_or_else(|e| format!("Could not change the arrangement: {e}")));
+                    }
+                    // retimed words: the sections' lyrics follow
+                    Drag::WordsEdge { saved: true, .. } => {
+                        st.write_lyrics();
+                        st.sel_changed = true;
+                    }
                     // a note edit is heard from the next rack (built once, on release)
                     Drag::NoteMove { lane, .. } | Drag::NoteSize { lane, .. } => {
                         let notes = st.project.tracks[lane].notes.clone().unwrap_or_default();

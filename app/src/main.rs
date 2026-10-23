@@ -547,6 +547,11 @@ script_mod! {
                             merge_btn := PillButton{text: "Merge into previous"}
                             use_remix_btn := PillButton{text: "Use the playing remix here"}
                         }
+                        words_row := View{
+                            visible: false width: Fill height: Fit flow: Right spacing: 14
+                            align: Align{y: 0.5}
+                            words_input := TextInput{width: 420 empty_text: "the right words"}
+                        }
                         take_row := View{
                             visible: false width: Fill height: Fit flow: Right spacing: 14
                             align: Align{y: 0.5}
@@ -809,7 +814,7 @@ fn typing(ui: &WidgetRef, cx: &Cx) -> bool {
     if focus.is_empty() {
         return false;
     }
-    let fields = [ids!(describe_input), ids!(note_input), ids!(section_input), ids!(remix_input), ids!(new_input)];
+    let fields = [ids!(describe_input), ids!(note_input), ids!(section_input), ids!(words_input), ids!(remix_input), ids!(new_input)];
     if fields.iter().any(|id| ui.widget(cx, *id).area() == focus) {
         return true;
     }
@@ -1035,6 +1040,10 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
 /// `lyrics.txt` in the bundle (hand-corrected) wins over the transcription.
 fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     let Some(jobs) = jobs else { return "The job worker is not running".into() };
+    // a chord or lyric line is selected to correct its words: Describe works on the song
+    if let Selection::Chord(_) | Selection::Lyric(_) = st.sel {
+        st.select(Selection::None);
+    }
     if !st.project.is_analysed() {
         // Not split (yet, or its download was declined): a range marked on the song can still be repainted.
         if let Some(reg) = match st.sel {
@@ -1056,6 +1065,16 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         return "A job is still running; describe the next take when it is done.".into();
     }
     let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    // The song's order: "repeat the chorus", "cut the second verse", "make it 30 s longer"
+    if let Selection::None | Selection::Section(_) = st.sel {
+        let selected = if let Selection::Section(i) = st.sel { Some(i) } else { None };
+        match model::arrange::arrange_intent(text, st.project.sections(), selected) {
+            Some(Ok(model::arrange::Arrange::Op(op))) => return st.arrange(&op).unwrap_or_else(|e| format!("Could not change the arrangement: {e}")),
+            Some(Ok(model::arrange::Arrange::Extend(secs))) => return extend_song(st, jobs, bundle, secs, text),
+            Some(Err(e)) => return format!("Could not change the arrangement: {e}"),
+            None => {}
+        }
+    }
     // A MIDI part ("add a funky bassline", "... played by Serum"), over the selected section or the song
     if let (Some(role), Selection::None | Selection::Section(_)) = (model::midi_part(text), st.sel) {
         st.next_instrument = named_plugin(st, text);
@@ -1193,6 +1212,56 @@ fn repaint_range(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, (start, end
     st.analysing = Some((format!("Take {n}"), 0.0));
     let _ = st.save();
     format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", label, start, end)
+}
+
+/// "Make it 30 s longer", "add an outro": ACE-Step makes the last bars again
+/// and goes on past the end. The take that comes back makes the song longer.
+fn extend_song(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, secs: f64, text: &str) -> String {
+    let Some(source) = st.project.source.clone() else { return "This project has no source audio to extend".into() };
+    if let Some(note) = model_view::gate(st, "repaint", model_view::Resume::Describe(st.path.clone(), text.to_string())) {
+        return note;
+    }
+    let end = st.project.duration;
+    // the source goes on to the song's end (an extension made before Poing kept it so does not)
+    if let Some(i) = st.project.tracks.iter().position(|t| t.file == source) {
+        if (st.stems[i].l.len() as f64) < (end - 1.0) * st.sr() as f64 {
+            return "The song's source audio stops before its end, so ACE-Step has nothing to go on from. Undo back to before it was made longer, then make it longer in one go.".into();
+        }
+    }
+    let a = st.project.analysis.clone().unwrap_or_default();
+    // from a downbeat a few seconds before the end: the song carries on rather than stopping and starting again
+    let from = a.downbeats.iter().flatten().copied().filter(|d| *d <= end - 4.0 && *d >= end - 12.0).last().unwrap_or((end - 6.0).max(0.0));
+    let (id, seed) = st.project.next_take();
+    let n = id.trim_start_matches('t').to_string();
+    let take = Take {
+        file: format!("takes/{id}.wav"),
+        id,
+        scope: "section".into(),
+        start: from,
+        end: end + secs,
+        engine: state::arrange::EXTEND.into(),
+        prompt: text.to_string(),
+        seed,
+        track: None,
+        blend: None,
+    };
+    let job = RepaintJob {
+        start: from,
+        end: end + secs,
+        margin: audio::TAKE_MARGIN_S,
+        caption: "the song goes on in the same style, then comes to its end".into(),
+        lyrics: "[Outro]\n[Instrumental]".into(),
+        seed,
+        bpm: a.tempo.map(f64::round),
+        key: a.key,
+        ..Default::default()
+    };
+    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, take, job, sr: st.sr() }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some((format!("Take {n}"), 0.0));
+    let _ = st.save();
+    format!("Making the song {secs:.0} s longer as take {n} (about a minute)...")
 }
 
 /// Describe that names an installed plugin ("Raum on the vocals"): put it on
@@ -1575,6 +1644,7 @@ impl App {
             }
         }
         st.restore_combined();
+        st.restore_extensions();
         // Analysed while another song was open: apply it from disk, no second run.
         if analyse {
             if let Some((analysis, stems)) = finished_analysis(&dir, sr) {
@@ -1800,11 +1870,14 @@ impl App {
         }
         st.sel_changed = false;
         let ui = self.ui.clone();
+        // an arrangement edit changes the song's length
+        show_title(&ui, cx, &st.project);
         let playing = st.shared.playing();
         ui.button(cx, ids!(play_btn)).set_visible(cx, !playing);
         ui.button(cx, ids!(pause_btn)).set_visible(cx, playing);
         ui.view(cx, ids!(topbar)).redraw(cx);
         let (mut show_region, mut show_track, mut show_section, mut show_take) = (false, false, false, false);
+        let mut show_words = false;
         let mut show_fx = false;
         match st.sel {
             Selection::Region(i) if i < st.project.regions().len() => {
@@ -1863,11 +1936,23 @@ impl App {
             }
             Selection::Section(i) if i < st.project.sections().len() => {
                 let s = st.project.sections()[i].clone();
-                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Section {}   {:.2}s - {:.2}s   ·   Describe above to repaint it", i + 1, s.start, s.end));
+                ui.label(cx, ids!(insp_title)).set_text(cx, &format!("Section {}   {:.2}s - {:.2}s   ·   drag it to move it, Alt-drag to repeat it, Delete cuts it   ·   Describe above to repaint it", i + 1, s.start, s.end));
                 ui.text_input(cx, ids!(section_input)).set_text(cx, &s.label);
                 let remix_on = st.song_take().is_some_and(|(_, t)| t.engine == "acestep-cover");
                 ui.button(cx, ids!(use_remix_btn)).set_visible(cx, remix_on);
                 show_section = true;
+            }
+            Selection::Chord(i) | Selection::Lyric(i) => {
+                let a = st.project.analysis.clone().unwrap_or_default();
+                let found = match st.sel {
+                    Selection::Chord(_) => a.chords.and_then(|c| c.get(i).map(|c| ("Chord", c.start, c.end, c.label.clone()))),
+                    _ => a.lyrics.and_then(|l| l.get(i).map(|l| ("Line", l.start, l.end, l.text.trim().to_string()))),
+                };
+                if let Some((what, start, end, text)) = found {
+                    ui.label(cx, ids!(insp_title)).set_text(cx, &format!("{what}   {start:.2}s - {end:.2}s   ·   type to correct it, drag its edges to retime it, Delete removes it"));
+                    ui.text_input(cx, ids!(words_input)).set_text(cx, &text);
+                    show_words = true;
+                }
             }
             _ => match st.focused_take() {
                 Some(t) => {
@@ -1918,6 +2003,7 @@ impl App {
         ui.view(cx, ids!(region_row)).set_visible(cx, show_region);
         ui.view(cx, ids!(track_row)).set_visible(cx, show_track);
         ui.view(cx, ids!(section_row)).set_visible(cx, show_section);
+        ui.view(cx, ids!(words_row)).set_visible(cx, show_words);
         ui.view(cx, ids!(take_row)).set_visible(cx, show_take);
         ui.view(cx, ids!(fx_row)).set_visible(cx, show_fx);
         ui.widget(cx, ids!(timeline)).redraw(cx);
@@ -2300,6 +2386,36 @@ impl App {
                 }
                 _ => Err("give a section index and a take id (see `song`)".into()),
             },
+            "arrange" => {
+                use model::arrange::Op;
+                let n = st.project.sections().len();
+                let section = index(&a, "section");
+                let to = index(&a, "to");
+                let op = match (get(&a, "op").and_then(|v| v.as_str()), section) {
+                    (Some("extend"), _) => None,
+                    (_, None) => return ToolResult::refused(&id, "give the `section` index (see `song`)"),
+                    (_, Some(s)) if s >= n => return ToolResult::refused(&id, "no such section"),
+                    (Some("move"), Some(s)) => match to {
+                        Some(to) => Some(Op::Move { section: s, to }),
+                        None => return ToolResult::refused(&id, "say where to move it in `to`"),
+                    },
+                    (Some("duplicate"), Some(s)) => Some(Op::Duplicate { section: s, to: to.unwrap_or(s + 1) }),
+                    (Some("delete"), Some(s)) => Some(Op::Delete { section: s }),
+                    _ => return ToolResult::refused(&id, "op is move, duplicate, delete or extend"),
+                };
+                match op {
+                    Some(op) => st.arrange(&op),
+                    None => match (self.jobs.as_ref(), st.analysing.is_some()) {
+                        (_, true) => Err("a job is still running; try again when song.busy is false".into()),
+                        (None, _) => Err("the job worker is not running".into()),
+                        (Some(jobs), _) => {
+                            let secs = get(&a, "seconds").and_then(num).unwrap_or(30.0).clamp(5.0, 120.0);
+                            let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+                            Ok(extend_song(st, jobs, bundle, secs, &format!("make it {secs:.0} s longer")))
+                        }
+                    },
+                }
+            }
             "transport" => {
                 if let Some(t) = get(&a, "seek").and_then(num) {
                     st.seek(t);
@@ -2962,7 +3078,30 @@ impl MatchEvent for App {
                 status = Some(st.use_remix_here(i).unwrap_or_else(|e| format!("Could not use it here: {e}")));
             }
             if ui.button(cx, ids!(merge_btn)).clicked(actions) {
-                status = st.delete_selected();
+                status = st.merge_section(i);
+            }
+        }
+        if let Selection::Chord(i) | Selection::Lyric(i) = st.sel {
+            if let Some(text) = ui.text_input(cx, ids!(words_input)).changed(actions) {
+                // one undo step for the whole correction
+                if st.editing_words != Some(st.sel) {
+                    st.checkpoint();
+                    st.editing_words = Some(st.sel);
+                }
+                match st.sel {
+                    Selection::Chord(_) => st.set_chord(i, &text),
+                    _ => st.set_lyric(i, &text),
+                }
+            }
+            let input = ui.text_input(cx, ids!(words_input));
+            if st.editing_words.is_some() && (input.returned(actions).is_some() || input.key_focus_lost(actions)) {
+                st.editing_words = None;
+                // the words as corrected are what covers and repaints sing
+                st.write_lyrics();
+                status = Some(match st.save() {
+                    Ok(()) => "Corrected  ·  Ctrl+Z to undo".into(),
+                    Err(e) => format!("Could not save: {e}"),
+                });
             }
         }
 
