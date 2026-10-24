@@ -22,7 +22,7 @@ target/release/poing --remote …         # Makepad remote control: snap / click
 
 Layout: `app/` (Makepad app: arrangement timeline, inspector, live mix, render; `poing-plughost` runs one VST3 plugin in a process of its own and must sit next to `poing.exe`), `model/` (`poing-model`: project.json types + tests), `engine/` (`poing-engine`: native models in a helper process, so poing never links CUDA).
 
-**Native analysis.** `poing-engine` runs stems (BS-RoFormer, plus a Mel-Band RoFormer vocal for the lyrics), beats (Beat This!) and lyrics (Whisper large-v3, Q8_0) on Makepad's ggml runtime; the app starts it from next to `poing.exe` and then runs only SheetSage2 (`poing_analyze.py --only structure`) in Python. Without the engine, its models or a GPU it falls back to the full Python analysis (`POING_NATIVE=0` forces that). Setup on the CUDA PC:
+**Native analysis.** `poing-engine` runs stems (BS-RoFormer, plus a Mel-Band RoFormer vocal for the lyrics), beats (Beat This!) and lyrics (Whisper large-v3, Q8_0) on Makepad's ggml runtime; the app starts it (`POING_ENGINE`, else the model manager's `engine-cuda` pack, else next to `poing.exe`) and then runs only SheetSage2 (`poing_analyze.py --only structure`) in Python. Without the engine, its models or a GPU it falls back to the full Python analysis (`POING_NATIVE=0` forces that). Setup on the CUDA PC:
 
 ```sh
 MAKEPAD_CUDA_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4" cargo build --release -p poing-engine   # without it: CPU-only stub, analysis falls back to Python
@@ -30,7 +30,7 @@ target/release/poing-engine install --accept-licence   # ~3.2 GB into ~/.makepad
 target/release/poing-engine status
 ``` A `project.json` comes from the Python prep step in claude-space `projects/music-gen/build_project.py` until M2 brings import into the app.
 
-**Installer and models** ([docs/INSTALL.md](docs/INSTALL.md)). `app/src/paths.rs` is the one resolver: dev overrides (`POING_SIDECAR`, `POING_ACESTEP`, `POING_UV`), then `sidecar/` and `uv.exe` beside an installed `poing.exe`, then the model manager's packs (`app/models.json`, `app/src/models.rs`, in `%LOCALAPPDATA%\Poing\models` or `POING_MODELS`). A build run from the repository still uses the repository's `sidecar/` and `../ACE-Step-1.5`. To build the Windows installer (CI does this on a `v*` tag, `.github/workflows/release.yml`):
+**Installer and models** ([docs/INSTALL.md](docs/INSTALL.md)). `app/src/paths.rs` is the one resolver: dev overrides (`POING_SIDECAR`, `POING_ACESTEP`, `POING_UV`), then `sidecar/` and `uv.exe` beside an installed `poing.exe`, then the model manager's packs (`app/models.json`, `app/src/models.rs`, in `%LOCALAPPDATA%\Poing\models` or `POING_MODELS`). A build run from the repository still uses the repository's `sidecar/` and `../ACE-Step-1.5`. The installer's `poing-engine` is CPU-only (CI has no CUDA), so on Windows the GPU engine and the native analysis weights are packs too (`engine-cuda`, `native-analysis`); `packaging/build-engine-cuda.sh` rebuilds the engine pack (fat binary for sm_75 to sm_120 plus PTX) whenever `engine/` or the Makepad pin changes. To build the Windows installer (CI does this on a `v*` tag, `.github/workflows/release.yml`):
 
 ```sh
 cargo build --release --workspace

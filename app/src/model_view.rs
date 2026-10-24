@@ -41,7 +41,7 @@ pub fn gate(st: &mut EditorState, feature: &'static str, resume: Resume) -> Opti
     }
 }
 
-const ROWS: usize = 6;
+const ROWS: usize = 7;
 
 fn row_ids(i: usize) -> (&'static [LiveId], &'static [LiveId], &'static [LiveId], &'static [LiveId]) {
     match i {
@@ -50,7 +50,8 @@ fn row_ids(i: usize) -> (&'static [LiveId], &'static [LiveId], &'static [LiveId]
         2 => (ids!(mp2), ids!(mp2_name), ids!(mp2_info), ids!(mp2_btn)),
         3 => (ids!(mp3), ids!(mp3_name), ids!(mp3_info), ids!(mp3_btn)),
         4 => (ids!(mp4), ids!(mp4_name), ids!(mp4_info), ids!(mp4_btn)),
-        _ => (ids!(mp5), ids!(mp5_name), ids!(mp5_info), ids!(mp5_btn)),
+        5 => (ids!(mp5), ids!(mp5_name), ids!(mp5_info), ids!(mp5_btn)),
+        _ => (ids!(mp6), ids!(mp6_name), ids!(mp6_info), ids!(mp6_btn)),
     }
 }
 
@@ -127,7 +128,7 @@ impl App {
             }
             return true;
         }
-        let packs = &models::registry().packs;
+        let packs: Vec<&models::Pack> = models::packs().collect();
         for i in 0..packs.len().min(ROWS) {
             if !ui.button(cx, row_ids(i).3).clicked(actions) {
                 continue;
@@ -136,6 +137,8 @@ impl App {
             if self.downloads.what.as_deref() == Some(id.as_str()) {
                 self.downloads.stop();
             } else if models::installed_pack(&id).is_some() {
+                // a loaded model holds the engine's files open
+                crate::llm::release();
                 let note = match models::remove(&id) {
                     Ok(bytes) => format!("Removed {}: {} freed.", packs[i].title, models::gb(bytes)),
                     Err(e) => format!("Could not remove {}: {e}", packs[i].title),
@@ -229,7 +232,7 @@ impl App {
                 audio::songs_dir().display()
             ),
         );
-        let packs = &models::registry().packs;
+        let packs: Vec<&models::Pack> = models::packs().collect();
         for i in 0..ROWS {
             let (row, name, info, btn) = row_ids(i);
             let Some(p) = packs.get(i) else {

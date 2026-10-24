@@ -36,8 +36,34 @@ pub struct Pack {
     /// False: personal, non-commercial use only.
     pub commercial: bool,
     pub needs: Needs,
+    /// Only for this OS ("windows", "macos", "linux"); elsewhere the pack is
+    /// not listed and features go without it.
+    pub os: Option<String>,
     pub files: Vec<PackFile>,
     pub setup: Option<Setup>,
+    pub engine: Option<EngineSetup>,
+    pub unpack: Option<Unpack>,
+}
+
+/// A zip among the files, unpacked into a folder of the pack (its top
+/// folder dropped) and then deleted.
+#[derive(DeJson, Clone)]
+pub struct Unpack {
+    pub zip: String,
+    pub into: String,
+    /// What unpacking adds once the zip is gone (the pack's size is then
+    /// files + this).
+    pub bytes: u64,
+}
+
+/// `poing-engine` fetches the pack itself, with its own pinned and
+/// hash-checked files, into the pack's folder as its `MAKEPAD_HOME`.
+#[derive(DeJson, Clone)]
+pub struct EngineSetup {
+    /// What to run: `["install", "--accept-licence"]`.
+    pub args: Vec<String>,
+    /// About how much it downloads.
+    pub bytes: u64,
 }
 
 #[derive(DeJson, Clone, Default)]
@@ -76,11 +102,22 @@ pub struct Feature {
     pub id: String,
     pub title: String,
     pub packs: Vec<String>,
+    /// Packs that put it on the GPU: downloaded with it when this PC can run
+    /// them, skipped when it can't (it then runs the slower way).
+    pub gpu: Option<Vec<String>>,
     /// Packs that make it better but are not needed: the Models page lists every
     /// pack, so only the registry test reads this.
     #[allow(dead_code)]
     pub optional: Option<Vec<String>>,
 }
+
+/// The pack with a GPU build of `poing-engine` and the CUDA runtime it needs
+/// (the installer's engine is CPU-only on Windows).
+pub const ENGINE_PACK: &str = "engine-cuda";
+
+/// The pack with the native analysis models (stems, beats, lyrics), which
+/// the engine runs with this folder as its `MAKEPAD_HOME`.
+pub const NATIVE_PACK: &str = "native-analysis";
 
 pub fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -89,6 +126,21 @@ pub fn registry() -> &'static Registry {
 
 pub fn pack(id: &str) -> Option<&'static Pack> {
     registry().packs.iter().find(|p| p.id == id)
+}
+
+/// The packs for this OS, in registry order (what the Models page lists).
+pub fn packs() -> impl Iterator<Item = &'static Pack> {
+    registry().packs.iter().filter(|p| for_this_os(p))
+}
+
+fn for_this_os(p: &Pack) -> bool {
+    p.os.as_deref().is_none_or(|os| os == std::env::consts::OS)
+}
+
+/// The packs `f` needs on this PC: its packs, plus its GPU packs that can run here.
+fn feature_packs(f: &Feature) -> Vec<&'static Pack> {
+    let gpu = f.gpu.iter().flatten().filter_map(|id| pack(id)).filter(|p| cant_run(p).is_none());
+    f.packs.iter().filter_map(|id| pack(id)).chain(gpu).filter(|p| for_this_os(p)).collect()
 }
 
 fn feature(id: &str) -> Option<&'static Feature> {
@@ -140,7 +192,8 @@ pub fn installed_pack(id: &str) -> Option<PathBuf> {
 
 /// Download size plus what its setup builds.
 pub fn pack_bytes(p: &Pack) -> u64 {
-    p.files.iter().map(|f| f.size).sum::<u64>() + p.setup.as_ref().map_or(0, |s| s.bytes)
+    p.files.iter().map(|f| f.size).sum::<u64>() + p.setup.as_ref().map_or(0, |s| s.bytes) + p.engine.as_ref().map_or(0, |e| e.bytes)
+        + p.unpack.as_ref().map_or(0, |u| u.bytes)
 }
 
 /// Bytes a folder takes (0 when it isn't there).
@@ -247,7 +300,7 @@ pub fn readiness(feature_id: &str) -> Readiness {
     if paths::dev_ready(feature_id) {
         return Readiness::Ready;
     }
-    let packs: Vec<&Pack> = f.packs.iter().filter_map(|id| pack(id)).collect();
+    let packs = feature_packs(f);
     if let Some(why) = packs.iter().find_map(|p| cant_run(p)) {
         return Readiness::CantRun(format!("{} {why}", f.title));
     }
@@ -302,7 +355,7 @@ impl Downloads {
             return;
         }
         let ids: Vec<String> = match feature(feature_id) {
-            Some(f) => f.packs.clone(),
+            Some(f) => feature_packs(f).iter().map(|p| p.id.clone()).collect(),
             None => vec![feature_id.to_string()],
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -391,8 +444,18 @@ fn install(p: &Pack, tx: &Sender<Update>, cancel: &CancelToken) -> Result<(), St
         })?;
         before += f.size;
     }
+    if let Some(u) = &p.unpack {
+        say(tx, format!("Unpacking {}", p.title));
+        let zip = dir.join(&u.zip);
+        unzip(&zip, &dir.join(&u.into))?;
+        let _ = std::fs::remove_file(&zip);
+        let _ = std::fs::remove_file(makepad_ai_hub::download::verification_path(&zip));
+    }
     if let Some(setup) = &p.setup {
         build_env(p, setup, &dir, tx, cancel)?;
+    }
+    if let Some(engine) = &p.engine {
+        engine_fetch(p, engine, &dir, tx, cancel)?;
     }
     let receipt = Receipt {
         pack: p.id.clone(),
@@ -471,6 +534,57 @@ fn build_env(p: &Pack, setup: &Setup, dir: &Path, tx: &Sender<Update>, cancel: &
     Ok(())
 }
 
+/// Run `poing-engine <args>` with the pack's folder as its Makepad home (its
+/// weights and licence store), following its progress lines.
+fn engine_fetch(p: &Pack, engine: &EngineSetup, dir: &Path, tx: &Sender<Update>, cancel: &CancelToken) -> Result<(), String> {
+    use makepad_strict_json as json;
+    use std::io::{BufRead, BufReader};
+    let mut cmd = crate::audio::engine_exe().ok_or("poing-engine was not found next to poing")?;
+    let log_path = dir.join("setup.log");
+    let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    cmd.args(&engine.args)
+        .env("MAKEPAD_HOME", dir)
+        .env_remove("MAKEPAD_ASSET_AI_CACHE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("poing-engine did not start ({e})"))?;
+    let mut error = None;
+    let mut last = Instant::now() - Duration::from_secs(1);
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            if cancel.is_cancelled() {
+                let _ = child.kill();
+                break;
+            }
+            let Ok(v) = json::parse(line.trim().as_bytes()) else { continue };
+            let message = v.get("message").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+            match v.get("stage").and_then(|s| s.as_str()) {
+                Some("error") => error = Some(message),
+                // it prints a line per chunk: pass on four a second
+                Some(_) if !message.is_empty() && last.elapsed() >= Duration::from_millis(250) => {
+                    last = Instant::now();
+                    say(tx, format!("Downloading {}: {message}", p.title));
+                }
+                _ => {}
+            }
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if cancel.is_cancelled() {
+        return Err(format!("Stopped. {} resumes where it was next time.", p.title));
+    }
+    if !ok {
+        return Err(format!("{}: {} (see {})", p.title, error.unwrap_or_else(|| "poing-engine failed".into()), log_path.display()));
+    }
+    Ok(())
+}
+
 /// Unpack a GitHub source zip into `into`, dropping its top folder.
 fn unzip(zip: &Path, into: &Path) -> Result<(), String> {
     use makepad_zip_file::zip_read_central_directory;
@@ -511,7 +625,7 @@ mod tests {
         let r = registry();
         assert!(!r.packs.is_empty());
         for f in &r.features {
-            for id in f.packs.iter().chain(f.optional.iter().flatten()) {
+            for id in f.packs.iter().chain(f.gpu.iter().flatten()).chain(f.optional.iter().flatten()) {
                 assert!(pack(id).is_some(), "feature {} names unknown pack {id}", f.id);
             }
         }
@@ -521,6 +635,18 @@ mod tests {
                 assert!(!f.url.contains("/resolve/main/"), "{}: {} must pin a commit", p.id, f.url);
             }
         }
+    }
+
+    #[test]
+    fn every_pack_brings_something_and_the_gpu_engine_is_windows_only() {
+        for p in &registry().packs {
+            assert!(!p.files.is_empty() || p.setup.is_some() || p.engine.is_some(), "{} is empty", p.id);
+            if let Some(u) = &p.unpack {
+                assert!(p.files.iter().any(|f| f.path == u.zip), "{}: unpacks {}, which it doesn't download", p.id, u.zip);
+            }
+        }
+        assert_eq!(packs().any(|p| p.id == ENGINE_PACK), cfg!(windows));
+        assert!(pack(NATIVE_PACK).is_some_and(|p| p.engine.is_some()));
     }
 
     #[test]

@@ -300,9 +300,11 @@ fn start_engine(model: Option<String>) -> Result<Engine, String> {
                 let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("the local model did not load");
                 // the installer's (and CI's) engine is built without CUDA
                 if message.contains("not compiled into this build") {
-                    return Err("this poing-engine was built without GPU support, and the model needs it on Windows. \
-                                Pick Claude Code in Settings, or build poing-engine with MAKEPAD_CUDA_ROOT set"
-                        .into());
+                    let pack = crate::models::pack(crate::models::ENGINE_PACK).map_or("the GPU engine", |p| p.title.as_str());
+                    return Err(format!(
+                        "this poing-engine was built without GPU support, and the model needs it on Windows. \
+                         Download {pack} in Settings → Models, or pick Claude Code there"
+                    ));
                 }
                 return Err(message.to_string());
             }

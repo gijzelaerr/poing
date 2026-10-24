@@ -1117,29 +1117,40 @@ fn sidecar_command(audio: &Path, bundle: &Path) -> Result<Command, String> {
     Ok(cmd)
 }
 
-/// The native engine (`poing-engine`, built next to poing): `POING_ENGINE`,
-/// else beside this exe. None when it isn't there or `POING_NATIVE=0`.
+/// The native engine for analysis (see `engine_exe`), with the model
+/// manager's analysis models when that pack is in (else the engine's own
+/// `~/.makepad/weights`). None when it isn't there or `POING_NATIVE=0`.
 fn engine_command() -> Option<Command> {
     if std::env::var("POING_NATIVE").is_ok_and(|v| v == "0") {
         return None;
     }
-    engine_exe()
+    let mut cmd = engine_exe()?;
+    if let Some(dir) = crate::models::installed_pack(crate::models::NATIVE_PACK) {
+        cmd.env("MAKEPAD_HOME", dir).env_remove("MAKEPAD_ASSET_AI_CACHE");
+    }
+    Some(cmd)
 }
 
 /// `poing-engine` whatever `POING_NATIVE` says (the language model has no
-/// Python fallback).
+/// Python fallback): `POING_ENGINE`, else the GPU engine pack's (with its own
+/// CUDA DLLs beside it), else the one beside poing (the installer's is
+/// CPU-only on Windows).
 pub(crate) fn engine_exe() -> Option<Command> {
-    let exe = std::env::var_os("POING_ENGINE").map(PathBuf::from).or_else(|| {
-        let name = if cfg!(windows) { "poing-engine.exe" } else { "poing-engine" };
-        Some(std::env::current_exe().ok()?.parent()?.join(name))
-    })?;
+    let name = if cfg!(windows) { "poing-engine.exe" } else { "poing-engine" };
+    let pack = crate::models::installed_pack(crate::models::ENGINE_PACK).map(|d| d.join("bin").join(name)).filter(|p| p.is_file());
+    let exe = std::env::var_os("POING_ENGINE")
+        .map(PathBuf::from)
+        .or_else(|| pack.clone())
+        .or_else(|| Some(std::env::current_exe().ok()?.parent()?.join(name)))?;
     if !exe.is_file() {
         return None;
     }
-    let mut cmd = Command::new(exe);
-    // The CUDA runtime DLLs live in the toolkit's bin\x64 since CUDA 13.
+    let mut cmd = Command::new(&exe);
+    // A development engine finds the CUDA runtime DLLs in the toolkit's
+    // bin\x64 (since CUDA 13). The pack's sit beside its engine, where
+    // Windows looks first.
     #[cfg(windows)]
-    if let Some(cuda) = cuda_root() {
+    if let Some(cuda) = cuda_root().filter(|_| pack.as_ref() != Some(&exe)) {
         let mut paths = vec![cuda.join("bin").join("x64"), cuda.join("bin")];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         if let Ok(joined) = std::env::join_paths(paths) {

@@ -446,6 +446,7 @@ script_mod! {
                                 mp3 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp3_name := ModelName{} mp3_info := CardText{}} mp3_btn := PillButton{}}
                                 mp4 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp4_name := ModelName{} mp4_info := CardText{}} mp4_btn := PillButton{}}
                                 mp5 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp5_name := ModelName{} mp5_info := CardText{}} mp5_btn := PillButton{}}
+                                mp6 := ModelRow{View{width: Fill height: Fit flow: Down spacing: 3 mp6_name := ModelName{} mp6_info := CardText{}} mp6_btn := PillButton{}}
                                 models_note := CardText{text: ""}
                             }
                         }

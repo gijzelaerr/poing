@@ -72,7 +72,9 @@ pub fn dev_ready(feature: &str) -> bool {
     match feature {
         "analysis" => dev_sidecar(),
         "repaint" | "remix" | "new-song" => dev_acestep().is_some(),
-        "llm" => crate::llm::dev_model().is_some(),
+        // Makepad's shared weights may hold the model on any PC, but an
+        // installed Poing still needs the GPU engine pack to run it
+        "llm" => !installed() && crate::llm::dev_model().is_some(),
         _ => false,
     }
 }

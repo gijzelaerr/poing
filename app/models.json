@@ -242,6 +242,54 @@
           "sha256": "8814232b85594dcd46c50e5b8b29324a7efe9e746edbe8a3d1df3d3fce7aad39"
         }
       ]
+    },
+    {
+      "id": "engine-cuda",
+      "title": "GPU engine",
+      "what": "Poing's engine built for NVIDIA GPUs (GeForce 16/20 series and newer) with NVIDIA's cuBLAS: runs Poing's language model and the native analysis on this PC's GPU",
+      "licence": "MIT; CUDA runtime under NVIDIA's CUDA EULA",
+      "licence_url": "https://docs.nvidia.com/cuda/eula/index.html",
+      "commercial": true,
+      "needs": {
+        "gpu": "cuda",
+        "vram_gb": 4,
+        "driver": "580.88"
+      },
+      "os": "windows",
+      "files": [
+        {
+          "url": "https://github.com/gijzelaerr/poing/releases/download/engine-cuda-20261024/poing-engine-cuda.zip",
+          "path": "poing-engine-cuda.zip",
+          "size": 462742443,
+          "sha256": "ee014c42c7d805d00b9947f785ef551a143ffa3853f47b3a02a47e90c6330da9"
+        }
+      ],
+      "unpack": {
+        "zip": "poing-engine-cuda.zip",
+        "into": "bin",
+        "bytes": 182798292
+      }
+    },
+    {
+      "id": "native-analysis",
+      "title": "Native analysis models",
+      "what": "BS-RoFormer (stems), Mel-Band RoFormer (vocals for the lyrics), Beat This! (beats) and Whisper large-v3 (lyrics), run by the GPU engine; Whisper is converted to 8-bit after the download",
+      "licence": "BS-RoFormer weights academic use only; Mel-Band RoFormer not cleared for commercial use; Beat This! MIT; Whisper Apache-2.0",
+      "licence_url": "https://github.com/ZFTurbo/Music-Source-Separation-Training",
+      "commercial": false,
+      "needs": {
+        "gpu": "cuda",
+        "vram_gb": 8,
+        "driver": "580.88"
+      },
+      "files": [],
+      "engine": {
+        "args": [
+          "install",
+          "--accept-licence"
+        ],
+        "bytes": 4620000000
+      }
     }
   ],
   "features": [
@@ -250,6 +298,10 @@
       "title": "Splitting and understanding a song",
       "packs": [
         "py-analysis"
+      ],
+      "gpu": [
+        "engine-cuda",
+        "native-analysis"
       ]
     },
     {
@@ -283,6 +335,7 @@
       "id": "llm",
       "title": "Writing with Poing's own model",
       "packs": [
+        "engine-cuda",
         "llm-qwen35-4b"
       ]
     }
