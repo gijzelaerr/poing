@@ -297,7 +297,14 @@ fn start_engine(model: Option<String>) -> Result<Engine, String> {
             Some("ready") => break,
             Some("error") => {
                 let _ = child.kill();
-                return Err(v.get("message").and_then(|m| m.as_str()).unwrap_or("the local model did not load").to_string());
+                let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("the local model did not load");
+                // the installer's (and CI's) engine is built without CUDA
+                if message.contains("not compiled into this build") {
+                    return Err("this poing-engine was built without GPU support, and the model needs it on Windows. \
+                                Pick Claude Code in Settings, or build poing-engine with MAKEPAD_CUDA_ROOT set"
+                        .into());
+                }
+                return Err(message.to_string());
             }
             _ => {}
         }

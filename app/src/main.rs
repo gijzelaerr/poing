@@ -418,13 +418,15 @@ script_mod! {
                         SettingsRow{
                             CardTitle{width: 160 text: "AI"}
                             View{width: Fill height: Fit flow: Down spacing: 6
+                                ai_dd := DropDown{width: 420 labels: ["Poing's own model (no subscription)", "Claude Code"]}
                                 ai_status := CardText{text: ""}
                             }
                         }
                         SettingsRow{
                             CardTitle{width: 160 text: "Compute"}
                             View{width: Fill height: Fit flow: Down spacing: 6
-                                compute_status := CardText{text: "This PC: analysis, remixes and new songs run here."}
+                                compute_dd := DropDown{width: 420 labels: ["This PC"]}
+                                compute_status := CardText{text: ""}
                             }
                         }
                         SettingsRow{
@@ -623,6 +625,9 @@ pub struct App {
     /// Audio devices as the system last reported them.
     #[rust]
     audio_devices: Vec<AudioDeviceDesc>,
+    /// The nodes Settings' Compute list offers after "This PC", in order.
+    #[rust]
+    compute_nodes: Vec<String>,
     /// Jobs finished so far (the worker's JobDone numbers).
     #[rust]
     jobs_done: u64,
@@ -811,6 +816,9 @@ fn write_requests(bundle: &Path, list: &[Request]) {
 pub struct Settings {
     /// The sound output by name (None: the system default).
     pub audio_output: Option<String>,
+    /// Who writes and answers: "local" (Poing's own model) or "claude"
+    /// (None: local, unless `POING_LLM` says otherwise).
+    pub ai: Option<String>,
 }
 
 fn load_settings() -> Settings {
@@ -1372,7 +1380,7 @@ fn add_named_plugin(st: &mut EditorState, lane: Option<usize>, text: &str) -> Op
         Ok(_) => {
             let i = st.project.chain(lane).len() - 1;
             st.select(Selection::Fx(lane, i));
-            format!("{name} is on {place}. Its main knobs are below; lanes are not delay-compensated yet.")
+            format!("{name} is on {place}. Its main knobs are below; \"Open its window\" shows all of it.")
         }
         Err(e) => format!("{name} could not be added: {e}"),
     })
@@ -2795,13 +2803,32 @@ impl App {
             (llm::Provider::Local, claude, why) => format!(
                 "Poing's own model (Qwen3.5 4B, on this PC's GPU) writes effects, MIDI parts and new songs and answers the Describe bar: no subscription needed.{}{}",
                 why.map(|w| format!(" Not now: {w}.")).unwrap_or_default(),
-                if claude { " Claude Code is installed too (POING_LLM=claude uses it)." } else { "" }
+                if claude { " Claude Code is installed too: pick it above to use it instead." } else { "" }
             ),
             (llm::Provider::ClaudeCode, true, None) => "Claude Code writes effects, MIDI parts and new songs and answers free-form requests in the Describe bar.".to_string(),
             (llm::Provider::ClaudeCode, true, Some(why)) => format!("Claude Code writes effects, MIDI parts and new songs. Free-form requests in the Describe bar also need Makepad's makepad-remote: {why}."),
             (llm::Provider::ClaudeCode, false, _) => "Claude Code was chosen but is not installed: written effects, MIDI parts and new songs need it (or Poing's own model).".to_string(),
         };
+        ui.drop_down(cx, ids!(ai_dd)).set_selected_item(cx, usize::from(llm::provider() == llm::Provider::ClaudeCode));
         ui.label(cx, ids!(ai_status)).set_text(cx, &ai);
+        // where the GPU jobs run: this PC, or a poing-node (docs/REMOTE.md)
+        let nodes = remote::targets();
+        let target = remote::target();
+        let mut labels = vec!["This PC".to_string()];
+        labels.extend(nodes.iter().map(|n| if n.discovered { format!("{} (found on the network)", n.address) } else { n.address.clone() }));
+        self.compute_nodes = nodes.into_iter().map(|n| n.address).collect();
+        let chosen = match &target {
+            remote::Target::Local => 0,
+            remote::Target::Node(a) => self.compute_nodes.iter().position(|n| n == a).map_or(0, |i| i + 1),
+        };
+        ui.drop_down(cx, ids!(compute_dd)).set_labels(cx, labels);
+        ui.drop_down(cx, ids!(compute_dd)).set_selected_item(cx, chosen);
+        let compute = match remote::status_line() {
+            Some(line) => format!("{line}. Analysis, remixes and new songs go there; playback, plugins and the mix stay here."),
+            None if self.compute_nodes.is_empty() => "This PC: analysis, remixes and new songs run here. To have another PC do them, run poing-node there (docs/REMOTE.md).".to_string(),
+            None => "This PC: analysis, remixes and new songs run here.".to_string(),
+        };
+        ui.label(cx, ids!(compute_status)).set_text(cx, &compute);
         let plugins = self.state.as_ref().map(|st| st.plugin_library.len()).unwrap_or_else(|| plugins::library().len());
         let ptext = if cfg!(windows) {
             format!("{plugins} VST3 plugins found in the standard folders. Name one in the Describe bar to use it.")
@@ -2836,6 +2863,12 @@ impl MatchEvent for App {
     }
 
     fn handle_startup(&mut self, cx: &mut Cx) {
+        // the AI chosen in Settings; POING_LLM still wins for a test run
+        if std::env::var_os("POING_LLM").is_none() {
+            if let Some(ai) = load_settings().ai {
+                llm::set_provider(if ai == "claude" { llm::Provider::ClaudeCode } else { llm::Provider::Local });
+            }
+        }
         self.jobs = Some(Jobs::start(cx));
         self.ai_port = makepad_ai_services::port::AiServicePort::open(cx, agent::manifest());
         self.plugin_watch = cx.start_interval(0.25);
@@ -2886,6 +2919,28 @@ impl MatchEvent for App {
                 _ => outputs.get(i - 1).map(|d| vec![d.device_id]).unwrap_or_default(),
             };
             cx.use_audio_outputs(&id);
+            self.refresh_settings(cx);
+        }
+        if let Some(i) = ui.drop_down(cx, ids!(ai_dd)).changed(actions) {
+            let claude = i == 1;
+            llm::set_provider(if claude { llm::Provider::ClaudeCode } else { llm::Provider::Local });
+            if claude {
+                // free the GPU the local model was holding
+                llm::release();
+            }
+            let mut settings = load_settings();
+            settings.ai = Some(if claude { "claude" } else { "local" }.into());
+            save_settings(&settings);
+            self.refresh_settings(cx);
+        }
+        if let Some(i) = ui.drop_down(cx, ids!(compute_dd)).changed(actions) {
+            let target = match i.checked_sub(1).and_then(|k| self.compute_nodes.get(k)) {
+                Some(a) => remote::Target::Node(a.clone()),
+                None => remote::Target::Local,
+            };
+            if let Err(e) = remote::set_target(target) {
+                self.set_status(cx, &format!("Could not save where jobs run: {e}"));
+            }
             self.refresh_settings(cx);
         }
         if ui.button(cx, ids!(rescan_btn)).clicked(actions) {

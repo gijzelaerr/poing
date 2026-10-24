@@ -163,14 +163,43 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 | | Workstream | State |
 |---|---|---|
 | D | Job safety + Settings: closing warns while a job runs, interrupted requests offered again ("Make it again"), Settings panel (sound output, AI, compute, plugins, models) | done |
-| B | Installer I1: Windows installer, model manager, bundled uv | in progress |
-| C | Native lyrics on the MelBand vocal stem | in progress |
-| L | Local AI: song sheets, MIDI parts, effects and the Describe assistant on a local Qwen model; Claude optional | proposed |
-| A | Remote compute: UI on the Mac, AI and compute on a Windows node (`poing-node`, Makepad AI hub discovery and credentials) | proposed |
-| G+K | Export: stems, MIDI files, DAWproject; DJ export (rekordbox XML with beatgrid, key, section cues) for rekordbox and the OMNIS-DUO | next |
-| E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | PR |
-| F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | PR |
-| H | Plugins phase 2: latency compensation, plugins in a helper process | PR |
-| QA | End-to-end on the Mac UI against the Windows node, then tag v1.0 | last |
+| B | Installer I1: Windows installer, model manager, bundled uv | done (#8) |
+| C | Native lyrics on the MelBand vocal stem | done (#9) |
+| L | Local AI: song sheets, MIDI parts, effects and the Describe assistant on a local Qwen model; Claude optional | done (#10) |
+| A | Remote compute: UI on the Mac, AI and compute on a Windows node (`poing-node`, Makepad AI hub discovery and credentials) | done (#7) |
+| G+K | Export: stems, MIDI files, DAWproject; DJ export (rekordbox XML with beatgrid, key, section cues) for rekordbox and the OMNIS-DUO | done (#6) |
+| E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | done (#11) |
+| F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | done (#12) |
+| H | Plugins phase 2: latency compensation, plugins in a helper process | done (#13) |
+| QA | End-to-end, then tag v1.0 | on the Windows PC: done (below); Gijs's checks left |
+
+### 1.0 QA on the Windows PC (2026-10-24)
+
+A hidden, muted Poing (its own settings folder) on a copy of It's Autumn, driven through makepad-remote, plus a poing-node on 127.0.0.1. All 186 tests pass.
+
+| Flow | Result |
+|---|---|
+| Settings: AI | Poing's own model / Claude Code, kept in `settings.json` across a restart (`POING_LLM` still wins) |
+| Settings: Compute | This PC or a node (paired or heard on the LAN); shows where jobs run |
+| Describe bar, Claude | "vocals a bit louder, bass a bit quieter": +2 / −2 dB in ~30 s, one undo; it noticed a remix was playing over the stems |
+| Describe bar, Poing's own model | the same in 13 s (its summary wrongly said "in the chorus") |
+| Remix (3 versions) | ~25 s on this PC; 41 s through the node including sending 31 files |
+| New song, Dutch prompt, own model | sheet in ~5 s, Dutch lyrics, 3 versions in 2.5 min |
+| MIDI part, own model | keys part, 504 notes, checked in 1 round, 115 s (short stabs rather than held chords) |
+| MIDI keyboard | one bar count-in, 4 injected notes recorded, quantised |
+| Arrange | repeat a chorus 0.2 s (2:14.6 → 2:32.3), cut, undo back to 2:14.6 |
+| Plugins | Pro-Q 3 in its own process: 1516 blocks, 0 missed, slowest 1.9 ms; its helper killed while playing: back in ~2 s, 1 block missed |
+| Tabs | 6 switches while playing, no missed blocks, no helper left behind |
+| Export | stems, DAWproject, MIDI, For DJ (2–3 tracks, grid, key, cues) |
+| Node killed mid-remix | "The Windows PC is not reachable" at once, Poing carries on, no ACE-Step left running |
+
+Fixed during QA: the Settings switches for AI and compute (they were text only); the DJ grid on a drifting band (stray downbeats made 105/150/166 bpm marks; now bars a few beats short where the analysis moves the bar keep the tempo, test on It's Autumn's real downbeats); stage directions under [Intro] in a new song's lyrics (ACE-Step would sing them); a plain message when poing-engine has no GPU support; a stale "lanes are not delay-compensated" line.
+
+**Open for 1.0:**
+- **The installer's poing-engine has no CUDA**, and on Windows Makepad's LLM runs only on CUDA, so an installed copy can't run Poing's own model (it says so and points to Claude Code). Needs a GPU engine pack built on this PC (multi-arch fatbin + cudart/cublas, ~550 MB) that the model manager downloads, as INSTALL.md plans for YuE2.
+- **Gijs's checks:** the Mac UI against this PC (docs/REMOTE.md), the rekordbox import onto the OMNIS-DUO (PR #6 steps), the installer on a clean account, clicking inside a plugin's own window.
+- Build note: `poing-engine` must be built with `MAKEPAD_CUDA_ROOT` (CLAUDE.md) or the local model and native analysis fall back / fail; a plain `cargo build` gives the CPU stub.
+
+**After 1.0:** isolated plugins restart on every tab switch (in-process ones stay loaded); tool calls with unknown arguments are ignored instead of refused; the small model's chords are short stabs; long take names in DJ file names are cut with "…".
 
 Later, not 1.0: signed installers, licence-clean default models, native ACE-Step cover/repaint/lego, AU/CLAP on macOS, live jam.

@@ -244,21 +244,31 @@ fn fit(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     })
 }
 
-/// Marks along `times` (one per bar, or per beat when `per` is 1) as
-/// rekordbox stores them (bpm to 2 decimals): a mark carries on until it is
-/// more than 8 ms off the next time, then a new mark starts there.
-fn marks_along(times: &[f64], per: u32) -> Vec<DjMark> {
+/// Marks along `bars` (each with its beats up to the next; one beat each when
+/// `per` is 1) as rekordbox stores them (bpm to 2 decimals): a mark carries on
+/// until it is more than 8 ms off the next bar, then a new mark starts there.
+/// After a short bar a mark starts too, since rekordbox counts bars from a
+/// mark's beat 1.
+fn marks_along(bars: &[(f64, u32)], per: u32) -> Vec<DjMark> {
     let mut marks: Vec<DjMark> = Vec::new();
-    for (i, w) in times.windows(2).enumerate() {
-        let bpm = round2(60.0 * per as f64 / (w[1] - w[0]));
-        let on_track = marks.last().is_some_and(|m| {
-            let from = times.iter().position(|t| (t - m.start).abs() < 1e-9).unwrap_or(0);
-            let predict = |k: usize| m.start + (k - from) as f64 * per as f64 * 60.0 / m.bpm;
-            (predict(i) - w[0]).abs() <= 0.008 && (predict(i + 1) - w[1]).abs() <= 0.008
-        });
+    // beats from the last mark to bar i
+    let mut beats = 0u32;
+    let mut after_short = false;
+    for w in bars.windows(2) {
+        let ((t0, n), t1) = (w[0], w[1].0);
+        let bpm = round2(60.0 * n as f64 / (t1 - t0));
+        let on_track = !after_short
+            && marks.last().is_some_and(|m| {
+                let p0 = m.start + beats as f64 * 60.0 / m.bpm;
+                let p1 = p0 + n as f64 * 60.0 / m.bpm;
+                (p0 - t0).abs() <= 0.008 && (p1 - t1).abs() <= 0.008
+            });
         if !on_track {
-            marks.push(DjMark { start: w[0], bpm, beat: 1 });
+            marks.push(DjMark { start: t0, bpm, beat: 1 });
+            beats = 0;
         }
+        beats += n;
+        after_short = n != per;
     }
     marks
 }
@@ -300,19 +310,88 @@ pub fn dj_grid(downbeats: &[f64], beats: &[f64], per_bar: u32, seconds: f64) -> 
         let k0 = ((-a) / b - 1e-9).ceil();
         let k1 = ((seconds - a) / b).floor();
         let fitted: Vec<f64> = (k0 as i64..=k1 as i64 + 1).map(|k| a + b * k as f64).collect();
-        marks_along(&fitted, per)
+        marks_along(&fitted.iter().map(|&x| (x, per)).collect::<Vec<_>>(), per)
     } else {
-        // follow the analysis: keep the times that make sensible gaps
-        let mut kept = vec![t[0]];
-        for &x in &t[1..] {
-            if x - kept[kept.len() - 1] > 0.5 * unit {
-                kept.push(x);
-            }
-        }
-        marks_along(&kept, per)
+        marks_along(&follow(&t, unit, per), per)
     };
     // per beat (no downbeats): rekordbox still wants beat 1 of a bar
     (marks, Some(avg))
+}
+
+/// The bars of a drifting song from the analysis: a stray time between two
+/// bars goes (of two close ones, the one that keeps the bar nearer the usual
+/// length stays), a missed bar is filled in evenly, so the grid only moves
+/// where the music does.
+///
+/// Each bar comes with its beats up to the next one: a bar shorter by whole
+/// beats is kept as such (the analysis moves the bar there, and the sections
+/// follow it), so the tempo holds and only the bar line moves.
+fn follow(t: &[f64], unit: f64, per: u32) -> Vec<(f64, u32)> {
+    let beat = unit / per as f64;
+    let mut kept = vec![(t[0], per)];
+    for &x in &t[1..] {
+        let last = kept[kept.len() - 1].0;
+        let gap = x - last;
+        // a bar of about the usual length is one bar, however it drifts;
+        // only a clearly short one is counted in beats
+        let q = gap / beat;
+        let k = if gap >= 1.5 * unit {
+            per * (gap / unit).round() as u32
+        } else if gap >= 0.875 * unit {
+            per
+        } else {
+            q.round() as u32
+        };
+        if k == 0 || (gap < 0.875 * unit && (q - k as f64).abs() > 0.3) {
+            // a stray: x replaces the last bar if it makes the bar before it better
+            let n = kept.len();
+            let better = if n >= 2 {
+                let prev = kept[n - 2].0;
+                ((x - prev) - unit).abs() < ((last - prev) - unit).abs()
+            } else {
+                // the first bar: keep the one whose next bar is nearer the usual length
+                t.iter().find(|&&y| y > x + 0.75 * unit).is_some_and(|&y| ((y - x) - unit).abs() < ((y - last) - unit).abs())
+            };
+            if better {
+                kept[n - 1].0 = x;
+            }
+            continue;
+        }
+        // k beats: whole bars (a missed one filled in), then what is left as a short bar
+        let step = gap / k as f64;
+        let n = kept.len();
+        kept[n - 1].1 = k.min(per);
+        let mut done = k.min(per);
+        while done < k {
+            let len = (k - done).min(per);
+            kept.push((last + done as f64 * step, len));
+            done += len;
+        }
+        kept.push((x, per));
+    }
+    // two short bars that make one whole bar: a stray inside it, not a move
+    let mut i = 0;
+    while i + 1 < kept.len() {
+        if kept[i].1 < per && kept[i + 1].1 < per && kept[i].1 + kept[i + 1].1 == per {
+            kept[i].1 = per;
+            kept.remove(i + 1);
+        }
+        i += 1;
+    }
+    // a bar the analysis put off the beat: the two whole bars on each side
+    // agree where it belongs, and it is not there
+    for i in 2..kept.len().saturating_sub(2) {
+        if kept[i - 2..=i + 1].iter().any(|b| b.1 != per) {
+            continue;
+        }
+        let left = 2.0 * kept[i - 1].0 - kept[i - 2].0;
+        let right = 2.0 * kept[i + 1].0 - kept[i + 2].0;
+        let mid = 0.5 * (left + right);
+        if (left - right).abs() < 0.04 && (kept[i].0 - mid).abs() > 0.04 {
+            kept[i].0 = mid;
+        }
+    }
+    kept
 }
 
 /// Beat and bar line times of a grid up to `seconds`: (beats, bars).
@@ -623,6 +702,64 @@ mod tests {
         for d in &downbeats {
             assert!(bars.iter().any(|b| (b - d).abs() < 0.009), "downbeat {d} not on a bar line: {bars:?}");
         }
+    }
+
+    #[test]
+    fn a_drifting_song_keeps_its_bars_without_the_strays() {
+        // a band drifting between 120 and 130 bpm (It's Autumn), with what its
+        // analysis gets wrong: a stray time before the first bar, one inside a
+        // bar, and a missed bar
+        let mut bars = Vec::new();
+        let mut t = 0.34;
+        for i in 0..40 {
+            bars.push(t);
+            t += 240.0 / (125.0 + 5.0 * (i as f64 / 4.0).sin());
+        }
+        let mut downbeats = vec![0.01];
+        for (i, &b) in bars.iter().enumerate() {
+            if i != 20 {
+                downbeats.push(b);
+            }
+            if i == 10 {
+                downbeats.push(b + 0.48);
+            }
+        }
+        let (grid, bpm) = dj_grid(&downbeats, &[], 4, t);
+        assert!(grid.len() > 2, "not steady, so it follows the bars: {grid:?}");
+        for m in &grid {
+            assert!((115.0..135.0).contains(&m.bpm), "a jump to {} bpm at {}", m.bpm, m.start);
+        }
+        assert!((grid[0].start - 0.34).abs() < 1e-9, "starts on the real first bar: {}", grid[0].start);
+        let (_, lines) = grid_lines(&grid, 4, t);
+        for b in &bars[..39] {
+            assert!(lines.iter().any(|l| (l - b).abs() < 0.03), "bar {b} not on the grid");
+        }
+        assert!(!lines.iter().any(|l| (l - (bars[10] + 0.48)).abs() < 0.03), "the stray became a bar line");
+        assert!((120.0..130.0).contains(&bpm.unwrap()));
+    }
+
+    /// It's Autumn's analysed downbeats: a band drifting around 125 bpm, a
+    /// stray before the first bar, and the bar moved by whole beats where the
+    /// choruses and the interlude start (37.49, 55.23, 86.83, 103.18, 112.55).
+    const ITS_AUTUMN: [f64; 74] = [
+        0.01, 0.34, 2.29, 3.89, 5.9, 7.85, 9.76, 11.65, 13.5, 15.37, 17.23, 19.11, 20.91, 22.79, 24.67, 26.57, 28.46, 30.35, 32.19, 34.11, 36.05, 37.49, 39.41, 41.3, 43.21,
+        45.11, 47.02, 48.91, 50.83, 52.79, 54.75, 55.23, 57.19, 59.11, 61.03, 62.86, 64.75, 66.65, 68.55, 70.46, 72.35, 74.2, 76.05, 77.86, 79.7, 81.54, 83.43, 85.41, 86.83,
+        88.79, 90.67, 92.55, 94.42, 96.33, 98.23, 100.17, 102.15, 103.18, 105.1, 107.1, 109.08, 111.07, 112.55, 114.5, 116.42, 118.34, 120.26, 122.19, 124.12, 126.07, 128.06,
+        130.11, 132.03, 133.95,
+    ];
+
+    #[test]
+    fn a_real_band_keeps_its_tempo_where_the_bar_moves() {
+        let (grid, bpm) = dj_grid(&ITS_AUTUMN, &[], 4, 134.6);
+        for m in &grid {
+            assert!((115.0..140.0).contains(&m.bpm), "a jump to {} bpm at {}: {grid:?}", m.bpm, m.start);
+        }
+        assert!((grid[0].start - 0.34).abs() < 1e-9);
+        let (_, bars) = grid_lines(&grid, 4, 134.6);
+        for s in [37.49, 55.23, 86.83, 103.18, 112.55] {
+            assert!(bars.iter().any(|b| (b - s).abs() < 0.01), "the bar at {s} is not on the grid");
+        }
+        assert!((120.0..130.0).contains(&bpm.unwrap()));
     }
 
     #[test]

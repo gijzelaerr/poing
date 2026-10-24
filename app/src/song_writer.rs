@@ -31,8 +31,9 @@ Reply with one fenced ```json block and nothing else:
   the prompt asks for, else the prompt's own language.
 - duration: seconds, 90-210 (150 unless the prompt asks otherwise).
 - lyrics: written to be sung, in that language, each section tagged on its own line:
-  [Intro] [Verse] [Pre-Chorus] [Chorus] [Bridge] [Outro] (instrumental sections may be
-  just the tag). Short lines that scan, 4-8 lines per section, a chorus that returns.
+  [Intro] [Verse] [Pre-Chorus] [Chorus] [Bridge] [Outro]. Every line under a tag is
+  sung: an instrumental section is the tag alone, never a description of what plays.
+  Short lines that scan, 4-8 lines per section, a chorus that returns.
   Enough sections to fill the duration. Empty string "" for an instrumental."#;
 
 /// Read the sheet out of the model's answer.
@@ -47,9 +48,35 @@ pub fn parse_answer(text: &str) -> Result<Sheet, String> {
     if sheet.caption.trim().is_empty() {
         return Err("the sheet has no caption".into());
     }
+    sheet.lyrics = unsung_removed(&sheet.lyrics);
     sheet.duration = Some(sheet.duration.unwrap_or(150.0).clamp(60.0, 240.0));
     sheet.bpm = sheet.bpm.filter(|b| (40.0..=220.0).contains(b));
     Ok(sheet)
+}
+
+/// The lyrics without what a model wrote about the music instead of words to
+/// sing ("guitar strumming pattern" under [Intro]): ACE-Step would sing it.
+/// Only short lines naming instruments or playing, under an instrumental tag.
+fn unsung_removed(lyrics: &str) -> String {
+    const PLAYING: [&str; 16] = [
+        "guitar", "strum", "piano", "drum", "bass", "synth", "solo", "instrumental", "beat", "riff", "melody", "fade", "chords", "pattern", "plays", "strings",
+    ];
+    let mut instrumental = false;
+    let mut out = Vec::new();
+    for line in lyrics.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            let tag = t.to_lowercase();
+            instrumental = ["intro", "outro", "interlude", "instrumental", "solo", "break"].iter().any(|k| tag.contains(k));
+        } else if instrumental && t.split_whitespace().count() <= 6 {
+            let l = t.trim_matches(|c: char| c == '(' || c == ')' || c == '*').to_lowercase();
+            if PLAYING.iter().any(|w| l.contains(w)) {
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 /// Ask the model for a sheet for `prompt` (one retry when the answer is unreadable).
@@ -95,5 +122,11 @@ mod tests {
         assert_eq!(s.lyrics, "[Verse]\nDe zon");
         assert!(parse_answer("no sheet").is_err());
         assert_eq!(folder_name("Dans: met/mij?"), "Dans met mij");
+    }
+
+    #[test]
+    fn descriptions_of_the_music_are_not_sung() {
+        let l = "[Intro]\nguitar strumming pattern\n\n[Verse 1]\nDe zon schijnt warm op het gras\nDe gitaar speelt zacht\n\n[Outro]\n(fade out)\nTot morgen, boerderij";
+        assert_eq!(unsung_removed(l), "[Intro]\n\n[Verse 1]\nDe zon schijnt warm op het gras\nDe gitaar speelt zacht\n\n[Outro]\nTot morgen, boerderij");
     }
 }
