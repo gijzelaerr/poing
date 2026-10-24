@@ -649,6 +649,34 @@ mod tests {
         assert!(pack(NATIVE_PACK).is_some_and(|p| p.engine.is_some()));
     }
 
+    /// Times one real pack install from the internet:
+    /// `POING_MODELS=<empty dir> POING_LIVE_PACK=llm-qwen35-4b cargo test --release -p poing live_pack_install -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_pack_install() {
+        let id = std::env::var("POING_LIVE_PACK").unwrap_or_else(|_| "llm-qwen35-4b".into());
+        let p = pack(&id).expect("no such pack");
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let printer = std::thread::spawn(move || {
+            let mut last = Instant::now();
+            for u in rx {
+                if let Update::Progress(text) = u {
+                    if last.elapsed() >= Duration::from_secs(10) {
+                        last = Instant::now();
+                        println!("{:>5.0}s {text}", started.elapsed().as_secs_f64());
+                    }
+                }
+            }
+        });
+        let result = install(p, &tx, &CancelToken::new());
+        drop(tx);
+        printer.join().unwrap();
+        let secs = started.elapsed().as_secs_f64();
+        println!("{}: {result:?} in {secs:.0}s, {:.1} MB/s", p.title, pack_bytes(p) as f64 / secs / 1e6);
+        result.unwrap();
+    }
+
     #[test]
     fn driver_versions_compare_by_number() {
         assert!(version("572.16") > version("528.33"));
