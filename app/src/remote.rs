@@ -38,6 +38,13 @@ pub const DEFAULT_PORT: u16 = 8125;
 pub const FLEET: &str = "poing";
 pub const CREDENTIAL_FILE: &str = "poing.credential";
 const TARGET_FILE: &str = "node.txt";
+/// Every node this machine has sent its jobs to, one `host:port` per line.
+const USED_FILE: &str = "nodes.txt";
+
+fn used_nodes() -> Vec<String> {
+    let text = config_dir().and_then(|d| std::fs::read_to_string(d.join(USED_FILE)).ok()).unwrap_or_default();
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
 /// The node pings every few seconds while it works: this much silence means it is gone.
 const SILENCE: Duration = Duration::from_secs(20);
 const CONNECT: Duration = Duration::from_secs(3);
@@ -138,6 +145,14 @@ pub fn set_target(target: Target) -> Result<(), String> {
         Target::Node(a) => a.clone(),
     };
     std::fs::write(dir.join(TARGET_FILE), format!("{text}\n")).map_err(|e| e.to_string())?;
+    // a node used once stays on Settings' list after switching to This PC
+    if let Target::Node(a) = &target {
+        let mut used = used_nodes();
+        if !used.contains(a) {
+            used.push(a.clone());
+            let _ = std::fs::write(dir.join(USED_FILE), used.join("\n") + "\n");
+        }
+    }
     let mut st = state();
     st.target = Some(target);
     st.node_name = None;
@@ -149,9 +164,14 @@ pub fn set_target(target: Target) -> Result<(), String> {
 /// The first call starts listening for beacons.
 pub fn targets() -> Vec<NodeInfo> {
     let mut out: Vec<NodeInfo> = discovered().into_iter().map(|address| NodeInfo { address, discovered: true }).collect();
+    let mut known = used_nodes();
     if let Target::Node(a) = target() {
+        known.retain(|n| n != &a);
+        known.insert(0, a);
+    }
+    for (i, a) in known.into_iter().enumerate() {
         if !out.iter().any(|n| n.address == a) {
-            out.insert(0, NodeInfo { address: a, discovered: false });
+            out.insert(i.min(out.len()), NodeInfo { address: a, discovered: false });
         }
     }
     out
