@@ -736,8 +736,9 @@ pub enum Job {
     Analyze { audio: PathBuf, bundle: PathBuf, sr: u32 },
     /// Render a take with native YuE2 from `fixture` into `bundle/<take.file>`.
     Generate { bundle: PathBuf, take: Take, fixture: Yue2Fixture, sr: u32 },
-    /// Repaint [take.start, take.end] of `src` with ACE-Step into `bundle/<take.file>`.
-    Repaint { bundle: PathBuf, take: Take, src: PathBuf, job: RepaintJob, sr: u32 },
+    /// Repaint [start, end] of `src` with ACE-Step, one version per take (its
+    /// seed, into `bundle/<take.file>`), the model loaded once.
+    Repaint { bundle: PathBuf, takes: Vec<Take>, src: PathBuf, job: RepaintJob, sr: u32 },
     /// Split `lane` into dry voice and echo; the dry voice is the take.
     Dereverb { bundle: PathBuf, take: Take, lane: PathBuf, sr: u32 },
     /// The language model writes a MIDI part (its role) over a range of grid beats of the song.
@@ -789,6 +790,9 @@ pub struct RepaintJob {
     pub seed: u64,
     pub bpm: Option<f64>,
     pub key: Option<String>,
+    /// Several versions: one seed and output file each (filled in by the job).
+    pub seeds: Option<Vec<u64>>,
+    pub outs: Option<Vec<String>>,
 }
 
 /// What `yue2_render --fixture` reads: style, section-tagged lyrics, seed,
@@ -884,7 +888,7 @@ pub fn run_job(job: Job, tx: &Sender<JobUpdate>) {
         Job::Render { stems, mix, rack, sr, out_dir, name } => render(&stems, &mix, rack, sr, &out_dir, &name, tx),
         Job::Analyze { audio, bundle, sr } => analyze(&audio, &bundle, sr, tx),
         Job::Generate { bundle, take, fixture, sr } => generate(&bundle, take, &fixture, sr, tx),
-        Job::Repaint { bundle, take, src, job, sr } => repaint(&bundle, take, &src, job, sr, tx),
+        Job::Repaint { bundle, takes, src, job, sr } => repaint(&bundle, takes, &src, job, sr, tx),
         Job::Dereverb { bundle, take, lane, sr } => dereverb(&bundle, take, &lane, sr, tx),
         Job::Layer { bundle, take, lego, clean, sr } => layer(&bundle, take, lego, clean, sr, tx),
         Job::WriteFx { bundle, lane, request, context } => write_fx(&bundle, lane, request, &context, tx),
@@ -1722,6 +1726,8 @@ fn sing_song(bundle: &Path, count: usize, seeds: Vec<u64>, sr: u32, tx: &Sender<
             seed: seeds.get(i - 1).copied().unwrap_or(0),
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         };
         let dest = bundle.join(&take.file);
         match std::fs::rename(&file, &dest).map_err(|e| e.to_string()).and_then(|_| load_stem(&dest, sr)) {
@@ -1774,24 +1780,31 @@ fn finish_take(bundle: &Path, take: Take, rendered: &Path, sr: u32, tx: &Sender<
 }
 
 /// Repaint one range with ACE-Step (`sidecar/acestep_repaint.py` in its uv
-/// project), relaying progress; the take covers the range plus its margins.
-fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u32, tx: &Sender<JobUpdate>) {
+/// project), relaying progress; each take covers the range plus its margins
+/// and is handed over as soon as its version is written.
+fn repaint(bundle: &Path, takes: Vec<Take>, src: &Path, mut job: RepaintJob, sr: u32, tx: &Sender<JobUpdate>) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let n = take.id.trim_start_matches('t').to_string();
-    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("Take {n} failed: {why}") });
+    let Some(first) = takes.first().cloned() else { return };
+    let n = takes.iter().map(|t| t.id.trim_start_matches('t')).collect::<Vec<_>>().join(", ");
+    let what = if takes.len() > 1 { format!("Takes {n}") } else { format!("Take {n}") };
+    let fail = |why: String| send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("{what} failed: {why}") });
     let progress = |message: &str, progress: f32| {
-        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("Take {n}  ·  {message}"), progress })
+        send(tx, JobUpdate::Progress { bundle: bundle.to_path_buf(), message: format!("{what}  ·  {message}"), progress })
     };
     progress("Starting ACE-Step", 0.0);
-    let work = bundle.join("takes").join(&take.id);
+    let work = bundle.join("takes").join(&first.id);
     if let Err(e) = std::fs::create_dir_all(&work) {
         return fail(e.to_string());
     }
-    let dest = bundle.join(&take.file);
     job.src = src.to_string_lossy().into_owned();
-    job.out = dest.to_string_lossy().into_owned();
+    job.out = bundle.join(&first.file).to_string_lossy().into_owned();
+    job.seed = first.seed;
+    if takes.len() > 1 {
+        job.seeds = Some(takes.iter().map(|t| t.seed).collect());
+        job.outs = Some(takes.iter().map(|t| bundle.join(&t.file).to_string_lossy().into_owned()).collect());
+    }
     let job_path = work.join("job.json");
     if let Err(e) = std::fs::write(&job_path, job.serialize_json()) {
         return fail(e.to_string());
@@ -1819,28 +1832,48 @@ fn repaint(bundle: &Path, mut take: Take, src: &Path, mut job: RepaintJob, sr: u
         Ok(c) => c,
         Err(e) => return fail(format!("{} did not start ({e})", cmd.get_program().to_string_lossy())),
     };
-    let (mut range, mut error) = (None, None);
+    let (mut range, mut error, mut sent) = (None, None, 0);
+    // a finished version: decoded and handed over while the next one renders
+    let hand_over = |i: usize, (start, end): (f64, f64)| {
+        let Some(mut take) = takes.get(i).cloned() else { return };
+        take.start = start;
+        take.end = end;
+        match load_stem(&bundle.join(&take.file), sr) {
+            Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
+            Err(e) => fail(e),
+        }
+    };
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
             let Ok(l) = SidecarLine::deserialize_json_lenient(&line) else { continue };
             let message = l.message.unwrap_or_default();
             match l.stage.as_str() {
                 "error" => error = Some(message),
+                "version" => {
+                    progress(&message, l.progress.unwrap_or(0.0) as f32);
+                    if let (Some(i), Some(r)) = (l.index, l.start.zip(l.end)) {
+                        hand_over(i - 1, r);
+                        sent = sent.max(i);
+                    }
+                }
                 "done" => range = l.start.zip(l.end),
                 _ => progress(&message, l.progress.unwrap_or(0.0) as f32),
             }
         }
     }
     let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    let Some((start, end)) = range.filter(|_| ok && error.is_none()) else {
+    let Some(range) = range.filter(|_| ok && error.is_none()) else {
         let why = error.unwrap_or_else(|| "ACE-Step exited with an error".into());
         return fail(format!("{why} (see {})", work.join("render.log").display()));
     };
-    take.start = start;
-    take.end = end;
-    match load_stem(&dest, sr) {
-        Ok(stem) => send(tx, JobUpdate::TakeReady { bundle: bundle.to_path_buf(), take, stem }),
-        Err(e) => fail(e),
+    // an older sidecar says only "done": its one version is the first take
+    if sent == 0 {
+        hand_over(0, range);
+    }
+    if takes.len() > 1 {
+        let (a, b) = (job.start, job.end);
+        let message = format!("{} versions of the mix over {a:.1}s - {b:.1}s are ready (takes {n}): click them above the lanes to compare, then Keep this version.", takes.len());
+        send(tx, JobUpdate::Finished { bundle: bundle.to_path_buf(), message });
     }
 }
 

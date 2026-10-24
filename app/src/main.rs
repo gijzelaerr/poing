@@ -1106,6 +1106,8 @@ fn start_remix(st: &mut EditorState, jobs: &Jobs) -> String {
             seed,
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         });
     }
     let job = SongJob {
@@ -1136,18 +1138,23 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
     if let Selection::Chord(_) | Selection::Lyric(_) = st.sel {
         st.select(Selection::None);
     }
-    if !st.project.is_analysed() {
-        // Not split (yet, or its download was declined): a range marked on the song can still be repainted.
-        if let Some(reg) = match st.sel {
-            Selection::Region(r) => st.project.regions().get(r).cloned(),
-            _ => None,
-        } {
-            let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_default().replace("
-", "
-");
-            return repaint_range(st, jobs, bundle, (reg.start, reg.end), "marked range", text, lyrics);
+    // A marked region made again: "regenerate", "fix this", "make this part better"
+    if let Selection::Region(r) = st.sel {
+        if wants_regenerate(st, r, text) {
+            if st.analysing.is_some() {
+                return "A job is still running; make this part again when it is done.".into();
+            }
+            return regenerate_region(st, jobs, r, text);
         }
+    }
+    // "Fix all the bad spots": every region marked bad
+    if st.sel == Selection::None && model::is_fix_marks_text(text) && st.project.regions().iter().any(|r| r.kind == "bad") {
+        if st.analysing.is_some() {
+            return "A job is still running; fix the bad spots when it is done.".into();
+        }
+        return fix_marks(st, jobs, text);
+    }
+    if !st.project.is_analysed() {
         if st.analysing.is_none() {
             return "This song isn't split into parts yet. Mark a range on it (drag on the lane) to repaint just that, or download the analysis in Settings → Models.".into();
         }
@@ -1242,6 +1249,8 @@ fn describe(st: &mut EditorState, jobs: Option<&Jobs>, text: &str) -> String {
         seed,
         track: None,
         blend: None,
+        region: None,
+        kept: None,
     };
     let n = take.id.trim_start_matches('t').to_string();
     let with_score = abc.is_some();
@@ -1285,6 +1294,8 @@ fn repaint_range(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, (start, end
         seed,
         track: None,
         blend: None,
+        region: None,
+        kept: None,
     };
     let a = st.project.analysis.clone().unwrap_or_default();
     let job = RepaintJob {
@@ -1298,12 +1309,162 @@ fn repaint_range(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, (start, end
         key: a.key,
         ..Default::default()
     };
-    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, take, job, sr: st.sr() }) {
+    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, takes: vec![take], job, sr: st.sr() }) {
         return "The job worker is not running".into();
     }
     st.analysing = Some((format!("Take {n}"), 0.0));
     let _ = st.save();
     format!("Repainting the {} ({:.0}s - {:.0}s) as take {n} (under a minute)...", label, start, end)
+}
+
+/// What the region inspector says a mark does (or what it made).
+fn region_hint(st: &EditorState, r: &model::Region) -> String {
+    let versions = st.region_versions(&r.id);
+    if !versions.is_empty() {
+        let ids = versions.iter().map(|t| t.trim_start_matches('t')).collect::<Vec<_>>().join(", ");
+        return format!("   ·   versions: takes {ids} (click them above the lanes, then Keep this version)");
+    }
+    // only drums and bass are played again on their own; elsewhere the mix is repainted
+    let alone = st.project.is_analysed() && matches!(r.track.as_str(), "drums" | "bass");
+    let what = if alone { "this lane" } else { "the whole mix here" };
+    match r.kind.as_str() {
+        "bad" | "regenerate" => format!("   ·   choose regenerate, or Describe \"fix this\", to make {what} again in 3 versions"),
+        _ => String::new(),
+    }
+}
+
+/// How many versions a marked region is made in: compare them, keep one.
+const REGION_VERSIONS: usize = 3;
+
+/// Does Describe on region `r` ask for it to be made again? Words that say so
+/// ("fix this", "again"), or anything but an effect, an echo change or a new
+/// part on a region marked bad or regenerate. A song not split into lanes
+/// yet can only repaint it.
+fn wants_regenerate(st: &EditorState, r: usize, text: &str) -> bool {
+    let Some(reg) = st.project.regions().get(r) else { return false };
+    if !st.project.is_analysed() || text.trim().is_empty() || model::is_fix_text(text) {
+        return true;
+    }
+    let track = st.project.track_index(&reg.track).map(|i| st.project.tracks[i].id.clone()).unwrap_or_default();
+    let flagged = reg.kind == "bad" || reg.kind == "regenerate";
+    flagged && matches!(lane_intent(text, &track), LaneIntent::Replace(ref i) if i.is_none() || i.as_deref() == Some(track.as_str()))
+}
+
+/// What ACE-Step is told the new part should be: the Describe words (unless
+/// they only ask for it again) and the region's note. Neither: the song as it is.
+fn region_caption(text: &str, note: &str) -> String {
+    let said = Some(text.trim()).filter(|t| !t.is_empty() && !model::is_fix_text(t));
+    let parts: Vec<&str> = said.into_iter().chain(Some(note.trim()).filter(|n| !n.is_empty())).collect();
+    if parts.is_empty() {
+        "the same song in the same style, played again".into()
+    } else {
+        parts.join(". ")
+    }
+}
+
+/// Make marked region `r` again in `REGION_VERSIONS` versions, over the
+/// range widened to whole bars, with its note as the hint. On a drums or bass
+/// lane lego plays just that lane again (lane takes); anywhere else ACE-Step
+/// repaints the mix there (section takes). The versions share one slot, so
+/// clicking one above the lanes switches to it; the newest plays.
+fn regenerate_region(st: &mut EditorState, jobs: &Jobs, r: usize, text: &str) -> String {
+    let Some(reg) = st.project.regions().get(r).cloned() else { return "No such region".into() };
+    let Some(lane) = st.project.track_index(&reg.track) else { return "That region's lane is gone".into() };
+    let track = st.project.tracks[lane].clone();
+    if track.is_midi() {
+        return format!("{} is a MIDI part: select the lane and Describe it to have it written again.", track.name);
+    }
+    let Some(source) = st.project.source.clone() else { return "This project has no source audio to repaint".into() };
+    let resume = if text.trim().is_empty() { "regenerate" } else { text };
+    if let Some(note) = model_view::gate(st, "repaint", model_view::Resume::Describe(st.path.clone(), resume.to_string())) {
+        return note;
+    }
+    let bundle = st.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let a = st.project.analysis.clone().unwrap_or_default();
+    let (start, end) = model::pad_to_downbeats(reg.start, reg.end, a.downbeats.as_deref().unwrap_or(&[]));
+    let caption = region_caption(text, reg.note.as_deref().unwrap_or(""));
+    let prompt = if text.trim().is_empty() { "regenerate".to_string() } else { text.trim().to_string() };
+    let mut takes = Vec::new();
+    for _ in 0..REGION_VERSIONS {
+        let (id, seed) = st.project.next_take();
+        takes.push(Take {
+            file: format!("takes/{id}.wav"),
+            id,
+            scope: "section".into(),
+            start,
+            end,
+            engine: "acestep".into(),
+            prompt: prompt.clone(),
+            seed,
+            track: None,
+            blend: None,
+            region: Some(reg.id.clone()),
+            kept: None,
+        });
+    }
+    let ids = takes.iter().map(|t| t.id.trim_start_matches('t')).collect::<Vec<_>>().join(", ");
+    let span = format!("{start:.1}s - {end:.1}s");
+    // Only drums and bass can be played again on their own (lego, then cleaned to the lane's stem).
+    let lego = st.project.is_analysed() && matches!(track.id.as_str(), "drums" | "bass");
+    if lego {
+        let lane_file = st.project.track_path(&st.path, lane).to_string_lossy().into_owned();
+        for mut take in takes {
+            take.scope = "lane".into();
+            take.engine = "lego".into();
+            take.track = Some(track.id.clone());
+            take.blend = Some(1.0);
+            let lego = LegoJob {
+                src: bundle.join(&source).to_string_lossy().into_owned(),
+                track: track.id.clone(),
+                caption: caption.clone(),
+                seed: take.seed,
+                bpm: a.tempo.map(f64::round),
+                key: a.key.clone(),
+                ..Default::default()
+            };
+            let clean = LayerJob { stem: demucs_stem_for(&track.id).to_string(), match_lane: Some(lane_file.clone()), start, end, ..Default::default() };
+            if !jobs.submit(Job::Layer { bundle: bundle.clone(), take, lego, clean, sr: st.sr() }) {
+                return "The job worker is not running".into();
+            }
+        }
+        st.analysing = Some((format!("Takes {ids}"), 0.0));
+        let _ = st.save();
+        return format!("Playing {} again over {span} (whole bars) in {REGION_VERSIONS} versions, takes {ids} (about a minute and a half each)...", track.name);
+    }
+    let lyrics = std::fs::read_to_string(bundle.join("lyrics.txt")).unwrap_or_else(|_| st.project.sung_lyrics()).replace("\r\n", "\n");
+    let job = RepaintJob {
+        start,
+        end,
+        margin: audio::TAKE_MARGIN_S,
+        caption,
+        lyrics,
+        bpm: a.tempo.map(f64::round),
+        key: a.key,
+        ..Default::default()
+    };
+    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, takes, job, sr: st.sr() }) {
+        return "The job worker is not running".into();
+    }
+    st.analysing = Some((format!("Takes {ids}"), 0.0));
+    let _ = st.save();
+    // say so when the lane alone is not what is made again
+    let whole = if st.project.tracks.len() > 1 {
+        format!(" This repaints the whole mix there, not just {}: only drums and bass can be played again on their own.", track.name)
+    } else {
+        String::new()
+    };
+    format!("Repainting {span} (whole bars) in {REGION_VERSIONS} versions, takes {ids} (about a minute).{whole}")
+}
+
+/// Every region marked bad made again, each in its versions (one job each).
+fn fix_marks(st: &mut EditorState, jobs: &Jobs, text: &str) -> String {
+    let bad: Vec<usize> = st.project.regions().iter().enumerate().filter(|(_, r)| r.kind == "bad").map(|(i, _)| i).collect();
+    let mut lines = Vec::new();
+    for r in bad.iter().copied() {
+        let (start, end) = (st.project.regions()[r].start, st.project.regions()[r].end);
+        lines.push(format!("{start:.0}-{end:.0}s: {}", regenerate_region(st, jobs, r, text)));
+    }
+    format!("Making the {} bad spot{} again. {}", bad.len(), if bad.len() == 1 { "" } else { "s" }, lines.join(" "))
 }
 
 /// "Make it 30 s longer", "add an outro": ACE-Step makes the last bars again
@@ -1336,6 +1497,8 @@ fn extend_song(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, secs: f64, te
         seed,
         track: None,
         blend: None,
+        region: None,
+        kept: None,
     };
     let job = RepaintJob {
         start: from,
@@ -1348,7 +1511,7 @@ fn extend_song(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, secs: f64, te
         key: a.key,
         ..Default::default()
     };
-    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, take, job, sr: st.sr() }) {
+    if !jobs.submit(Job::Repaint { src: bundle.join(source), bundle, takes: vec![take], job, sr: st.sr() }) {
         return "The job worker is not running".into();
     }
     st.analysing = Some((format!("Take {n}"), 0.0));
@@ -1499,6 +1662,8 @@ fn describe_lane(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, lane: usize
         track: Some(track.id.clone()),
         // dry + 35% of the echo: what worked for the disco v4 vocal
         blend: Some(0.65),
+        region: None,
+        kept: None,
     };
     let (job, status) = match intent {
         LaneIntent::Replace(Some(instrument)) => {
@@ -1736,6 +1901,7 @@ impl App {
             }
         }
         st.restore_combined();
+        st.restore_kept();
         st.restore_extensions();
         // Analysed while another song was open: apply it from disk, no second run.
         if analyse {
@@ -1978,7 +2144,7 @@ impl App {
                 let track = st.project.track_index(&r.track).map(|t| st.project.tracks[t].name.clone()).unwrap_or_default();
                 ui.label(cx, ids!(insp_title)).set_text(
                     cx,
-                    &format!("Region {} on {}   {:.2}s - {:.2}s ({:.2}s)", r.id, track, r.start, r.end, r.end - r.start),
+                    &format!("Region {} on {}   {:.2}s - {:.2}s ({:.2}s){}", r.id, track, r.start, r.end, r.end - r.start, region_hint(st, &r)),
                 );
                 ui.drop_down(cx, ids!(kind_dd)).set_selected_item(cx, kind_index(&r.kind));
                 ui.slider(cx, ids!(region_gain)).set_value(cx, r.gain());
@@ -2086,6 +2252,7 @@ impl App {
                     ui.view(cx, ids!(take_blend_box)).set_visible(cx, blends);
                     ui.slider(cx, ids!(take_blend)).set_value(cx, (t.blend() * 100.0).round());
                     let keep = match t.scope.as_str() {
+                        _ if t.region.is_some() => "Keep this version",
                         "song" if st.project.is_draft() => "Use this version",
                         "song" => "Keep as a new song",
                         "layer" => "Keep as a lane",
@@ -2400,6 +2567,23 @@ impl App {
                 }
                 _ => Err("give a role (bass, keys, lead or drums) and the style in `text`".into()),
             },
+            "regenerate" => {
+                let text = get(&a, "text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                match (index(&a, "region"), self.jobs.as_ref()) {
+                    (_, None) => Err("the job worker is not running".into()),
+                    _ if st.analysing.is_some() => Err("a job is still running; try again when song.busy is false".into()),
+                    (Some(r), _) if r >= st.project.regions().len() => Err("no such region (see song.regions)".into()),
+                    (Some(r), Some(jobs)) => {
+                        st.select(Selection::Region(r));
+                        Ok(regenerate_region(st, jobs, r, &text))
+                    }
+                    (None, Some(jobs)) if st.project.regions().iter().any(|r| r.kind == "bad") => {
+                        st.select(Selection::None);
+                        Ok(fix_marks(st, jobs, &text))
+                    }
+                    (None, Some(_)) => Err("no region is marked bad; give `region` to make another one again".into()),
+                }
+            }
             "set_lane" => match index(&a, "lane").filter(|&l| l < lanes) {
                 None => Err("no such lane".into()),
                 Some(l) => {
@@ -3122,6 +3306,9 @@ impl MatchEvent for App {
             }
         } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.analysing.is_some() {
             status = Some("A job is still running; keep the take when it is done.".into());
+        } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.focused_take().is_some_and(|t| t.region.is_some()) {
+            let id = st.focus.clone().unwrap_or_default();
+            status = Some(st.keep_version(&id).unwrap_or_else(|e| format!("Keep failed: {e}")));
         } else if ui.button(cx, ids!(keep_btn)).clicked(actions) && st.focused_take().is_some_and(|t| t.scope != "song") {
             let id = st.focus.clone().unwrap_or_default();
             status = Some(st.keep_take(&id).unwrap_or_else(|e| format!("Keep failed: {e}")));
@@ -3198,11 +3385,16 @@ impl MatchEvent for App {
             if i < st.project.regions().len() {
                 if let Some(k) = ui.drop_down(cx, ids!(kind_dd)).selected(actions) {
                     let kind = REGION_KINDS[k].to_string();
+                    let regenerate = kind == "regenerate";
                     let r = &mut st.project.regions_mut()[i];
                     r.gain_db = Some(default_gain_for(&kind));
                     r.kind = kind;
                     st.push_mix();
                     st.sel_changed = true;
+                    // "regenerate" makes it again straight away, with its note as the hint
+                    if regenerate {
+                        status = Some(describe(st, self.jobs.as_ref(), "regenerate"));
+                    }
                 }
                 if let Some(v) = ui.slider(cx, ids!(region_gain)).slided(actions) {
                     let r = &mut st.project.regions_mut()[i];
