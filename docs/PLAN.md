@@ -158,6 +158,8 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 
 ## Road to 1.0 (2026-10-23)
 
+**0.1 (2026-10-24):** everything below as a first pre-release, so friends can try it. 1.0 waits until the open checks under "1.0 QA" are done.
+
 1.0 means *a solid tool for us* (Gijs, Megan, Rik and friends): unsigned builds and non-commercial models are fine, and **every feature works without a subscription** (a local model by default, Claude Code optional).
 
 | | Workstream | State |
