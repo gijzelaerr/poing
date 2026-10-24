@@ -5,12 +5,12 @@ version = 4
 [[package]]
 name = "ab_glyph_rasterizer"
 version = "0.1.8"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "bitflags"
 version = "2.10.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "bitflags"
@@ -30,12 +30,12 @@ dependencies = [
 [[package]]
 name = "bytemuck"
 version = "1.25.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "byteorder"
 version = "1.5.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "cfg-if"
@@ -93,17 +93,17 @@ dependencies = [
 [[package]]
 name = "downcast-rs"
 version = "1.2.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "foldhash"
 version = "0.2.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "fxhash"
 version = "0.2.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "byteorder",
 ]
@@ -139,7 +139,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "makepad-ai-beats"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-common",
  "makepad-ai-loader",
@@ -148,7 +148,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-common"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-cuda",
  "makepad-ai-llm",
@@ -159,7 +159,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-cuda"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-loader",
  "makepad-windows-sys",
@@ -168,7 +168,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-hub"
 version = "0.3.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-common",
  "makepad-audio-decode",
@@ -188,7 +188,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-llm"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-cuda",
  "makepad-ai-loader",
@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-loader"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-serde",
  "makepad-windows-sys",
@@ -209,7 +209,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-metal"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-cuda",
  "makepad-ai-loader",
@@ -220,7 +220,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-services"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-serde",
  "makepad-platform",
@@ -231,7 +231,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-speech"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-common",
  "makepad-ai-cuda",
@@ -243,7 +243,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-stems"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-ai-common",
  "makepad-ai-loader",
@@ -252,7 +252,7 @@ dependencies = [
 [[package]]
 name = "makepad-ai-vulkan"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-script",
  "makepad-vulkan",
@@ -261,12 +261,12 @@ dependencies = [
 [[package]]
 name = "makepad-alloc-epoch"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-android-state"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-jni-sys",
 ]
@@ -274,12 +274,12 @@ dependencies = [
 [[package]]
 name = "makepad-app-icons"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-apple-sys"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-objc-sys",
 ]
@@ -287,7 +287,7 @@ dependencies = [
 [[package]]
 name = "makepad-audio-decode"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax",
 ]
@@ -295,22 +295,22 @@ dependencies = [
 [[package]]
 name = "makepad-base64"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-byteorder-lite"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-core-util"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-derive-wasm-bridge"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -318,7 +318,7 @@ dependencies = [
 [[package]]
 name = "makepad-derive-widget"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-derive-widget-impl",
  "makepad-live-id",
@@ -328,7 +328,7 @@ dependencies = [
 [[package]]
 name = "makepad-derive-widget-impl"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "makepad-draw"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "fxhash",
  "makepad-font-core",
@@ -360,7 +360,7 @@ dependencies = [
 [[package]]
 name = "makepad-error-log"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-serde",
 ]
@@ -368,12 +368,12 @@ dependencies = [
 [[package]]
 name = "makepad-fast-inflate"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-filesystem-watcher"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-git",
  "makepad-windows-sys",
@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "makepad-font-core"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "ab_glyph_rasterizer",
  "fxhash",
@@ -396,12 +396,12 @@ dependencies = [
 [[package]]
 name = "makepad-futures"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-gif"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "weezl",
 ]
@@ -409,7 +409,7 @@ dependencies = [
 [[package]]
 name = "makepad-git"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-fast-inflate",
 ]
@@ -417,7 +417,7 @@ dependencies = [
 [[package]]
 name = "makepad-gizmo"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-math",
 ]
@@ -425,7 +425,7 @@ dependencies = [
 [[package]]
 name = "makepad-hal"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-apple-sys",
  "makepad-font-core",
@@ -447,7 +447,7 @@ dependencies = [
 [[package]]
 name = "makepad-html"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id",
 ]
@@ -455,12 +455,12 @@ dependencies = [
 [[package]]
 name = "makepad-jni-sys"
 version = "0.4.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-key-code"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-serde",
 ]
@@ -468,7 +468,7 @@ dependencies = [
 [[package]]
 name = "makepad-latex-math"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "ttf-parser",
 ]
@@ -476,7 +476,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-id"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id-macros",
  "makepad-relax-api",
@@ -485,7 +485,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-id-macros"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id-macros-impl",
 ]
@@ -493,7 +493,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-id-macros-impl"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -501,7 +501,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-reload-core"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-filesystem-watcher",
 ]
@@ -509,7 +509,7 @@ dependencies = [
 [[package]]
 name = "makepad-math"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bytemuck",
  "makepad-micro-serde",
@@ -518,12 +518,12 @@ dependencies = [
 [[package]]
 name = "makepad-micro-proc-macro"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-micro-serde"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id",
  "makepad-micro-serde-derive",
@@ -532,7 +532,7 @@ dependencies = [
 [[package]]
 name = "makepad-micro-serde-derive"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
  "makepad-micro-serde-derive-impl",
@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "makepad-micro-serde-derive-impl"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -549,7 +549,7 @@ dependencies = [
 [[package]]
 name = "makepad-network"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-apple-sys",
  "makepad-error-log",
@@ -561,12 +561,12 @@ dependencies = [
 [[package]]
 name = "makepad-objc-sys"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-platform"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "foldhash",
@@ -601,7 +601,7 @@ dependencies = [
 [[package]]
 name = "makepad-platform-video"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-apple-sys",
  "makepad-hal",
@@ -612,17 +612,17 @@ dependencies = [
 [[package]]
 name = "makepad-regex"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-relax"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-relax-api"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax-api-macro",
 ]
@@ -630,7 +630,7 @@ dependencies = [
 [[package]]
 name = "makepad-relax-api-macro"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax-api-macro-impl",
 ]
@@ -638,7 +638,7 @@ dependencies = [
 [[package]]
 name = "makepad-relax-api-macro-impl"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -646,7 +646,7 @@ dependencies = [
 [[package]]
 name = "makepad-remote"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-network",
  "makepad-strict-json",
@@ -656,7 +656,7 @@ dependencies = [
 [[package]]
 name = "makepad-script"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-error-log",
  "makepad-html",
@@ -673,7 +673,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-audio-aot"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax-api",
  "makepad-script-compute",
@@ -682,7 +682,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-census"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax-api",
  "makepad-script",
@@ -691,7 +691,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-compute"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-relax-api",
  "relax-backend",
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-derive"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
  "makepad-script-derive-impl",
@@ -710,7 +710,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-derive-impl"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -718,7 +718,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-std"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id",
  "makepad-network",
@@ -729,7 +729,7 @@ dependencies = [
 [[package]]
 name = "makepad-shader"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-live-id",
  "makepad-relax-api",
@@ -738,17 +738,17 @@ dependencies = [
 [[package]]
 name = "makepad-shared-bytes"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-strict-json"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-studio-protocol"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "makepad-error-log",
@@ -760,7 +760,7 @@ dependencies = [
 [[package]]
 name = "makepad-svg"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-html",
  "makepad-live-id",
@@ -769,12 +769,12 @@ dependencies = [
 [[package]]
 name = "makepad-toml-parser"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-tsdf"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-math",
  "makepad-micro-serde",
@@ -783,22 +783,22 @@ dependencies = [
 [[package]]
 name = "makepad-tween"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-video-flow"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-vulkan"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-wasm-bridge"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-derive-wasm-bridge",
  "makepad-live-id",
@@ -807,12 +807,12 @@ dependencies = [
 [[package]]
 name = "makepad-web-manifest"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-webp"
 version = "0.2.4"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-byteorder-lite",
 ]
@@ -820,7 +820,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-catalog",
  "makepad-widgets-collections",
@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-catalog"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -847,7 +847,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-collections"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -855,7 +855,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-core"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-app-icons",
  "makepad-derive-widget",
@@ -868,7 +868,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-data"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-editors"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-gizmo",
  "makepad-widgets-core",
@@ -885,7 +885,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-extras"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -893,7 +893,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-fab"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -901,7 +901,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-hotkeys"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-media"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -917,7 +917,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-menus"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -925,7 +925,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-pickers"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-widgets-core",
 ]
@@ -933,7 +933,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets-rich-text"
 version = "2.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-base64",
  "makepad-html",
@@ -946,12 +946,12 @@ dependencies = [
 [[package]]
 name = "makepad-windows-sys"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-zip-file"
 version = "1.0.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-fast-inflate",
 ]
@@ -959,7 +959,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-bmp"
 version = "0.5.2"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-error-log",
  "makepad-zune-core",
@@ -968,12 +968,12 @@ dependencies = [
 [[package]]
 name = "makepad-zune-core"
 version = "0.5.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "makepad-zune-inflate"
 version = "0.2.54"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "simd-adler32",
 ]
@@ -981,7 +981,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-jpeg"
 version = "0.5.15"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-zune-core",
 ]
@@ -989,7 +989,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-png"
 version = "0.5.2"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-fast-inflate",
  "makepad-zune-core",
@@ -999,7 +999,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-qoi"
 version = "0.5.2"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-zune-core",
 ]
@@ -1007,7 +1007,7 @@ dependencies = [
 [[package]]
 name = "memchr"
 version = "2.7.6"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "memchr"
@@ -1170,7 +1170,7 @@ dependencies = [
 [[package]]
 name = "pkg-config"
 version = "0.3.32"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "poing"
@@ -1226,7 +1226,7 @@ dependencies = [
 [[package]]
 name = "pulldown-cmark"
 version = "0.12.2"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "memchr 2.7.6",
@@ -1254,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "relax-backend"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "relax-session",
 ]
@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "relax-session"
 version = "0.1.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "rtrb"
@@ -1273,7 +1273,7 @@ checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
 [[package]]
 name = "rustybuzz"
 version = "0.18.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
@@ -1289,12 +1289,12 @@ dependencies = [
 [[package]]
 name = "scoped-tls"
 version = "1.0.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "sdfer"
 version = "0.2.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "serde"
@@ -1342,12 +1342,12 @@ dependencies = [
 [[package]]
 name = "simd-adler32"
 version = "0.3.9"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "smallvec"
 version = "1.15.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "smallvec"
@@ -1389,27 +1389,27 @@ dependencies = [
 [[package]]
 name = "ttf-parser"
 version = "0.24.1"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicase"
 version = "2.9.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-bidi"
 version = "0.3.18"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-bidi-mirroring"
 version = "0.3.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-ccc"
 version = "0.3.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-ident"
@@ -1420,22 +1420,22 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "unicode-linebreak"
 version = "0.1.5"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-properties"
 version = "0.1.4"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-script"
 version = "0.5.8"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "unicode-segmentation"
 version = "1.12.0"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "vst3"
@@ -1472,7 +1472,7 @@ dependencies = [
 [[package]]
 name = "wayland-backend"
 version = "0.3.12"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "downcast-rs",
  "scoped-tls",
@@ -1483,7 +1483,7 @@ dependencies = [
 [[package]]
 name = "wayland-client"
 version = "0.31.12"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
@@ -1493,7 +1493,7 @@ dependencies = [
 [[package]]
 name = "wayland-protocols"
 version = "0.32.10"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
@@ -1503,7 +1503,7 @@ dependencies = [
 [[package]]
 name = "wayland-sys"
 version = "0.31.8"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 dependencies = [
  "makepad-error-log",
  "pkg-config",
@@ -1512,7 +1512,7 @@ dependencies = [
 [[package]]
 name = "weezl"
 version = "0.1.12"
-source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024#34b69682a3e2c402486af3dffc657f109bfe9cfe"
+source = "git+https://github.com/gijzelaerr/makepad.git?tag=poing-pin-20261024b#3b984c25905db382a2a11e4b459a624996ab42da"
 
 [[package]]
 name = "winapi"
