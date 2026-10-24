@@ -531,6 +531,8 @@ pub struct Shared {
     pub loop_b: AtomicU64,
     /// Keys played live into a MIDI lane, and recording them.
     pub live: crate::live::Live,
+    /// Live mode's two decks (played instead of the song while on).
+    pub decks: crate::decks::Decks,
 }
 
 impl Shared {
@@ -549,6 +551,7 @@ impl Shared {
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
             live: crate::live::Live::default(),
+            decks: crate::decks::Decks::default(),
         }
     }
     pub fn pos(&self) -> usize {
@@ -578,6 +581,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut was_playing = false;
     let mut last_live: Option<usize> = None;
     let mut click = crate::live::Click::new(sr);
+    let mut decks = crate::decks::Player::new(sr);
     // where the last block ended: playback from anywhere else is a jump
     let mut expected = usize::MAX;
     cx.audio_output(0, move |info, out| {
@@ -615,6 +619,17 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         };
         let ratio = sr as f64 / info.sample_rate.max(1.0);
         let dev_frames = out.frame_count();
+        // Live mode: the decks play, not the song.
+        if shared.decks.on() {
+            let n_src = ((dev_frames as f64 * ratio).ceil() as usize).max(1);
+            l.resize(n_src, 0.0);
+            r.resize(n_src, 0.0);
+            decks.render(&shared.decks, &mut l, &mut r);
+            if !muted {
+                play_out(out, &l, &r, ratio);
+            }
+            return;
+        }
         // Keys played live go to the selected MIDI lane's instrument; a lane
         // that loses them lets go of what they hold.
         let live_lane = shared.live.lane().filter(|l| rack.has_midi(*l));
@@ -710,21 +725,27 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
             n_src
         };
         if !muted {
-            let chans = out.channel_count();
-            for i in 0..dev_frames {
-                let j = ((i as f64 * ratio) as usize).min(n_src.saturating_sub(1));
-                if n_src == 0 {
-                    break;
-                }
-                if chans >= 2 {
-                    out.channel_mut(0)[i] = l[j];
-                    out.channel_mut(1)[i] = r[j];
-                } else {
-                    out.channel_mut(0)[i] = 0.5 * (l[j] + r[j]);
-                }
-            }
+            play_out(out, &l[..n_src], &r[..n_src], ratio);
         }
     });
+}
+
+/// Stem-rate frames l/r to the device's frames (nearest frame at another rate).
+fn play_out(out: &mut AudioBuffer, l: &[f32], r: &[f32], ratio: f64) {
+    let n_src = l.len().min(r.len());
+    if n_src == 0 {
+        return;
+    }
+    let chans = out.channel_count();
+    for i in 0..out.frame_count() {
+        let j = ((i as f64 * ratio) as usize).min(n_src - 1);
+        if chans >= 2 {
+            out.channel_mut(0)[i] = l[j];
+            out.channel_mut(1)[i] = r[j];
+        } else {
+            out.channel_mut(0)[i] = 0.5 * (l[j] + r[j]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- jobs worker

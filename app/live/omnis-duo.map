@@ -1,0 +1,107 @@
+# Poing live: the AlphaTheta OMNIS-DUO as a MIDI controller.
+#
+# The numbers come from rekordbox 7.2.19's own controller map for the DUO
+# (MidiMappings/OMNIS-DUO.midi.csv); docs/LIVE.md says how to read it and
+# what each control does in Poing.
+#
+# One control per line:  status data1 action [deck] [argument] [options]
+#   status  the first byte, channel included (90 = note on ch1, B4 = CC ch5)
+#   data1   the note or CC number
+#   deck    1 or 2 (absent for the mixer's master controls and the effects)
+#   options hires   a 14-bit fader: its LSB comes on CC data1+0x20
+#           invert  the fader the other way round
+#           noled   do not light this control
+# A note-on with velocity 0 is a release, like a note-off. Buttons and pads
+# with a state are lit by sending the same message back (7F on, 00 off).
+#
+# To fix a control without rebuilding Poing, copy this file to Poing's
+# config folder (%APPDATA%\Poing\omnis-duo.map on Windows) and edit it there.
+# Poing logs every message from the DUO it does not know:
+#   poing: live: unmapped 96 04 7F
+
+# MIDI ports whose name contains this play the decks.
+port OMNIS
+
+# ---- deck 1 (channel 1, pads on channel 6)
+90 00 play 1
+90 01 cue 1
+90 05 start 1
+90 1F sync 1
+90 51 load 1
+95 00 hotcue 1 1
+95 01 hotcue 1 2
+95 02 hotcue 1 3
+95 03 hotcue 1 4
+95 04 loop 1 1
+95 05 loop 1 2
+95 06 loop 1 4
+95 07 loop 1 8
+95 08 mute 1 vocals
+95 09 mute 1 drums
+95 0A mute 1 bass
+95 0B mute 1 other
+90 0C section 1 -1
+90 0B section 1 1
+90 43 loop_toggle 1
+90 44 loop_toggle 1
+B0 2E loop_size 1
+90 20 touch 1
+90 48 touch 1
+B0 22 scratch 1
+B0 21 nudge 1
+B0 26 nudge 1
+B0 00 tempo 1 hires
+B0 02 level 1
+
+# ---- deck 2 (channel 2, pads on channel 7)
+91 00 play 2
+91 01 cue 2
+91 05 start 2
+91 1F sync 2
+91 51 load 2
+96 00 hotcue 2 1
+96 01 hotcue 2 2
+96 02 hotcue 2 3
+96 03 hotcue 2 4
+96 04 loop 2 1
+96 05 loop 2 2
+96 06 loop 2 4
+96 07 loop 2 8
+96 08 mute 2 vocals
+96 09 mute 2 drums
+96 0A mute 2 bass
+96 0B mute 2 other
+91 0C section 2 -1
+91 0B section 2 1
+91 43 loop_toggle 2
+91 44 loop_toggle 2
+B1 2E loop_size 2
+91 20 touch 2
+91 48 touch 2
+B1 22 scratch 2
+B1 21 nudge 2
+B1 26 nudge 2
+B1 00 tempo 2 hires
+B1 02 level 2
+
+# ---- mixer (channel 5)
+B4 01 trim 1
+B4 02 eq_high 1
+B4 03 eq_mid 1
+B4 04 eq_low 1
+B4 05 color 1
+B4 11 fader 1
+B4 06 trim 2
+B4 07 eq_high 2
+B4 08 eq_mid 2
+B4 09 eq_low 2
+B4 0A color 2
+B4 12 fader 2
+B4 0B xfader
+
+# ---- beat FX (channel 5, buttons as CCs)
+B4 72 fx_on
+B4 34 fx_select
+B4 5B fx_depth
+B4 4C fx_beats -1
+B4 4D fx_beats 1

@@ -48,6 +48,12 @@ pub fn manifest() -> ServiceManifest {
         Risk::Request,
     ))
     .with_tool(tool(
+        "live",
+        "Live mode: two decks played from the OMNIS-DUO controller (docs/LIVE.md). `on` turns it on (both decks get the open song) or off. Returns both decks: song, playing, `t` (seconds), `beat` (on the song's beat grid), `speed`, `bpm` as heard, `sync`, section, cue, hot cues A-D, which stems play, the loop, EQ, filter, fader and level; the crossfader, the beat FX, the tempo heard and `phase_diff_beats` (deck 2's beat phase minus deck 1's).",
+        r#"{"type":"object","properties":{"on":{"type":"boolean"}},"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
         "set_lane",
         "Change a lane's level, mute or solo it. `change_db` moves the level by that much from where it is now (+2 louder, -2 quieter); `gain_db` sets the level itself (-36..12, the lane's `gain_db` in `song`).",
         r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"change_db":{"type":"number","minimum":-24,"maximum":24},"gain_db":{"type":"number","minimum":-36,"maximum":12},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["lane"],"additionalProperties":false}"#,

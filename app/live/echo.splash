@@ -1,0 +1,31 @@
+// Live mode's beat FX echo: repeats on the beat (its length in beats at the
+// master deck's tempo), each one darker than the last. `on` gates what goes
+// in, so turning it off lets the echoes ring out.
+let bpm = param(120, 60, 200)
+let beats = param(0.75, 0.125, 2)
+let mix = param(0.5, 0, 1)
+let on = param(0, 0, 1)
+let feedback = param(0.45, 0, 0.9)
+
+var bl = [0.0; 131072]
+var br = [0.0; 131072]
+var w = int(0)
+var lpl = OnePole{}
+var lpr = OnePole{}
+
+fn block() {
+    onepole_set(lpl, 4500)
+    onepole_set(lpr, 4500)
+}
+
+fn effect(l, r) {
+    let d = clamp(60.0 / bpm * beats * sample_rate, 64.0, 131000.0)
+    let yl = tap(bl, w, d)
+    let yr = tap(br, w, d)
+    // ping-pong: each side's repeat feeds the other
+    bl[w] = l * on + onepole_lp(lpr, yr) * feedback
+    br[w] = r * on + onepole_lp(lpl, yl) * feedback
+    // kept small: tap() reads at float(w) - d
+    w = (w + 1) % 131072
+    vec2(l + yl * mix, r + yr * mix)
+}

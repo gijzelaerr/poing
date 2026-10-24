@@ -8,6 +8,10 @@ pub use makepad_widgets;
 
 #[path = "audio.rs"]
 mod audio;
+#[path = "deckmap.rs"]
+mod deckmap;
+#[path = "decks.rs"]
+mod decks;
 #[path = "djexport.rs"]
 mod djexport;
 #[path = "export.rs"]

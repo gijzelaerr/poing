@@ -88,7 +88,7 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 ### Using it
 
 - **Starting it.** Open a song and press **Live** in the top bar. Both decks load the song in front. The hardware **Load** button loads the song in front onto that deck, so a version or remix opened in another tab can go on deck 2. **Live** again goes back to the song.
-- **What a deck plays.** The song's lanes as the song sets them: levels, mutes (the muted "Original" stays out), regions, and the whole-song take that is on. Each stem can be muted on its own. Two copies of one song share their audio, so nothing is loaded twice.
+- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Each stem can be muted on its own. Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
 - **Tempo.** Speed and pitch move together, like vinyl. There is no key lock yet.
 - **Beat grid and hot cues.** These are the DJ export's own: `dj_grid` and `dj_cues` from `djexport.rs`. Hot cues A–D sit on the intro, the first chorus, the bridge or drop (else the last chorus), and the outro (else the last section). A song may have fewer than four. "It's Autumn" has no outro and its last section is chorus 3, so it gets A, B and C, and pad 4 stays dark.
 
@@ -147,7 +147,30 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 
 ### Tested without the hardware
 
-Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a hidden, muted Poing. The `live` tool reads the decks back, and `midi k=out` reads the LEDs Poing sent. See the PR for the run and its numbers.
+Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a hidden, muted Poing. The `live` tool reads the decks back, and `midi k=out` reads the LEDs Poing sent. The run, 2026-10-24, on glacier, used a copy of "It's Autumn" on both decks:
+
+1. **The two decks out of step.**
+   - Deck 2's tempo fader went to +3% (`B1 00 57`, `B1 20 7F`).
+   - Deck 1 played from hot cue A (Intro, 0.34 s). Deck 2 started from hot cue B (`96 01`, Chorus 1 at 37.49 s).
+   - After 3 s they were 0.036 beat apart, at 133.0 and 130.8 bpm.
+2. **Sync on deck 2** (`91 1F`). Three seconds later the phase difference was **0.000 beat**. Deck 2 then played at 0.974× (123.08 bpm, deck 1's local tempo), and the beats were 13.462 and 92.462. It held at 0.000 two seconds later.
+3. **Deck 1 hot cue C** (`95 02`) while playing: it jumped from about 8.7 s to 113.57 s. The phase difference stayed 0.000.
+4. **Shift + pads.**
+   - On deck 1 (`95 08`, `95 09`), vocals and drums went off.
+   - On deck 2 (`96 0A`), bass went off.
+   - Their LEDs went dark (`95 08 00`, `95 09 00`, `96 0A 00`).
+5. **Crossfader.**
+   - Hard left: deck 2 fell to −53 dB (its meter falling back) while deck 1 played at −13 dB.
+   - Hard right: deck 1 fell to −61 dB.
+6. **EQ, filter and loop.**
+   - Deck 1's low was killed and its filter set to low-pass.
+   - Deck 2's loop went on (`91 43`) and was halved (`B1 2E 3F`). It looped 2 beats and stayed in sync.
+7. **Beat FX** on (`B4 72`) and set to 1 beat (`B4 4D`): Echo, 1 beat, on.
+8. **Jog on deck 1.** It was touched (`90 20`) and turned back 72 steps (`B0 22`): the playhead went back 0.12 s and held. Synced deck 2 kept its tempo (0.995×) rather than chasing the scratched deck.
+9. **An unknown message** (`96 0C 7F`) was logged as `poing: live: unmapped 96 0C 7F`.
+10. **Leaving live mode.** Live off ("Back to the song") brought the song's timeline back.
+
+The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change.
 
 ### To check on the real DUO
 
@@ -161,6 +184,7 @@ Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a h
 
 ### Not in this first version
 
+- Lane effects and MIDI lanes. A deck plays the song's audio through the song's own mixer, with no effects rack, so a Splash or VST3 effect on a lane and the MIDI lanes' instruments are not heard live.
 - Key lock (time-stretch).
 - Headphone cueing.
 - Saving changed cue points to the song.
