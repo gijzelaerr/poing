@@ -421,7 +421,7 @@ impl Decks {
 
     /// Has the callback moved past every song published before now?
     pub fn retired(&self) -> bool {
-        !self.on() || self.deck.iter().all(|d| d.seen.load(Ordering::Acquire) == d.gen.load(Ordering::Acquire))
+        self.deck.iter().all(|d| d.seen.load(Ordering::Acquire) == d.gen.load(Ordering::Acquire))
     }
 
     /// A controller message, decoded by `map` (on the MIDI thread).
@@ -432,10 +432,11 @@ impl Decks {
                 self.touched.fetch_add(1, Ordering::Relaxed);
             }
             None => {
-                // the meter's CC is output only; the rest is news
+                // the meter and the ignored controls are known; only note
+                // and CC messages are news (not pressure or clock)
                 let status = if d[0] & 0xf0 == 0x80 { d[0] | 0x10 } else { d[0] };
                 let known = map.controls.iter().any(|c| c.status == status && c.data1 == d[1]);
-                if !known {
+                if !known && matches!(d[0] & 0xf0, 0x80 | 0x90 | 0xb0) {
                     let _ = self.unmapped.push(d);
                 }
             }
@@ -1412,6 +1413,9 @@ mod tests {
         decks.midi(&map, &mut dec, [0x96, 0x0c, 0x7f]);
         assert_eq!(decks.unmapped.pop(), Some([0x96, 0x0c, 0x7f]), "unknown: logged");
         decks.midi(&map, &mut dec, [0x86, 0x00, 0x00]);
-        assert!(decks.unmapped.pop().is_none(), "a known pad's note-off is no news");
+        decks.midi(&map, &mut dec, [0x90, 0x3f, 0x7f]);
+        decks.midi(&map, &mut dec, [0xb4, 0x46, 0x7f]);
+        decks.midi(&map, &mut dec, [0xa6, 0x00, 0x40]);
+        assert!(decks.unmapped.pop().is_none(), "a known pad's note-off, shift, headphone cue and pad pressure are no news");
     }
 }

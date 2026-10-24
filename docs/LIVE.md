@@ -88,7 +88,7 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 ### Using it
 
 - **Starting it.** Open a song and press **Live** in the top bar. Both decks load the song in front. The hardware **Load** button loads the song in front onto that deck, so a version or remix opened in another tab can go on deck 2. **Live** again goes back to the song.
-- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Each stem can be muted on its own. Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
+- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
 - **Tempo.** Speed and pitch move together, like vinyl. There is no key lock yet.
 - **Beat grid and hot cues.** These are the DJ export's own: `dj_grid` and `dj_cues` from `djexport.rs`. Hot cues A–D sit on the intro, the first chorus, the bridge or drop (else the last chorus), and the outro (else the last section). A song may have fewer than four. "It's Autumn" has no outro and its last section is chorus 3, so it gets A, B and C, and pad 4 stays dark.
 
@@ -104,7 +104,7 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 | Shift + loop press | Reloop/exit: the same toggle |
 | ◀ / ▶ | Jump to the previous or next section, keeping the beat |
 
-- **A hot cue or section jump while playing** lands on the cue plus the current offset from the last beat. The deck keeps its beat, so a synced deck stays in sync. While stopped, it jumps exactly to the cue.
+- **A hot cue or section jump while playing** lands on the cue plus the current offset from the last beat. The deck keeps its beat, so a synced deck stays in sync. While stopped, it jumps exactly to the cue. A hot cue also starts the deck, as on a CDJ.
 - **Cue works like a CDJ.**
   - Playing: back to the cue point, and stop.
   - Stopped away from the cue: the cue point moves here, on the nearest beat.
@@ -142,12 +142,14 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
   - `hires`: a 14-bit fader whose LSB comes on data1+0x20;
   - `invert`: turns a fader around;
   - `noled`: no LED written back.
+
+  The action `ignore` marks a control the DUO has that Poing does not use (Shift, the touch panel's other buttons, browse…), so it is not logged.
 - **LEDs.** Buttons and pads with state get their LED written back. Poing sends the same message with 7F or 00 whenever the state changes, and writes the channel meters to `B0 02` / `B1 02`. Poing writes only to MIDI outputs whose name contains `OMNIS`, so the Launchpad and Launchkey on glacier get nothing.
-- **Unmapped messages.** Every message from the DUO that the map does not know is logged as `poing: live: unmapped 96 04 7F`. That line is what to put in the map.
+- **Unmapped messages.** Every note or CC from the DUO that the map does not know is logged as `poing: live: unmapped 96 04 7F`. That line is what to put in the map.
 
 ### Tested without the hardware
 
-Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a hidden, muted Poing. The `live` tool reads the decks back, and `midi k=out` reads the LEDs Poing sent. The run, 2026-10-24, on glacier, used a copy of "It's Autumn" on both decks:
+Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a hidden, muted Poing. The `live` tool reads the decks back, and `midi k=out` reads the LEDs Poing sent. [`app/live/live_test.sh`](../app/live/live_test.sh) is the run below; its header says how to start the Poing it drives. If every deck stays at 0.0 s, the audio output did not open: the callback never ran. Once, "Remote Audio" refused with `Initialize: HRESULT 0x80070005`, and starting Poing again fixed it. The run, 2026-10-24, on glacier, used a copy of "It's Autumn" on both decks:
 
 1. **The two decks out of step.**
    - Deck 2's tempo fader went to +3% (`B1 00 57`, `B1 20 7F`).

@@ -40,6 +40,8 @@ pub enum Act {
     FxSelect,
     FxDepth,
     FxBeats(i8),
+    /// A control the DUO has that Poing does not use (not logged as unmapped).
+    Ignore,
 }
 
 /// The four stems a deck mutes, in pad order.
@@ -59,7 +61,7 @@ impl Act {
         match self {
             LoopSize | Scratch | Nudge => Kind::Relative,
             Tempo | Trim | EqHigh | EqMid | EqLow | Color | Fader | XFader | FxDepth => Kind::Absolute,
-            Level => Kind::Output,
+            Level | Ignore => Kind::Output,
             _ => Kind::Button,
         }
     }
@@ -135,7 +137,7 @@ impl Map {
             let Some(&name) = words.get(2) else { return Err(bad("no action")) };
             let mut rest = words[3..].iter().copied().peekable();
             // the deck, for the actions that have one
-            let master = matches!(name, "xfader" | "fx_on" | "fx_select" | "fx_depth" | "fx_beats");
+            let master = matches!(name, "xfader" | "fx_on" | "fx_select" | "fx_depth" | "fx_beats" | "ignore");
             let deck = if master {
                 0
             } else {
@@ -177,6 +179,7 @@ impl Map {
                 "fx_select" => Act::FxSelect,
                 "fx_depth" => Act::FxDepth,
                 "fx_beats" => Act::FxBeats(if arg()?.starts_with('-') { -1 } else { 1 }),
+                "ignore" => Act::Ignore,
                 _ => return Err(bad("unknown action")),
             };
             let mut c = Control { status: if status & 0xf0 == 0x80 { status | 0x10 } else { status }, data1, act, deck, hires: false, invert: false, led: true };
@@ -313,6 +316,7 @@ mod tests {
         // unknown: nothing (the caller logs it); the meter is output only
         assert_eq!(act(&m, [0x96, 0x0c, 0x7f]), None);
         assert_eq!(act(&m, [0xb0, 0x02, 0x40]), None);
+        assert_eq!(act(&m, [0x91, 0x3f, 0x7f]), None, "shift is known but does nothing itself");
         assert!(m.led(1, Act::HotCue(2)).is_some_and(|c| c.status == 0x96 && c.data1 == 0x01));
         assert!(m.led(0, Act::Level).is_some_and(|c| c.status == 0xb0 && c.data1 == 0x02));
     }

@@ -108,6 +108,8 @@ impl App {
             }
         } else {
             shared.decks.on.store(false, Ordering::Relaxed);
+            // the song waits at its playhead (Space may have started it meanwhile)
+            shared.set_playing(false);
             cx.stop_timer(self.live_pump);
             self.live_pump = Timer::empty();
         }

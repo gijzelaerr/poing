@@ -105,3 +105,36 @@ B4 34 fx_select
 B4 5B fx_depth
 B4 4C fx_beats -1
 B4 4D fx_beats 1
+
+# ---- on the DUO, not used by Poing (so they are not logged as unmapped)
+# shift (the DUO sends shifted pads, cue and loop as their own notes)
+90 3F ignore
+91 3F ignore
+# jog search (shift + jog), needle search, the touch panel's master, quantize,
+# slip, vinyl, master tempo and auto cue buttons
+B0 29 ignore
+B1 29 ignore
+B0 1C ignore
+B1 1C ignore
+90 1E ignore
+91 1E ignore
+90 09 ignore
+91 09 ignore
+90 2B ignore
+91 2B ignore
+90 12 ignore
+91 12 ignore
+90 11 ignore
+91 11 ignore
+90 0F ignore
+91 0F ignore
+# headphone cue, crossfader curve, beat FX auto/tap (shift + beat), browse
+B4 46 ignore
+B4 47 ignore
+B4 5F ignore
+B4 78 ignore
+B4 79 ignore
+B4 4F ignore
+B4 60 ignore
+90 33 ignore
+90 61 ignore
