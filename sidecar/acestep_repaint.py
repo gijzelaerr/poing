@@ -75,6 +75,12 @@ def main():
         a = max(0.0, float(job["start"]) - margin)
         b = min(len(audio) / sr, float(job["end"]) + margin)
         take = audio[int(a * sr):int(b * sr)]
+        if src_sr != sr:
+            # the source at ACE-Step's rate (an mp3 is often 44.1 kHz), so the margins line up
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(sr, src_sr)
+            src, src_sr = resample_poly(src, sr // g, src_sr // g, axis=0), sr
         # ACE-Step normalises its output (about -1 dB). The margins are the original
         # spliced back in, so the gain they show is undone to make the seams exact.
         if src_sr == sr and src.shape[1] == take.shape[1]:

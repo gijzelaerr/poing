@@ -1342,12 +1342,11 @@ const REGION_VERSIONS: usize = 3;
 /// yet can only repaint it.
 fn wants_regenerate(st: &EditorState, r: usize, text: &str) -> bool {
     let Some(reg) = st.project.regions().get(r) else { return false };
-    if !st.project.is_analysed() || text.trim().is_empty() || model::is_fix_text(text) {
+    if !st.project.is_analysed() {
         return true;
     }
     let track = st.project.track_index(&reg.track).map(|i| st.project.tracks[i].id.clone()).unwrap_or_default();
-    let flagged = reg.kind == "bad" || reg.kind == "regenerate";
-    flagged && matches!(lane_intent(text, &track), LaneIntent::Replace(ref i) if i.is_none() || i.as_deref() == Some(track.as_str()))
+    model::region_regenerates(text, &track, reg.kind == "bad" || reg.kind == "regenerate")
 }
 
 /// What ACE-Step is told the new part should be: the Describe words (unless

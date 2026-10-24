@@ -280,6 +280,21 @@ pub fn is_fix_text(text: &str) -> bool {
     has_fix_word(&w) || w.iter().any(|w| w == "bad" || w == "wrong" || w == "slecht")
 }
 
+/// Describe on a region of lane `track` asks for the region to be made again:
+/// nothing said, words that ask for it ("fix this"), or, on a region marked bad
+/// or regenerate, anything but an effect, an echo change, a new part or
+/// another instrument (those keep their own paths).
+pub fn region_regenerates(text: &str, track: &str, flagged: bool) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    match lane_intent(text, track) {
+        LaneIntent::Effect | LaneIntent::Dereverb | LaneIntent::AddLayer(_) | LaneIntent::AddWhat => false,
+        LaneIntent::Replace(Some(i)) if i != track => false,
+        LaneIntent::Replace(_) => flagged || is_fix_text(text),
+    }
+}
+
 /// "Fix all the bad spots", "redo every marked region": each region marked
 /// bad is made again.
 pub fn is_fix_marks_text(text: &str) -> bool {
@@ -1019,6 +1034,14 @@ mod tests {
         }
         for t in ["less echo", "tape saturation", "funky slap bass", ""] {
             assert!(!is_fix_text(t), "{t}");
+        }
+        for t in ["fix this", "make this part better", "", "sing it clearly"] {
+            assert!(region_regenerates(t, "vocals", true), "{t}");
+        }
+        assert!(region_regenerates("fix this", "other", false));
+        assert!(!region_regenerates("sing it clearly", "other", false), "a plain region: Describe as before");
+        for t in ["add another guitar here", "make it better with a plate reverb", "less echo, better", "make it a warm rhodes, better"] {
+            assert!(!region_regenerates(t, "other", true), "{t}");
         }
         for t in ["fix all the bad spots", "Fix the bad marks", "redo every marked region", "repair each bad part"] {
             assert!(is_fix_marks_text(t), "{t}");
