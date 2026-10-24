@@ -17,8 +17,8 @@
 //! The prompt format is Qwen's own chat template as Makepad's hub renders it
 //! (`makepad_ai_hub::local_llm::build_prefix`: a `<tools>` block, calls as
 //! `<tool_call><function=..><parameter=..>`). The turn templates and the
-//! tool-call parser below are copies of the hub's (`local_llm.rs`,
-//! `local_llm/worker.rs`), which are crate-private there.
+//! tool-call parser are the hub's too (`user_message`, `tool_responses`,
+//! `ASSISTANT_OPEN`, `parse_tool_call`).
 //!
 //!     -> {"id":1,"system":"...","tools":[{"name":..,"description":..,"parameters":"{..}"}],
 //!         "messages":[{"role":"user","content":".."},{"role":"assistant","content":"<raw>"},
@@ -29,7 +29,7 @@
 //!     <- {"event":"error","id":1,"message":".."}
 
 use crate::models;
-use makepad_ai_hub::local_llm::{build_prefix, ToolSpec};
+use makepad_ai_hub::local_llm::{build_prefix, parse_tool_call, tool_responses, user_message, ToolSpec, ASSISTANT_OPEN};
 use makepad_ai_llm::{LlamaSamplerState, LlamaSamplingParams, LlamaSession, LlamaSessionConfig, LlamaSessionState};
 use makepad_micro_serde::*;
 use std::io::BufRead;
@@ -228,9 +228,6 @@ fn append(session: &mut LlamaSession, held: &mut String, text: &str) -> Result<(
     Ok(())
 }
 
-/// The template's empty thinking block: Qwen3.5 answers without thinking.
-const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-
 /// The messages after the system prefix, ending ready for the assistant.
 /// Tool results go back as one user turn of `<tool_response>` blocks.
 fn render(messages: &[Message]) -> String {
@@ -241,20 +238,15 @@ fn render(messages: &[Message]) -> String {
         match m.role.as_str() {
             "assistant" => out.push_str(&format!("{ASSISTANT_OPEN}{}<|im_end|>\n", m.content)),
             "tool" => {
-                out.push_str("<|im_start|>user\n");
+                let mut results = Vec::new();
                 while i < messages.len() && messages[i].role == "tool" {
-                    out.push_str("<tool_response>\n");
-                    if messages[i].error == Some(true) {
-                        out.push_str("ERROR: ");
-                    }
-                    out.push_str(&messages[i].content);
-                    out.push_str("\n</tool_response>\n");
+                    results.push((messages[i].content.clone(), messages[i].error == Some(true)));
                     i += 1;
                 }
-                out.push_str("<|im_end|>\n");
+                out.push_str(&tool_responses(&results));
                 continue;
             }
-            _ => out.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", m.content)),
+            _ => out.push_str(&user_message(&m.content)),
         }
         i += 1;
     }
@@ -269,8 +261,9 @@ fn render(messages: &[Message]) -> String {
 fn generate(session: &mut LlamaSession, max_tokens: usize, temperature: f32, presence_penalty: f32) -> Result<(String, usize, bool, bool), String> {
     let mut decoder = session.vocab().text_decoder();
     // Qwen3.5's suggested non-thinking sampling: top_p 0.8, top_k 20.
-    // (at temperature 0 the decode is plain greedy: Makepad's sampler skips
-    // its penalties there, and a near-zero temperature underflows its softmax)
+    // (at temperature 0 the decode is plain greedy, without the penalties;
+    // a near-zero temperature with a penalty no longer underflows since
+    // poing-pin-20261024c)
     let params = LlamaSamplingParams { temperature, top_p: 0.8, top_k: 20, seed: seed(), presence_penalty, penalty_last_n: 1024, ..Default::default() };
     let mut sampler = LlamaSamplerState::new(params.seed);
     let stops = session.stop_tokens();
@@ -335,33 +328,6 @@ fn split_turn(raw: &str) -> (String, Vec<(String, Vec<(String, String)>)>) {
     }
     text.push_str(rest);
     (text.trim().to_string(), calls)
-}
-
-/// `<function=NAME>` and a run of `<parameter=key>\nvalue\n</parameter>`
-/// (Makepad's `local_llm::parse_tool_call`). Values stay strings.
-fn parse_tool_call(body: &str) -> Result<(String, Vec<(String, String)>), String> {
-    let function_at = body.find("<function=").ok_or("missing <function=")?;
-    let rest = &body[function_at + "<function=".len()..];
-    let name_end = rest.find(['>', '\n']).ok_or("unterminated function name")?;
-    let name = rest[..name_end].trim().to_string();
-    if name.is_empty() {
-        return Err("empty function name".into());
-    }
-    let mut args = Vec::new();
-    let mut cursor = &rest[name_end..];
-    while let Some(param_at) = cursor.find("<parameter=") {
-        let param_rest = &cursor[param_at + "<parameter=".len()..];
-        let Some(key_end) = param_rest.find('>') else { break };
-        let key = param_rest[..key_end].trim().to_string();
-        let value_rest = &param_rest[key_end + 1..];
-        let value_end = value_rest.find("</parameter>").unwrap_or(value_rest.len());
-        let raw = &value_rest[..value_end];
-        let raw = raw.strip_prefix("\r\n").or_else(|| raw.strip_prefix('\n')).unwrap_or(raw);
-        let raw = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n')).unwrap_or(raw);
-        args.push((key, raw.to_string()));
-        cursor = &value_rest[value_end..];
-    }
-    Ok((name, args))
 }
 
 #[cfg(test)]
