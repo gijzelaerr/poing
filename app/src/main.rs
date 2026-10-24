@@ -9,12 +9,15 @@ pub use makepad_widgets;
 
 mod agent;
 mod audio;
+mod deckmap;
+mod decks;
 mod djexport;
 mod export;
 mod fx;
 mod fx_writer;
 mod listen;
 mod live;
+mod live_view;
 mod llm;
 mod plugins;
 mod remote;
@@ -173,6 +176,21 @@ script_mod! {
         draw_bg +: {color: #x181a20 border_radius: 10.0 border_size: 1.0 border_color: HAIRLINE}
     }
 
+    // Live mode: a deck's panel, and its big readouts.
+    let DeckPanel = RoundedView{
+        width: Fill height: Fill flow: Down spacing: 10
+        padding: Inset{left: 20 right: 20 top: 18 bottom: 18}
+        show_bg: true
+        draw_bg +: {color: #x181a20 border_radius: 12.0 border_size: 1.0 border_color: HAIRLINE}
+    }
+    let DeckBig = Label{
+        draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 22}}
+    }
+    let DeckLine = Label{
+        width: Fill
+        draw_text +: {color: TEXT text_style: theme.font_regular{font_size: 10.5}}
+    }
+
     // The start screen's three ways in.
     let HomeCard = RoundedView{
         width: 300 height: 240 flow: Down spacing: 10
@@ -282,6 +300,10 @@ script_mod! {
                                     text_style: theme.font_regular{font_size: 10.5}
                                 }
                             }
+                        }
+                        live_btn := PillButton{
+                            margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
+                            text: "Live"
                         }
                         render_btn := PillButton{
                             margin: Inset{top: 3 bottom: 0 left: 0 right: 0}
@@ -512,6 +534,57 @@ script_mod! {
                         export_done := PillButton{text: "Done"}
                     }
 
+                    // Live: two decks played from the OMNIS-DUO (docs/LIVE.md).
+                    live_view := View{
+                        visible: false
+                        width: Fill height: Fill flow: Down spacing: 14
+                        padding: Inset{left: 36 right: 36 top: 26 bottom: 22}
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 14
+                            align: Align{y: 0.5}
+                            Label{
+                                text: "Live"
+                                draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 20}}
+                            }
+                            live_status := Caption{width: Fill text: ""}
+                            live_done := PillButton{text: "Back to the song"}
+                        }
+                        View{
+                            width: Fill height: Fill flow: Right spacing: 14
+                            DeckPanel{
+                                d0_title := CardTitle{text: ""}
+                                d0_time := DeckBig{text: ""}
+                                d0_info := DeckLine{text: ""}
+                                d0_pads := DeckLine{text: ""}
+                                d0_stems := DeckLine{text: ""}
+                                d0_loop := DeckLine{text: ""}
+                                d0_mix := CardText{text: ""}
+                            }
+                            RoundedView{
+                                width: 230 height: Fill flow: Down spacing: 10
+                                padding: Inset{left: 18 right: 18 top: 18 bottom: 18}
+                                show_bg: true
+                                draw_bg +: {color: #x14161b border_radius: 12.0 border_size: 1.0 border_color: HAIRLINE}
+                                Caption{text: "Tempo"}
+                                live_bpm := DeckBig{text: ""}
+                                Caption{text: "Crossfader"}
+                                live_xf := DeckLine{text: ""}
+                                Caption{text: "Beat FX"}
+                                live_fx := DeckLine{text: ""}
+                            }
+                            DeckPanel{
+                                d1_title := CardTitle{text: ""}
+                                d1_time := DeckBig{text: ""}
+                                d1_info := DeckLine{text: ""}
+                                d1_pads := DeckLine{text: ""}
+                                d1_stems := DeckLine{text: ""}
+                                d1_loop := DeckLine{text: ""}
+                                d1_mix := CardText{text: ""}
+                            }
+                        }
+                        live_help := CardText{text: "Pads 1-4: hot cues. Shift + pads: mute vocals, drums, bass, other. Loop encoder: beat loop (turn for its size). Arrows: previous or next section. Load: the song in front onto that deck. The map is app/live/omnis-duo.map; a copy in Poing's config folder overrides it."}
+                    }
+
                     timeline_box := View{
                         width: Fill height: Fill flow: Down
                         timeline := mod.widgets.DawTimeline{}
@@ -687,6 +760,19 @@ pub struct App {
     /// A download offered in the offer bar, and what to do once it is in.
     #[rust]
     offer: Option<model_view::Offer>,
+    /// Live mode (two decks from the OMNIS-DUO) is showing, its readouts'
+    /// timer, the controller map and its ports, and deck songs the audio
+    /// thread may still hold.
+    #[rust]
+    live_shown: bool,
+    #[rust]
+    live_pump: Timer,
+    #[rust]
+    live_map: Option<std::sync::Arc<deckmap::Map>>,
+    #[rust]
+    live_ports: (Vec<u64>, Vec<u64>),
+    #[rust]
+    live_retired: Vec<std::sync::Arc<decks::DeckSong>>,
 }
 
 /// The song a job belongs to, in front or in a background tab.
@@ -843,16 +929,50 @@ enum Open {
 /// keys are text; otherwise they are shortcuts (a clicked button keeps the
 /// focus but does not want keys).
 /// MIDI keyboards: a thread takes their notes as they come and queues them
-/// straight to the audio thread (the selected MIDI lane plays them).
-fn start_midi_input(cx: &mut Cx, shared: std::sync::Arc<audio::Shared>) {
+/// straight to the audio thread (the selected MIDI lane plays them). The live
+/// controller's port goes to the decks instead (while live mode is on), and
+/// its lights are written back from here.
+fn start_midi_input(cx: &mut Cx, shared: std::sync::Arc<audio::Shared>, map: std::sync::Arc<deckmap::Map>) {
     let mut input = cx.midi_input();
-    let _ = std::thread::Builder::new().name("poing-midi".into()).spawn(move || loop {
-        while let Some((_, data)) = input.receive() {
-            if let MidiEvent::Note(n) = data.decode() {
-                shared.live.key(n.note_number, n.velocity, n.is_on);
+    let output = cx.midi_output();
+    let _ = std::thread::Builder::new().name("poing-midi".into()).spawn(move || {
+        let mut dec = deckmap::Decoder::default();
+        let mut leds = decks::Leds::default();
+        let mut lit_at = std::time::Instant::now();
+        let mut was_on = false;
+        // injected test messages arrive on the port named after the map's
+        let injected = makepad_widgets::makepad_platform::midi_inject::port_id_for("OMNIS-DUO").0 .0;
+        loop {
+            while let Some((port, data)) = input.receive() {
+                if shared.decks.is_port(port.0 .0) || port.0 .0 == injected {
+                    if shared.decks.on() {
+                        shared.decks.midi(&map, &mut dec, data.data);
+                    }
+                    continue;
+                }
+                if let MidiEvent::Note(n) = data.decode() {
+                    shared.live.key(n.note_number, n.velocity, n.is_on);
+                }
             }
+            let on = shared.decks.on();
+            if on && lit_at.elapsed().as_millis() >= 30 {
+                lit_at = std::time::Instant::now();
+                if !was_on {
+                    leds.reset();
+                }
+                let mut ports: Vec<u64> = shared.decks.outputs().collect();
+                if ports.is_empty() {
+                    ports.push(injected);
+                }
+                for m in leds.update(&map, &shared.decks) {
+                    for p in &ports {
+                        output.send(Some(MidiPortId(LiveId(*p))), MidiData { data: m });
+                    }
+                }
+            }
+            was_on = on;
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
     });
 }
 
@@ -1817,6 +1937,7 @@ impl App {
         ui.view(cx, ids!(export_sheet)).set_visible(cx, false);
         ui.view(cx, ids!(describe_frame)).set_visible(cx, song);
         ui.button(cx, ids!(render_btn)).set_visible(cx, song);
+        ui.button(cx, ids!(live_btn)).set_visible(cx, song);
         if !song {
             ui.button(cx, ids!(play_btn)).set_visible(cx, false);
             ui.button(cx, ids!(pause_btn)).set_visible(cx, false);
@@ -1824,8 +1945,9 @@ impl App {
             ui.label(cx, ids!(project_meta)).set_text(cx, "");
         }
         for id in [ids!(timeline_box), ids!(inspector_box)] {
-            ui.view(cx, id).set_visible(cx, song);
+            ui.view(cx, id).set_visible(cx, song && !self.live_shown);
         }
+        ui.view(cx, ids!(live_view)).set_visible(cx, song && self.live_shown);
         self.refresh_tabs(cx);
         ui.redraw(cx);
     }
@@ -1914,7 +2036,7 @@ impl App {
         remember_song(&st.path);
         if first {
             audio::start_output(cx, st.shared.clone(), st.sr());
-            start_midi_input(cx, st.shared.clone());
+            start_midi_input(cx, st.shared.clone(), self.live_map());
         }
         if analyse {
             self.start_analysis(&mut st);
@@ -2514,6 +2636,12 @@ impl App {
         if self.home_shown {
             self.show_song_view(cx, true);
         }
+        if call.tool == "live" {
+            return match self.live_tool(cx, &a) {
+                Ok((line, data)) => ToolResult::ok(&id, line, "").with_data(data),
+                Err(e) => ToolResult::refused(&id, e),
+            };
+        }
         let Some(st) = self.state.as_mut() else { return ToolResult::unavailable(&id, "no song is open") };
         let lanes = st.project.tracks.len();
         let result: Result<String, String> = match call.tool.as_str() {
@@ -2906,7 +3034,7 @@ impl App {
             self.export_shown = false;
             ui.view(cx, ids!(export_sheet)).set_visible(cx, false);
             ui.view(cx, ids!(home)).set_visible(cx, false);
-            for id in [ids!(timeline_box), ids!(inspector_box)] {
+            for id in [ids!(timeline_box), ids!(inspector_box), ids!(live_view)] {
                 ui.view(cx, id).set_visible(cx, false);
             }
             self.refresh_settings(cx);
@@ -2928,7 +3056,7 @@ impl App {
         ui.view(cx, ids!(settings)).set_visible(cx, false);
         self.export_shown = true;
         ui.view(cx, ids!(export_sheet)).set_visible(cx, true);
-        for id in [ids!(timeline_box), ids!(inspector_box)] {
+        for id in [ids!(timeline_box), ids!(inspector_box), ids!(live_view)] {
             ui.view(cx, id).set_visible(cx, false);
         }
         let Some(st) = self.state.as_ref() else { return };
@@ -3223,6 +3351,15 @@ impl MatchEvent for App {
 
         if ui.button(cx, ids!(play_btn)).clicked(actions) || ui.button(cx, ids!(pause_btn)).clicked(actions) {
             st.toggle_play();
+        }
+        if ui.button(cx, ids!(live_btn)).clicked(actions) {
+            let on = !self.live_shown;
+            self.show_live(cx, on);
+            return;
+        }
+        if ui.button(cx, ids!(live_done)).clicked(actions) {
+            self.show_live(cx, false);
+            return;
         }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
             let on = !self.export_shown;
@@ -3544,6 +3681,9 @@ impl AppMain for App {
                 }
             }
         }
+        if self.live_pump.is_event(event).is_some() {
+            self.pump_live(cx);
+        }
         if self.plugin_watch.is_event(event).is_some() && self.plugin_pump.is_empty() {
             if let Some(said) = self.state.as_mut().filter(|st| st.has_plugins()).and_then(|st| st.pump_plugins()) {
                 self.set_status(cx, &said);
@@ -3617,9 +3757,23 @@ impl AppMain for App {
         if let Event::MidiPorts(ports) = event {
             let inputs = ports.all_inputs();
             cx.use_midi_inputs(&inputs);
-            self.midi_inputs = inputs.len();
             let names: Vec<&str> = ports.descs.iter().filter(|d| d.port_type.is_input()).map(|d| d.name.as_str()).collect();
             log!("poing: MIDI inputs: {}", if names.is_empty() { "none (A to K play)".into() } else { names.join(", ") });
+            // the live controller: its inputs play the decks, only its outputs get lights
+            let map = self.live_map();
+            let dj = |input: bool| ports.descs.iter().filter(|d| d.port_type.is_input() == input && map.is_port(&d.name)).map(|d| d.port_id).collect::<Vec<_>>();
+            let (dj_in, dj_out) = (dj(true), dj(false));
+            if !dj_out.is_empty() {
+                cx.use_midi_outputs(&dj_out);
+            }
+            self.live_ports = (dj_in.iter().map(|p| p.0 .0).collect(), dj_out.iter().map(|p| p.0 .0).collect());
+            if let Some(sh) = &self.shared {
+                sh.decks.set_ports(&self.live_ports.0, &self.live_ports.1);
+            }
+            if !dj_in.is_empty() {
+                log!("poing: live: {} is the live controller (port `{}`)", ports.descs.iter().find(|d| d.port_id == dj_in[0]).map_or("?", |d| d.name.as_str()), map.port);
+            }
+            self.midi_inputs = inputs.len() - dj_in.len();
         }
         let piano = self.piano(cx, event);
         // Shortcuts work anywhere but in a text field (which keeps its own keys).
