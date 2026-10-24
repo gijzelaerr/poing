@@ -33,7 +33,7 @@ pub const BUNDLE_MARK: &str = "{bundle}";
 pub enum WireJob {
     Analyze { audio: String },
     Generate { take: Take, fixture: Yue2Fixture },
-    Repaint { take: Take, src: String, job: RepaintJob },
+    Repaint { takes: Vec<Take>, src: String, job: RepaintJob },
     Dereverb { take: Take, lane: String },
     Layer { take: Take, lego: LegoJob, clean: LayerJob },
     /// Sing the bundle's sheet.json (the client wrote it with Claude).
@@ -233,10 +233,10 @@ pub fn outbound(job: &Job) -> Option<(PathBuf, u32, Outbound)> {
             o.job = WireJob::Generate { take: take.clone(), fixture: fixture.clone() };
             (bundle, *sr, o)
         }
-        Job::Repaint { bundle, take, src, job, sr } => {
+        Job::Repaint { bundle, takes, src, job, sr } => {
             let mut o = blank();
             let src = o.take_along(bundle, src);
-            o.job = WireJob::Repaint { take: take.clone(), src, job: job.clone() };
+            o.job = WireJob::Repaint { takes: takes.clone(), src, job: job.clone() };
             (bundle, *sr, o)
         }
         Job::Dereverb { bundle, take, lane, sr } => {
@@ -333,9 +333,11 @@ pub fn job_on_node(wire: WireJob, bundle: &Path, sr: u32) -> Result<Job, String>
             safe_rel(&take.file).ok_or("bad take file")?;
             Job::Generate { bundle: b, take, fixture, sr }
         }
-        WireJob::Repaint { take, src, job } => {
-            safe_rel(&take.file).ok_or("bad take file")?;
-            Job::Repaint { bundle: b, take, src: at(&src)?, job, sr }
+        WireJob::Repaint { takes, src, job } => {
+            for take in &takes {
+                safe_rel(&take.file).ok_or("bad take file")?;
+            }
+            Job::Repaint { bundle: b, takes, src: at(&src)?, job, sr }
         }
         WireJob::Dereverb { take, lane } => {
             safe_rel(&take.file).ok_or("bad take file")?;
@@ -546,6 +548,8 @@ mod tests {
             seed: 7,
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         }
     }
 

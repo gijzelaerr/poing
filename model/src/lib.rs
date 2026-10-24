@@ -59,6 +59,10 @@ pub struct Take {
     pub track: Option<String>,
     /// How much of a lane or layer take is heard, 0..1.
     pub blend: Option<f64>,
+    /// The region mark it was made for (a version of that marked range).
+    pub region: Option<String>,
+    /// Kept: chosen over its other versions, so it plays whenever the song opens.
+    pub kept: Option<bool>,
 }
 
 impl Take {
@@ -74,6 +78,9 @@ impl Take {
     }
     pub fn blend(&self) -> f64 {
         self.blend.unwrap_or(1.0)
+    }
+    pub fn is_kept(&self) -> bool {
+        self.kept.unwrap_or(false)
     }
 }
 
@@ -237,6 +244,65 @@ pub fn snap_to_downbeats(start: f64, end: f64, downbeats: &[f64]) -> (f64, f64) 
     } else {
         (start, end)
     }
+}
+
+/// A marked range made again: widened to the downbeat at or before its start
+/// and the one at or after its end (a hair's tolerance either way), so the
+/// new part comes in and leaves on the one. Without downbeats there, as marked.
+pub fn pad_to_downbeats(start: f64, end: f64, downbeats: &[f64]) -> (f64, f64) {
+    const TOL: f64 = 0.05;
+    let a = downbeats.iter().copied().filter(|d| *d <= start + TOL).fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.max(d))));
+    let b = downbeats.iter().copied().filter(|d| *d >= end - TOL).fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.min(d))));
+    let (a, b) = (a.unwrap_or(start), b.unwrap_or(end));
+    if b > a + 0.5 {
+        (a, b)
+    } else {
+        (start, end)
+    }
+}
+
+/// Words that ask for a part to be made again ("fix", "better", "opnieuw").
+const FIX_WORDS: [&str; 15] =
+    ["fix", "better", "improve", "again", "redo", "regenerate", "remake", "repair", "retry", "repaint", "beter", "opnieuw", "herstel", "verbeter", "another"];
+
+fn words(t: &str) -> Vec<String> {
+    t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+}
+
+fn has_fix_word(words: &[String]) -> bool {
+    words.iter().any(|w| FIX_WORDS.iter().any(|k| w == k || (k.len() > 4 && w.starts_with(k))))
+}
+
+/// Describe on a marked region that asks for it to be made again ("fix
+/// this", "make this part better", "try again", "maak dit beter").
+pub fn is_fix_text(text: &str) -> bool {
+    let w = words(text);
+    has_fix_word(&w) || w.iter().any(|w| w == "bad" || w == "wrong" || w == "slecht")
+}
+
+/// Describe on a region of lane `track` asks for the region to be made again:
+/// nothing said, words that ask for it ("fix this"), or, on a region marked bad
+/// or regenerate, anything but an effect, an echo change, a new part or
+/// another instrument (those keep their own paths).
+pub fn region_regenerates(text: &str, track: &str, flagged: bool) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    match lane_intent(text, track) {
+        LaneIntent::Effect | LaneIntent::Dereverb | LaneIntent::AddLayer(_) | LaneIntent::AddWhat => false,
+        LaneIntent::Replace(Some(i)) if i != track => false,
+        LaneIntent::Replace(_) => flagged || is_fix_text(text),
+    }
+}
+
+/// "Fix all the bad spots", "redo every marked region": each region marked
+/// bad is made again.
+pub fn is_fix_marks_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let w = words(&t);
+    let marks = ["spot", "mark", "region", "bad part", "bad bit", "plek", "stukken"].iter().any(|m| t.contains(m));
+    let all = w.iter().any(|x| ["all", "every", "each", "alle", "elke"].contains(&x.as_str()));
+    has_fix_word(&w) && marks && (all || w.iter().any(|x| x == "bad" || x == "slechte"))
 }
 
 /// The Demucs stem that holds a lego track (htdemucs: vocals, drums, bass, other).
@@ -817,6 +883,8 @@ mod tests {
             file: "takes/t4.wav".into(),
             track: Some("vocals".into()),
             blend: Some(0.65),
+            region: None,
+            kept: None,
         };
         assert_eq!(t.slot(), "lane:vocals");
         t.scope = "layer".into();
@@ -856,6 +924,8 @@ mod tests {
             file: "takes/t1.wav".into(),
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         };
         p.takes_mut().push(take);
         assert_eq!(p.next_take(), ("t2".to_string(), 1966));
@@ -946,5 +1016,55 @@ mod tests {
         assert_eq!(region("regenerate", -6.0).factor(), 1.0);
         assert_eq!(region("bad", -6.0).factor(), 1.0);
         assert!((region("gain", -6.0).factor() - 0.501).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_region_pads_out_to_its_downbeats() {
+        let db = [10.0, 12.0, 14.0, 16.0, 18.0];
+        assert_eq!(pad_to_downbeats(12.7, 15.2, &db), (12.0, 16.0));
+        assert_eq!(pad_to_downbeats(12.02, 15.98, &db), (12.0, 16.0), "on the one already: kept");
+        assert_eq!(pad_to_downbeats(20.0, 22.0, &db), (18.0, 22.0), "past the last downbeat: as marked there");
+        assert_eq!(pad_to_downbeats(1.0, 3.0, &[]), (1.0, 3.0));
+    }
+
+    #[test]
+    fn fix_words() {
+        for t in ["fix this", "make this part better", "try again", "Regenerate", "maak dit beter", "this is bad", "improve it"] {
+            assert!(is_fix_text(t), "{t}");
+        }
+        for t in ["less echo", "tape saturation", "funky slap bass", ""] {
+            assert!(!is_fix_text(t), "{t}");
+        }
+        for t in ["fix this", "make this part better", "", "sing it clearly"] {
+            assert!(region_regenerates(t, "vocals", true), "{t}");
+        }
+        assert!(region_regenerates("fix this", "other", false));
+        assert!(!region_regenerates("sing it clearly", "other", false), "a plain region: Describe as before");
+        for t in ["add another guitar here", "make it better with a plate reverb", "less echo, better", "make it a warm rhodes, better"] {
+            assert!(!region_regenerates(t, "other", true), "{t}");
+        }
+        for t in ["fix all the bad spots", "Fix the bad marks", "redo every marked region", "repair each bad part"] {
+            assert!(is_fix_marks_text(t), "{t}");
+        }
+        for t in ["fix this", "the bad spots", "make the chorus better", "more reverb on all the vocals"] {
+            assert!(!is_fix_marks_text(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn region_versions_round_trip() {
+        let dir = std::env::temp_dir().join(format!("poing-model-takes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("project.json");
+        let mut p = project(vec![region("bad", 0.0)]);
+        p.takes_mut().push(Take {
+            id: "t1".into(), scope: "section".into(), start: 0.0, end: 2.0, engine: "acestep".into(), prompt: "p".into(), seed: 1,
+            file: "takes/t1.wav".into(), track: None, blend: None, region: Some("r1".into()), kept: Some(true),
+        });
+        p.save(&path).unwrap();
+        let back = Project::load(&path).unwrap();
+        assert_eq!(back.takes()[0].region.as_deref(), Some("r1"));
+        assert!(back.takes()[0].is_kept());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

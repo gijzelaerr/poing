@@ -173,10 +173,13 @@ impl EditorState {
             path.hash(&mut h);
             h.finish() | 1
         };
+        // past the ids takes still name too, so a new mark never inherits old versions
         let next_region = project
             .regions()
             .iter()
-            .filter_map(|r| r.id.trim_start_matches('r').parse::<u64>().ok())
+            .map(|r| r.id.as_str())
+            .chain(project.takes().iter().filter_map(|t| t.region.as_deref()))
+            .filter_map(|id| id.trim_start_matches('r').parse::<u64>().ok())
             .max()
             .unwrap_or(0)
             + 1;
@@ -1312,6 +1315,55 @@ impl EditorState {
         }
     }
 
+    /// The versions made for region `id` (see `regenerate_region`), oldest first.
+    pub fn region_versions(&self, id: &str) -> Vec<String> {
+        self.project.takes().iter().filter(|t| t.region.as_deref() == Some(id)).map(|t| t.id.clone()).collect()
+    }
+
+    /// Keep take `id`, one version of a marked region, in one undo step: its
+    /// other versions go, and so does the mark (it is done). A section version
+    /// stays on and plays whenever the song opens; a lane version goes into
+    /// its lane, like Keep in the lane.
+    pub fn keep_version(&mut self, id: &str) -> Result<String, String> {
+        let i = self.project.take_index(id).ok_or("no such take")?;
+        let take = self.project.takes()[i].clone();
+        let region = take.region.clone().ok_or("this take was not made for a marked region")?;
+        let n = take.id.trim_start_matches('t').to_string();
+        let message = if take.scope == "section" {
+            self.checkpoint();
+            self.project.takes_mut()[i].kept = Some(true);
+            if !self.take_on(id) {
+                self.toggle_take(id);
+            }
+            format!("Take {n} is kept: it plays there from now on (Ctrl+Z undoes it)")
+        } else {
+            self.keep_take(id)?
+        };
+        for other in self.region_versions(&region).into_iter().filter(|o| o != id) {
+            self.delete_take(&other)?;
+        }
+        if let Some(r) = self.project.regions().iter().position(|r| r.id == region) {
+            self.project.regions_mut().remove(r);
+            self.push_mix();
+        }
+        if let Some(t) = self.project.take_index(id) {
+            self.project.takes_mut()[t].region = None;
+        }
+        self.sel_changed = true;
+        self.save()?;
+        Ok(message)
+    }
+
+    /// Kept versions of marked regions play again when the song is reopened.
+    pub fn restore_kept(&mut self) {
+        let kept: Vec<String> = self.project.takes().iter().filter(|t| t.is_kept()).map(|t| t.id.clone()).collect();
+        for id in kept {
+            if !self.take_on(&id) {
+                self.toggle_take(&id);
+            }
+        }
+    }
+
     /// Sections combined from remixes play again when the song is reopened
     /// (the newest one per section wins, as when they were made).
     pub fn restore_combined(&mut self) {
@@ -1359,6 +1411,8 @@ impl EditorState {
             seed,
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         };
         audio::write_wav(&self.dir().join(&take.file), &part.l, &part.r, self.sr(), 1.0).map_err(|e| e.to_string())?;
         let stem = part;

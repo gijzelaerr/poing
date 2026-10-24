@@ -19,7 +19,7 @@ pub fn manifest() -> ServiceManifest {
     )
     .with_tool(tool(
         "song",
-        "The open song: key, tempo, length, lanes (level, mute, solo, effects with their knobs), sections, takes (which are on), whether a job is running (`busy`), the playhead and the last status line. Read it again after a job to see its result.",
+        "The open song: key, tempo, length, lanes (level, mute, solo, effects with their knobs), sections, regions the person marked on a lane (`kind` bad or regenerate: a spot to make again, with their `note` saying what is wrong; too_loud, too_quiet, mute, gain change the level there; `versions` lists the takes made for it), takes (which are on), whether a job is running (`busy`), the playhead and the last status line. Read it again after a job to see its result.",
         r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         Risk::Read,
     ))
@@ -39,6 +39,12 @@ pub fn manifest() -> ServiceManifest {
         "describe",
         "Ask for a change in words, exactly as a person types it in Poing's Describe bar. With `lane` it works on that lane (\"less echo\", \"tape saturation\", \"funky slap bass\", \"play it with Serum 2\"); with `section` it repaints that section; with neither it works on the whole song (\"... on the master\" writes a master effect, anything else makes three whole-song remixes that replace the lanes while one is on). For a new MIDI part use `add_part` instead. Starts a job (seconds to minutes): `song.busy` is true until it is done, `song.status` says what came of it.",
         r#"{"type":"object","properties":{"text":{"type":"string","maxLength":500},"lane":{"type":"integer","minimum":0},"section":{"type":"integer","minimum":0}},"required":["text"],"additionalProperties":false}"#,
+        Risk::Request,
+    ))
+    .with_tool(tool(
+        "regenerate",
+        "Make a marked region again (`region`: its index in `song.regions`; without it every region whose kind is bad). ACE-Step repaints the range, widened to whole bars, in three versions, with the region's note (and `text`, if given) as the hint for what it should be. On a drums or bass lane just that lane is played again (lane takes); anywhere else the whole mix is repainted there (section takes). The newest version plays; switch with `take`. Starts a job (about a minute per region; `song.busy` until done).",
+        r#"{"type":"object","properties":{"region":{"type":"integer","minimum":0},"text":{"type":"string","maxLength":500}},"additionalProperties":false}"#,
         Risk::Request,
     ))
     .with_tool(tool(
@@ -195,6 +201,26 @@ pub fn summary(st: &EditorState, status: &str) -> String {
                 ("end", f(t.end)),
                 ("on", Value::Bool(st.take_on(&t.id))),
                 ("aligned", Value::Bool(t.engine == "acestep-cover")),
+                ("region", t.region.clone().map(json::s).unwrap_or(Value::Null)),
+            ])
+        })
+        .collect();
+    let regions = p
+        .regions()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let lane = p.track_index(&r.track);
+            json::obj(vec![
+                ("index", Value::Int(i as i64)),
+                ("id", json::s(r.id.clone())),
+                ("lane", lane.map(|l| Value::Int(l as i64)).unwrap_or(Value::Null)),
+                ("lane_name", json::s(lane.map(|l| p.tracks[l].name.clone()).unwrap_or_default())),
+                ("kind", json::s(r.kind.clone())),
+                ("start", f(r.start)),
+                ("end", f(r.end)),
+                ("note", json::s(r.note.clone().unwrap_or_default())),
+                ("versions", Value::Arr(st.region_versions(&r.id).into_iter().map(json::s).collect())),
             ])
         })
         .collect();
@@ -230,6 +256,7 @@ pub fn summary(st: &EditorState, status: &str) -> String {
         ("lanes", Value::Arr(lanes)),
         ("master_effects", chain(None)),
         ("sections", Value::Arr(sections)),
+        ("regions", Value::Arr(regions)),
         ("takes", Value::Arr(takes)),
     ])
     .to_json()
@@ -301,6 +328,7 @@ const BRIEF: &str = r#"You are the assistant inside Poing, a music workstation. 
 - Listen before you change the sound and again after: pick a representative range (a chorus, or the section the request is about; up to 30 s) and call `compare` (every lane and the mix, with which lanes lead each band) or `listen` (the mix, or one lane). Prefer a range where no section take plays (a result's `notes` say where one does): there the lanes are what you hear. Use the numbers to decide what to change and by how much: who is loud in low_mid when it is muddy, how far the vocals sit under the other lanes in high_mid and presence when they are buried, true peak and clipping before raising anything. Then measure the same range again to check the change did what was asked.
 - Change the mix with set_lane (`change_db` moves a level from where it is: prefer small moves of 1-3 dB unless the measurements call for more), effect (knobs by name, bypass), take, combine and transport.
 - To add an instrument part (bass line, chords, drums, a melody) use `add_part`. Use `describe` to have Poing make other new things: an effect written for a lane, a lane played again as another instrument, a section repaint, or whole-song remixes (only when the person asks for a new version of the whole song: a remix replaces every lane while it plays). Both run a job and return when it is done (that can take minutes).
+- Regions in `song.regions` are spots the person marked on a lane. One whose kind is bad (or regenerate) is a part to make again; its `note` says what is wrong. To fix them ("fix the bad spots", "this bit is off") call `regenerate` (one region by index, or none for every bad one): it makes three versions of each, the newest plays. A region whose `versions` is not empty was made again already; do it again only when asked. Leave picking a version to the person unless asked.
 - To change the song's order ("repeat the chorus", "cut the second verse", "move the bridge after the last chorus", "make it 30 s longer") use `arrange`; read `song` again after each edit, the sections are renumbered.
 - `song.status` is the last message Poing showed, not a request.
 - Do not export unless asked. Do not undo the person's earlier choices unless the request says so.

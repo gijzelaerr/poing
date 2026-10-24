@@ -633,6 +633,8 @@ mod tests {
             file: format!("takes/{id}.wav"),
             track: track.map(String::from),
             blend: None,
+            region: None,
+            kept: None,
         };
         *p.takes_mut() = vec![take("t1", "section", 15.75, 24.25, None, "copy"), take("t2", "lane", 0.0, 32.0, Some("b"), "dereverb"), take("t3", "song", 0.0, 32.0, None, "acestep-cover")];
         p.takes_made = Some(3);
@@ -742,6 +744,8 @@ mod tests {
             file: format!("takes/{id}.wav"),
             track: None,
             blend: None,
+            region: None,
+            kept: None,
         };
         let audio = |len: f64, k: f32| Stem::new(vec![k; (len * 1000.0) as usize], vec![k; (len * 1000.0) as usize]);
         st.project.analysis = Some(crate::model::Analysis {
@@ -777,5 +781,42 @@ mod tests {
         assert_eq!(arranged_file("original.mp3", 3), "original.a3.wav");
         assert_eq!(arranged_file("takes/t4.wav", 2), "takes/t4.a2.wav");
         assert_eq!(arranged_file("stems/my.alto.wav", 2), "stems/my.alto.a2.wav");
+    }
+
+    #[test]
+    fn a_regions_versions_share_a_slot_and_keeping_one_drops_the_rest() {
+        use crate::model::Region;
+        let dir = std::env::temp_dir().join(format!("poing-region-versions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = song(&dir);
+        st.project.regions_mut().push(Region { id: "r1".into(), track: "a".into(), start: 9.0, end: 12.5, kind: "bad".into(), gain_db: None, note: Some("too busy".into()) });
+        // three versions as the repaint hands them over: the range plus margins, the same length each
+        for id in ["t4", "t5", "t6"] {
+            let take = Take { id: id.into(), scope: "section".into(), start: 7.0, end: 14.0, engine: "acestep".into(), prompt: "fix this".into(), seed: 1, file: format!("takes/{id}.wav"), track: None, blend: None, region: Some("r1".into()), kept: None };
+            st.add_take(take, Stem::new(vec![0.5; 7000], vec![0.5; 7000])).unwrap();
+        }
+        assert_eq!(st.region_versions("r1"), ["t4", "t5", "t6"]);
+        assert!(st.take_on("t6") && !st.take_on("t4") && !st.take_on("t5"), "the newest plays, alone in its slot");
+        st.toggle_take("t5");
+        assert!(st.take_on("t5") && !st.take_on("t6"), "switching to another version replaces it");
+        let said = st.keep_version("t5").unwrap();
+        assert!(said.starts_with("Take 5 is kept"), "{said}");
+        let ids: Vec<&str> = st.project.takes().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t2", "t3", "t5"]);
+        assert!(st.project.regions().is_empty(), "the mark is done");
+        assert_eq!(st.stems.len(), st.project.tracks.len() + 4);
+        // it plays when the song opens again
+        let p = Project::load(&dir.join("project.json")).unwrap();
+        assert!(p.takes()[3].is_kept());
+        let stems = st.stems.iter().map(|s| Stem::new(s.l.clone(), s.r.clone())).collect();
+        let mut again = EditorState::new(p, dir.join("project.json"), stems, None);
+        again.restore_kept();
+        assert!(again.take_on("t5"));
+        // one undo brings the other versions and the mark back
+        st.undo(false);
+        assert_eq!(st.region_versions("r1"), ["t4", "t5", "t6"]);
+        assert_eq!(st.project.regions().len(), 1);
+        assert!(!st.project.takes()[4].is_kept());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
