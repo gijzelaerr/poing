@@ -51,7 +51,8 @@ pub struct Pack {
 pub struct Unpack {
     pub zip: String,
     pub into: String,
-    /// What it takes unpacked.
+    /// What unpacking adds once the zip is gone (the pack's size is then
+    /// files + this).
     pub bytes: u64,
 }
 

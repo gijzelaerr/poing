@@ -50,7 +50,7 @@ cat <<JSON
     "sha256": "$(sha256sum "$ZIP" | cut -d' ' -f1)"
   }
 ],
-"unpack": { "zip": "$NAME.zip", "into": "bin", "bytes": $(du -sb "$OUT" | cut -f1) }
+"unpack": { "zip": "$NAME.zip", "into": "bin", "bytes": $(( $(du -sb "$OUT" | cut -f1) - $(stat -c %s "$ZIP") )) }
 JSON
 }
 

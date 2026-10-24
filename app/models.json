@@ -267,7 +267,7 @@
       "unpack": {
         "zip": "poing-engine-cuda.zip",
         "into": "bin",
-        "bytes": 645540735
+        "bytes": 182798292
       }
     },
     {
