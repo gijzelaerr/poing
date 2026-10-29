@@ -33,6 +33,12 @@ pub fn range_of(role: &str) -> (u8, u8) {
         "strings:viola" => (48, 88),
         "strings:cello" => (36, 76),
         "strings:bass" => (28, 60),
+        "winds" => (34, 96),
+        "winds:flute" => (60, 96),
+        "winds:oboe" => (58, 89),
+        "winds:clarinet" => (50, 89),
+        "winds:bassoon" => (34, 72),
+        "winds:horn" => (40, 77),
         _ => (55, 91),
     }
 }
@@ -56,6 +62,34 @@ pub fn strings_role_for(tags: &str) -> &'static str {
 
 fn is_strings(role: &str) -> bool {
     role == "strings" || role.starts_with("strings:")
+}
+
+/// The winds role for a sound (flute, oboe ...), from its tags.
+pub fn winds_role_for(tags: &str) -> &'static str {
+    let t = tags.to_lowercase();
+    if t.contains("flute") || t.contains("piccolo") {
+        "winds:flute"
+    } else if t.contains("oboe") {
+        "winds:oboe"
+    } else if t.contains("clarinet") {
+        "winds:clarinet"
+    } else if t.contains("bassoon") {
+        "winds:bassoon"
+    } else if t.contains("horn") {
+        "winds:horn"
+    } else {
+        "winds"
+    }
+}
+
+pub fn is_winds(role: &str) -> bool {
+    role == "winds" || role.starts_with("winds:")
+}
+
+/// Strings and winds: orchestral parts for a sample library (held notes,
+/// dynamics from the controller curve, humanised when they come in).
+pub fn is_orchestral(role: &str) -> bool {
+    is_strings(role) || is_winds(role)
 }
 
 /// Bars of the song: bar 1 starts on the first downbeat.
@@ -139,6 +173,12 @@ straight lines between the points. Sampled orchestral instruments get their
 dynamics from it, not from velocity."#;
 
 /// What a strings part is asked for, on top of the brief.
+const WINDS: &str = "This is an orchestral wind instrument played by a sampled library, so write it as a \
+player breathes: one melodic line (a second voice only for a held harmony note), phrases of two to four bars \
+with a breath (a rest of at least half a beat) between them, mostly legato with notes of a beat or longer and \
+only a few shorter passing notes, a shape that rises to the phrase's high point and falls back. Always give a \
+DYNAMICS line: each phrase swells and relaxes.";
+
 const STRINGS: &str = "This is an orchestral string section played by a sampled library, so write it as string players would play it: three or four voices (low strings, violas, second and first violins) with smooth voice leading (each voice moves by step or holds), long legato notes (chords last a bar or more, melody notes at least a beat, a note may overlap the next by a sixteenth for a legato join), no short stabs or repeated notes, rests where the strings should breathe. Always give a DYNAMICS line: swell into new sections and peaks, fall back in breakdowns, never flat for long.";
 
 /// The `DYNAMICS:` line of an answer as controller 1 points (in grid beats).
@@ -250,6 +290,12 @@ pub fn problems(notes: &[Note], role: &str, range: (f64, f64), key: Option<&str>
     if off > 0 {
         out.push(format!("{off} notes fall outside the requested bars"));
     }
+    if is_winds(role) && !notes.is_empty() {
+        let short = notes.iter().filter(|n| n.len < 0.5).count() as f64 / notes.len() as f64;
+        if short > 0.4 {
+            out.push(format!("{:.0}% of the notes are shorter than half a beat: a wind melody sings in longer notes, with only a few short passing notes", short * 100.0));
+        }
+    }
     if is_strings(role) && !notes.is_empty() {
         let short = notes.iter().filter(|n| n.len < 1.0).count() as f64 / notes.len() as f64;
         if short > 0.4 {
@@ -309,7 +355,11 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
     let extra = match role.strip_prefix("strings:") {
         Some(section) => format!("\n{STRINGS}\nOnly the {section} section plays this part (other sections may come as parts of their own): write it in two voices, divided, inside its range."),
         None if role == "strings" => format!("\n{STRINGS}"),
-        None => String::new(),
+        None => match role.strip_prefix("winds:") {
+            Some(instrument) => format!("\n{WINDS}\nThe instrument is a {instrument}: keep inside its range."),
+            None if role == "winds" => format!("\n{WINDS}"),
+            None => String::new(),
+        },
     };
     let ask_for = format!(
         "The song:\n{sheet}\nWrite a {role} part for bars {b0}-{last}, pitch range {lo}-{hi}: \"{request}\"{in_key}{extra}"
@@ -325,8 +375,8 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
             Ok((name, mut notes, cc)) => {
                 fit(&mut notes, range);
                 let mut found = problems(&notes, role, range, key.as_deref());
-                if is_strings(role) && cc.is_empty() {
-                    found.push("give the DYNAMICS line (the strings' loudness over time)".into());
+                if is_orchestral(role) && cc.is_empty() {
+                    found.push("give the DYNAMICS line (the part's loudness over time)".into());
                 }
                 let w = Written { name, notes, cc, problems: found, rounds: round };
                 if w.problems.is_empty() {
@@ -394,6 +444,10 @@ mod tests {
         assert_eq!(strings_role_for("Bowed Strings, Violin"), "strings:violin");
         assert_eq!(strings_role_for("Bowed Strings, Double Bass"), "strings:bass");
         assert_eq!(strings_role_for("Synth Pad"), "strings");
+        assert_eq!(winds_role_for("Flute, Concert"), "winds:flute");
+        assert_eq!(range_of("winds:flute"), (60, 96));
+        let stabs: Vec<Note> = (0..8).map(|i| Note { start: i as f64 * 0.25, len: 0.25, pitch: 72, vel: 0.8 }).collect();
+        assert!(problems(&stabs, "winds:flute", (0.0, 32.0), None).iter().any(|x| x.contains("half a beat")));
         let low: Vec<Note> = [(45, 0.0), (60, 0.0)].iter().map(|&(p, s)| Note { start: s, len: 4.0, pitch: p, vel: 0.8 }).collect();
         let p = problems(&low, "strings:violin", (0.0, 32.0), Some("A minor"));
         assert!(p.iter().any(|x| x.contains("outside the pitch range 55-100")), "{p:?}");

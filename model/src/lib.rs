@@ -6,6 +6,7 @@ use makepad_micro_serde::*;
 use std::path::{Path, PathBuf};
 
 pub mod arrange;
+pub mod humanize;
 pub mod record;
 
 #[derive(SerJson, DeJson, Clone, Debug)]

@@ -907,6 +907,20 @@ impl EditorState {
         Ok(saved)
     }
 
+    /// Humanise MIDI lane `lane` (timing, legato, velocity, dynamics swells): one undo step.
+    pub fn humanize_lane(&mut self, lane: usize, amount: f64, seed: u64) -> Result<usize, String> {
+        let spb = poing_model::BeatGrid::of(&self.project).seconds_per_beat();
+        let t = self.project.tracks.get(lane).filter(|t| t.is_midi()).ok_or("that lane has no notes")?;
+        let (mut notes, mut cc) = (t.notes.clone().unwrap_or_default(), t.cc.clone().unwrap_or_default());
+        poing_model::humanize::humanize(&mut notes, &mut cc, poing_model::humanize::Humanize { amount, seconds_per_beat: spb, seed });
+        self.checkpoint();
+        let n = notes.len();
+        self.project.tracks[lane].cc = (!cc.is_empty()).then_some(cc);
+        self.set_notes(lane, notes);
+        self.sel_changed = true;
+        Ok(n)
+    }
+
     /// Set lane `lane`'s level automation (dB over seconds; empty clears it).
     pub fn set_automation(&mut self, lane: usize, mut points: Vec<poing_model::GainPoint>) -> Result<(), String> {
         let t = self.project.tracks.get_mut(lane).ok_or("no such lane")?;

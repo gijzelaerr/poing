@@ -2501,6 +2501,13 @@ impl App {
                     let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     st.analysing = None;
                     let code = synth::BUILTIN.iter().find(|(r, _, _)| *r == role).map(|(_, _, c)| *c).unwrap_or(synth::BUILTIN[2].2);
+                    // an orchestral part is played, not quantised: humanised as it comes in
+                    let (mut notes, mut cc) = (notes, cc);
+                    if midi_writer::is_orchestral(&role) {
+                        let seed = notes.len() as u64 * 7919 + st.project.tracks.len() as u64;
+                        let spb = model::BeatGrid::of(&st.project).seconds_per_beat();
+                        model::humanize::humanize(&mut notes, &mut cc, model::humanize::Humanize { amount: 0.6, seconds_per_beat: spb, seed });
+                    }
                     match st.add_midi_track(&name, code, notes, cc, Some(request)) {
                         Ok(lane) => {
                             st.select(Selection::Track(lane));
@@ -2677,12 +2684,13 @@ impl App {
                 }
             },
             "add_part" => match (get(&a, "role").and_then(|v| v.as_str()), get(&a, "text").and_then(|v| v.as_str())) {
-                (Some(role @ ("bass" | "keys" | "lead" | "drums" | "strings")), Some(text)) => {
+                (Some(role @ ("bass" | "keys" | "lead" | "drums" | "strings" | "winds")), Some(text)) => {
                     let role: &'static str = match role {
                         "bass" => "bass",
                         "keys" => "keys",
                         "drums" => "drums",
                         "strings" => "strings",
+                        "winds" => "winds",
                         _ => "lead",
                     };
                     match index(&a, "section") {
@@ -2694,6 +2702,7 @@ impl App {
                             // strings for one section's sound (violins, celli ...) keep to its range
                             let role: &'static str = match (&st.next_sound, role) {
                                 (Some(sound), "strings") => midi_writer::strings_role_for(&sound.types),
+                                (Some(sound), "winds") => midi_writer::winds_role_for(&sound.types),
                                 _ => role,
                             };
                             st.next_instrument = if st.next_sound.is_some() { None } else { named.as_deref().and_then(|n| named_plugin(st, n)) };
@@ -2711,7 +2720,7 @@ impl App {
                         }
                     }
                 }
-                _ => Err("give a role (bass, keys, lead, drums or strings) and the style in `text`".into()),
+                _ => Err("give a role (bass, keys, lead, drums, strings or winds) and the style in `text`".into()),
             },
             "regenerate" => {
                 let text = get(&a, "text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2760,6 +2769,14 @@ impl App {
             "save_sound" => match (index(&a, "lane").filter(|&l| l < lanes), get(&a, "name").and_then(|v| v.as_str())) {
                 (Some(l), Some(name)) => st.save_sound(l, name).map(|s| format!("Kept {} ({}) as a sound.", s.name, s.plugin)),
                 _ => Err("give a lane and a name".into()),
+            },
+            "humanize" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
+                None => Err("no such MIDI lane".into()),
+                Some(l) => {
+                    let amount = get(&a, "amount").and_then(num).unwrap_or(0.6);
+                    let seed = get(&a, "seed").and_then(|v| v.as_u64()).unwrap_or(l as u64 + 1);
+                    st.humanize_lane(l, amount, seed).map(|n| format!("{}: {n} notes humanised ({amount:.1})", st.project.tracks[l].name))
+                }
             },
             "automate" => match index(&a, "lane").filter(|&l| l < lanes) {
                 None => Err("no such lane".into()),

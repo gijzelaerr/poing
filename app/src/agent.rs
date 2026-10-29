@@ -49,8 +49,8 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "add_part",
-        "Have Claude write a new MIDI part on the song's key, chords and beat grid, as a new lane: `role` is bass, keys, lead, drums or strings (an orchestral section: held voiced notes and a dynamics curve, for a sampled library); `text` says the style (\"walking upright bass, smooth jazz\"); `section` limits it to that section; `instrument` names a sound from `sounds` (\"Strings: Discover - Violins 1\", what most sample libraries need) or an installed VST3 instrument (else Poing's built-in synth). Returns when the part is in (about a minute).",
-        r#"{"type":"object","properties":{"role":{"type":"string","enum":["bass","keys","lead","drums","strings"]},"text":{"type":"string","maxLength":500},"section":{"type":"integer","minimum":0},"instrument":{"type":"string"}},"required":["role","text"],"additionalProperties":false}"#,
+        "Have Claude write a new MIDI part on the song's key, chords and beat grid, as a new lane: `role` is bass, keys, lead, drums or strings (an orchestral section: held voiced notes and a dynamics curve, for a sampled library), winds (one breathing melodic line: flute, oboe, clarinet, bassoon, horn; give their sound); orchestral parts come in humanised; `text` says the style (\"walking upright bass, smooth jazz\"); `section` limits it to that section; `instrument` names a sound from `sounds` (\"Strings: Discover - Violins 1\", what most sample libraries need) or an installed VST3 instrument (else Poing's built-in synth). Returns when the part is in (about a minute).",
+        r#"{"type":"object","properties":{"role":{"type":"string","enum":["bass","keys","lead","drums","strings","winds"]},"text":{"type":"string","maxLength":500},"section":{"type":"integer","minimum":0},"instrument":{"type":"string"}},"required":["role","text"],"additionalProperties":false}"#,
         Risk::Request,
     ))
     .with_tool(tool(
@@ -69,6 +69,12 @@ pub fn manifest() -> ServiceManifest {
         "save_sound",
         "Keep the plugin playing a MIDI lane, as it is now, as a named sound for later parts (after an instrument was chosen in its own window, e.g. a Kontakt library).",
         r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"name":{"type":"string","maxLength":120}},"required":["lane","name"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
+        "humanize",
+        "Make a MIDI lane sound played rather than quantised: timing a little off the grid (chord notes not all at once), legato notes overlapping the next (sample libraries play legato transitions), varied velocities, long notes that swell and taper on the dynamics curve, a slow drift in expression. `amount` 0..1 (0.6 default; strings and winds parts already come in at 0.6), `seed` for another take of it. One undo step.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"amount":{"type":"number","minimum":0,"maximum":1},"seed":{"type":"integer","minimum":0}},"required":["lane"],"additionalProperties":false}"#,
         Risk::Act,
     ))
     .with_tool(tool(
