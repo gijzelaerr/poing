@@ -1449,8 +1449,7 @@ dependencies = [
 [[package]]
 name = "vst3-host"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57a1b316200861ab8b9f634c587e882b796cb2fa8005d9f6c6d21df42386e896"
+source = "git+https://github.com/gijzelaerr/rust-vst3-host?rev=9c067903fc4d3451448ab1ac3ba372b9778b4027#9c067903fc4d3451448ab1ac3ba372b9778b4027"
 dependencies = [
  "core-foundation",
  "crossbeam-queue",

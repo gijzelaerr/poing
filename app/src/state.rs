@@ -46,6 +46,16 @@ pub struct PluginInfo {
     pub bridge: Option<(u64, u64)>,
 }
 
+/// A plugin's second instance for measuring the song.
+#[cfg(windows)]
+struct MeasurePlugin {
+    path: String,
+    instrument: bool,
+    state: Option<Vec<u8>>,
+    handle: crate::plugins::Handle,
+    shared: crate::plugins::Shared,
+}
+
 pub struct EditorState {
     pub project: Project,
     pub path: PathBuf,
@@ -114,6 +124,10 @@ pub struct EditorState {
     /// rack holds them any more.
     #[cfg(windows)]
     retiring: Vec<crate::plugins::Handle>,
+    /// Second instances of the song's plugins for `listen` and `compare`, by
+    /// effect or track id, kept between measurements (a sample player loads once).
+    #[cfg(windows)]
+    measure_plugins: HashMap<String, MeasurePlugin>,
     /// MIDI lanes played by a plugin: track id -> the plugin path loaded for it.
     pub inst_plugins: HashMap<String, String>,
     /// Plugin instruments loaded but not yet in a rack.
@@ -121,6 +135,10 @@ pub struct EditorState {
     pending_insts: Vec<(String, crate::plugins::Shared)>,
     /// A plugin to play the MIDI part Claude is writing (named in the Describe).
     pub next_instrument: Option<(String, PathBuf)>,
+    /// The named sound the next written MIDI part is played by (wins over `next_instrument`).
+    pub next_sound: Option<crate::sounds::SoundInfo>,
+    /// A state a lane's plugin instrument loads with next (a chosen sound), by track id.
+    next_state: HashMap<String, Vec<u8>>,
     /// A remix asked for when the song was dropped: made once it is understood.
     pub pending_remix: Option<String>,
     /// Describe from the bar (not from an agent's tool): a request with nothing
@@ -215,7 +233,11 @@ impl EditorState {
             note_len: 1.0,
             inst_shaders: HashMap::new(),
             inst_controls: HashMap::new(),
-            plugin_library: crate::plugins::library(),
+            plugin_library: {
+                let lib = crate::plugins::library();
+                crate::sounds::warm(lib.clone());
+                lib
+            },
             plugin_params: HashMap::new(),
             #[cfg(windows)]
             plugins: HashMap::new(),
@@ -223,10 +245,14 @@ impl EditorState {
             pending_runners: Vec::new(),
             #[cfg(windows)]
             retiring: Vec::new(),
+            #[cfg(windows)]
+            measure_plugins: HashMap::new(),
             inst_plugins: HashMap::new(),
             #[cfg(windows)]
             pending_insts: Vec::new(),
             next_instrument: None,
+            next_sound: None,
+            next_state: HashMap::new(),
             pending_remix: None,
             agent_ok: false,
             ask_agent: None,
@@ -306,7 +332,7 @@ impl EditorState {
             .collect();
         for (i, t) in self.project.tracks.iter().enumerate() {
             let Some(notes) = &t.notes else { continue };
-            let events = crate::synth::events(notes, &grid, sr);
+            let events = crate::synth::events(notes, t.cc.as_deref().unwrap_or_default(), &grid, sr);
             if t.instrument.as_ref().is_some_and(|f| f.plugin.is_some()) {
                 // its instance arrives by install or adopt
                 #[cfg(windows)]
@@ -354,7 +380,7 @@ impl EditorState {
     }
 
     /// A new MIDI lane: notes played by an instrument written as code.
-    pub fn add_midi_track(&mut self, name: &str, code: &str, notes: Vec<poing_model::Note>, prompt: Option<String>) -> Result<usize, String> {
+    pub fn add_midi_track(&mut self, name: &str, code: &str, notes: Vec<poing_model::Note>, cc: Vec<poing_model::Cc>, prompt: Option<String>) -> Result<usize, String> {
         fx::compile_instrument(code)?;
         self.checkpoint();
         let n = (1..).find(|n| self.project.track_index(&format!("midi{n}")).is_none()).unwrap_or(1);
@@ -377,6 +403,8 @@ impl EditorState {
             fx: None,
             notes: Some(notes),
             instrument: Some(instrument),
+            cc: (!cc.is_empty()).then_some(cc),
+            automation: None,
         });
         // the stem set is tracks then takes: a silent placeholder goes in between
         let mut lanes: Vec<Arc<Stem>> = self.stems[..tracks].to_vec();
@@ -732,13 +760,87 @@ impl EditorState {
         (rack, missing)
     }
 
+    /// A rack to measure the song with (`listen`, `compare`): the song's plugins
+    /// played by second instances with the state they have now, kept for the
+    /// next measurement. Names the plugins that would not load.
+    pub fn measure_rack(&mut self) -> (FxRack, Vec<String>) {
+        #[allow(unused_mut)]
+        let mut rack = self.make_rack();
+        #[allow(unused_mut)]
+        let mut missing = Vec::new();
+        #[cfg(windows)]
+        {
+            let mut wanted: Vec<(String, Fx, bool)> = self.all_fx().into_iter().filter(|f| f.plugin.is_some()).map(|f| (f.id.clone(), f, false)).collect();
+            for t in self.project.tracks.iter().filter(|t| t.is_midi()) {
+                if let Some(inst) = t.instrument.clone().filter(|f| f.plugin.is_some()) {
+                    wanted.push((t.id.clone(), inst, true));
+                }
+            }
+            let keep: Vec<&String> = wanted.iter().map(|(id, _, _)| id).collect();
+            let gone: Vec<String> = self.measure_plugins.keys().filter(|id| !keep.contains(id)).cloned().collect();
+            for id in gone {
+                if let Some(m) = self.measure_plugins.remove(&id) {
+                    self.retiring.push(m.handle);
+                }
+            }
+            let mut late: HashMap<String, u32> = HashMap::new();
+            for (id, fx, instrument) in wanted {
+                let path = fx.plugin.clone().unwrap_or_default();
+                let state = self.plugins.get(&id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&id));
+                let reuse = self.measure_plugins.get_mut(&id).filter(|m| m.path == path && m.instrument == instrument);
+                let shared = match reuse {
+                    Some(m) => {
+                        // the last measurement may have ended inside a note: a new
+                        // lane does not know what this instance still holds
+                        if instrument {
+                            crate::plugins::all_notes_off(&m.shared);
+                        }
+                        if state.is_some() && state != m.state {
+                            if let Ok(mut p) = m.shared.plugin.lock() {
+                                let _ = p.load_state(state.as_deref().unwrap_or_default());
+                            }
+                            m.state = state;
+                        }
+                        late.insert(id.clone(), m.handle.latency());
+                        m.shared.clone()
+                    }
+                    None => {
+                        if let Some(old) = self.measure_plugins.remove(&id) {
+                            self.retiring.push(old.handle);
+                        }
+                        let how = crate::plugins::LoadAs { instrument, isolated: fx.isolated(), realtime: false };
+                        match crate::plugins::load(std::path::Path::new(&path), self.sr(), Some(&fx), state.as_deref(), how) {
+                            Ok((handle, shared)) => {
+                                late.insert(id.clone(), handle.latency());
+                                self.measure_plugins.insert(id.clone(), MeasurePlugin { path, instrument, state, handle, shared: shared.clone() });
+                                shared
+                            }
+                            Err(_) => {
+                                missing.push(fx.name.clone());
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let _ = if instrument { rack.install_instrument(&id, shared) } else { rack.install(&id, shared) };
+            }
+            rack.compensate(&|id| late.get(id).copied().unwrap_or(0));
+        }
+        (rack, missing)
+    }
+
+    /// Any of the song's plugins (measurements then render them one at a time).
+    pub fn has_plugin_sound(&self) -> bool {
+        self.all_fx().iter().any(|f| f.plugin.is_some()) || self.project.tracks.iter().any(|t| t.instrument.as_ref().is_some_and(|i| i.plugin.is_some()))
+    }
+
     /// Load the plugin at `path` to play MIDI lane `id` (UI thread), ready for the next rack.
     fn load_plugin_instrument(&mut self, id: &str, path: &str, inst: &Fx) -> bool {
         #[cfg(windows)]
         let same_place = self.plugins.get(id).map_or(true, |h| h.isolated == inst.isolated());
         #[cfg(not(windows))]
         let same_place = true;
-        if same_place && self.inst_plugins.get(id).is_some_and(|p| p == path) {
+        if same_place && self.inst_plugins.get(id).is_some_and(|p| p == path) && !self.next_state.contains_key(id) {
             return true; // already playing: the rack keeps its instance
         }
         #[cfg(windows)]
@@ -749,7 +851,8 @@ impl EditorState {
             }
             // another plugin was playing this lane: it goes
             self.retire_plugin(id);
-            let state = self.plugin_state(id).filter(|_| self.project.track_index(id).and_then(|l| self.project.tracks[l].instrument.as_ref()).and_then(|i| i.plugin.as_deref()) == Some(path));
+            let chosen = self.next_state.remove(id);
+            let state = chosen.or_else(|| self.plugin_state(id).filter(|_| self.project.track_index(id).and_then(|l| self.project.tracks[l].instrument.as_ref()).and_then(|i| i.plugin.as_deref()) == Some(path)));
             let how = crate::plugins::LoadAs { instrument: true, isolated: inst.isolated(), realtime: true };
             match crate::plugins::load(std::path::Path::new(path), self.sr(), Some(inst), state.as_deref(), how) {
                 Ok((handle, shared)) => {
@@ -773,6 +876,74 @@ impl EditorState {
             self.fx_errors.insert(id.to_string(), "VST3 plugins play on Windows for now".into());
             false
         }
+    }
+
+    /// Play MIDI lane `lane` with a named sound: its plugin, loaded with its state.
+    pub fn set_instrument_sound(&mut self, lane: usize, sound: &crate::sounds::SoundInfo) -> Result<(), String> {
+        let path = self.plugin_library.iter().find(|(n, _)| *n == sound.plugin).map(|(_, p)| p.clone()).ok_or_else(|| format!("{} is not installed", sound.plugin))?;
+        let Some(id) = self.project.tracks.get(lane).filter(|t| t.is_midi()).map(|t| t.id.clone()) else { return Err("that lane has no notes".into()) };
+        let state = crate::sounds::state_of(sound)?;
+        self.next_state.insert(id.clone(), state);
+        let done = self.set_instrument_plugin(lane, &sound.name, &path, Some(format!("sound: {}", sound.name)));
+        self.next_state.remove(&id);
+        done?;
+        // the lane keeps the sound as it is now (its state file), not only the preset
+        self.save_plugin_states();
+        Ok(())
+    }
+
+    /// Keep lane `lane`'s plugin instrument, as it is now, as a named sound.
+    pub fn save_sound(&mut self, lane: usize, name: &str) -> Result<crate::sounds::SoundInfo, String> {
+        let t = self.project.tracks.get(lane).ok_or("no such lane")?;
+        let inst = t.instrument.as_ref().filter(|i| i.plugin.is_some()).ok_or("that lane is not played by a plugin")?;
+        let plugin = std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        #[cfg(windows)]
+        let state = self.plugins.get(&t.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&t.id));
+        #[cfg(not(windows))]
+        let state = self.plugin_state(&t.id);
+        let state = state.ok_or("the plugin gave no state to keep")?;
+        let saved = crate::sounds::save(name, &plugin, "", &state)?;
+        crate::sounds::forget();
+        Ok(saved)
+    }
+
+    /// Set lane `lane`'s level automation (dB over seconds; empty clears it).
+    pub fn set_automation(&mut self, lane: usize, mut points: Vec<poing_model::GainPoint>) -> Result<(), String> {
+        let t = self.project.tracks.get_mut(lane).ok_or("no such lane")?;
+        points.retain(|p| p.t.is_finite() && p.db.is_finite());
+        points.sort_by(|a, b| a.t.total_cmp(&b.t));
+        for p in &mut points {
+            p.db = p.db.clamp(-60.0, 12.0);
+        }
+        t.automation = (!points.is_empty()).then_some(points);
+        self.dirty = true;
+        self.push_mix();
+        self.sel_changed = true;
+        Ok(())
+    }
+
+    /// The articulations lane `lane`'s plugin instrument switches by key (name, key), if it says.
+    pub fn keyswitches(&self, lane: usize) -> Vec<(String, u8)> {
+        #[cfg(windows)]
+        if let Some(h) = self.project.tracks.get(lane).and_then(|t| self.plugins.get(&t.id)) {
+            return h.keyswitches();
+        }
+        let _ = lane;
+        Vec::new()
+    }
+
+    /// Switch lane `lane`'s articulation at grid beat `beat`: a short note on the
+    /// library's keyswitch `key`, a sixteenth before the notes it is for.
+    pub fn add_keyswitch(&mut self, lane: usize, beat: f64, key: u8) -> Result<(), String> {
+        let mut notes = self.project.tracks.get(lane).and_then(|t| t.notes.clone()).ok_or("that lane has no notes")?;
+        let at = (beat - 0.25).max(0.0);
+        notes.retain(|n| !(n.pitch == key && (n.start - at).abs() < 1e-6));
+        notes.push(poing_model::Note { start: at, len: 0.125, pitch: key.min(127), vel: 0.8 });
+        notes.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.pitch.cmp(&b.pitch)));
+        self.checkpoint();
+        self.set_notes(lane, notes);
+        self.sel_changed = true;
+        Ok(())
     }
 
     /// Play MIDI lane `lane` with the installed plugin `name` at `path`.
@@ -1178,6 +1349,8 @@ impl EditorState {
                     fx: None,
                     notes: None,
                     instrument: None,
+                    cc: None,
+                    automation: None,
                 });
                 lanes.push(Arc::new(placed));
                 format!("Take {n} is now a lane of its own")

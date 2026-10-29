@@ -4,7 +4,7 @@
 //! and problems go back for another round.
 
 use crate::llm;
-use poing_model::{BeatGrid, Note, Project};
+use poing_model::{BeatGrid, Cc, Note, Project};
 use std::path::Path;
 
 /// Rounds of write, check, fix.
@@ -27,8 +27,35 @@ pub fn range_of(role: &str) -> (u8, u8) {
         "bass" => (28, 60),
         "keys" => (45, 84),
         "drums" => (35, 59),
+        "strings" => (36, 96),
+        // one string section played by a sound of its own: that instrument's range
+        "strings:violin" => (55, 100),
+        "strings:viola" => (48, 88),
+        "strings:cello" => (36, 76),
+        "strings:bass" => (28, 60),
         _ => (55, 91),
     }
+}
+
+/// The strings role for a sound that is one section (its tags name the
+/// instrument): "strings:violin" and so on; else the whole-section "strings".
+pub fn strings_role_for(tags: &str) -> &'static str {
+    let t = tags.to_lowercase();
+    if t.contains("double bass") || t.contains("contrabass") {
+        "strings:bass"
+    } else if t.contains("cello") {
+        "strings:cello"
+    } else if t.contains("viola") {
+        "strings:viola"
+    } else if t.contains("violin") {
+        "strings:violin"
+    } else {
+        "strings"
+    }
+}
+
+fn is_strings(role: &str) -> bool {
+    role == "strings" || role.starts_with("strings:")
 }
 
 /// Bars of the song: bar 1 starts on the first downbeat.
@@ -104,7 +131,29 @@ Write music that fits: follow the chords as given (bar.beat chord), stay in the
 key, shape the part to the sections (lighter in verses, fuller in choruses),
 leave space where it suits the style, and keep to the requested bars and pitch
 range. For drums use General MIDI numbers: 36 kick, 38 snare, 39 clap,
-42 closed hi-hat, 46 open hi-hat, 49 crash, 45/47/50 toms."#;
+42 closed hi-hat, 46 open hi-hat, 49 crash, 45/47/50 toms.
+
+You may add, after the notes, a line `DYNAMICS: [[bar, beat, level], ...]`: the
+part's loudness over time (level 0-127; pp about 20, mp 60, f 100, ff 127),
+straight lines between the points. Sampled orchestral instruments get their
+dynamics from it, not from velocity."#;
+
+/// What a strings part is asked for, on top of the brief.
+const STRINGS: &str = "This is an orchestral string section played by a sampled library, so write it as string players would play it: three or four voices (low strings, violas, second and first violins) with smooth voice leading (each voice moves by step or holds), long legato notes (chords last a bar or more, melody notes at least a beat, a note may overlap the next by a sixteenth for a legato join), no short stabs or repeated notes, rests where the strings should breathe. Always give a DYNAMICS line: swell into new sections and peaks, fall back in breakdowns, never flat for long.";
+
+/// The `DYNAMICS:` line of an answer as controller 1 points (in grid beats).
+pub fn parse_dynamics(text: &str, bars: Bars) -> Result<Vec<Cc>, String> {
+    use makepad_micro_serde::DeJson;
+    let Some(line) = text.lines().find_map(|l| l.trim().trim_start_matches('`').strip_prefix("DYNAMICS:")) else { return Ok(Vec::new()) };
+    let rows = Vec::<Vec<f64>>::deserialize_json_lenient(line.trim().trim_end_matches('`')).map_err(|e| format!("the DYNAMICS line is not valid JSON: {e:?}"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let [bar, beat, level] = r[..] else { return Err("each DYNAMICS point must be [bar, beat, level]".into()) };
+        out.push(Cc { beat: bars.beat(bar, beat), num: 1, value: (level / 127.0).clamp(0.0, 1.0) });
+    }
+    out.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+    Ok(out)
+}
 
 /// Read the model's answer: the name and the notes (in grid beats), snapped to 1/16.
 pub fn parse_answer(text: &str, bars: Bars) -> Result<(String, Vec<Note>), String> {
@@ -114,8 +163,11 @@ pub fn parse_answer(text: &str, bars: Bars) -> Result<(String, Vec<Note>), Strin
         .find_map(|l| l.trim().strip_prefix("NAME:").map(|n| n.trim().trim_matches('`').to_string()))
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "MIDI part".into());
-    let start = text.find('[').ok_or("no JSON array in the answer")?;
-    let end = text.rfind(']').ok_or("no JSON array in the answer")?;
+    // the notes are the array before any DYNAMICS line
+    let notes_text = text.split("DYNAMICS:").next().unwrap_or(text);
+    let start = notes_text.find('[').ok_or("no JSON array in the answer")?;
+    let end = notes_text.rfind(']').ok_or("no JSON array in the answer")?;
+    let text = notes_text;
     let rows = Vec::<Vec<f64>>::deserialize_json_lenient(&text[start..=end]).map_err(|e| format!("the notes are not valid JSON: {e:?}"))?;
     let mut notes = Vec::with_capacity(rows.len());
     for r in rows {
@@ -198,6 +250,21 @@ pub fn problems(notes: &[Note], role: &str, range: (f64, f64), key: Option<&str>
     if off > 0 {
         out.push(format!("{off} notes fall outside the requested bars"));
     }
+    if is_strings(role) && !notes.is_empty() {
+        let short = notes.iter().filter(|n| n.len < 1.0).count() as f64 / notes.len() as f64;
+        if short > 0.4 {
+            out.push(format!("{:.0}% of the notes are shorter than a beat: strings hold their notes (chords a bar or more, melody notes at least a beat)", short * 100.0));
+        }
+        // a whole section in three or four voices; one section of it (divisi) in two
+        let want = if role == "strings" { 3 } else { 2 };
+        if voices(notes) < want {
+            out.push(if want == 3 {
+                "write three or four voices that sound together (low strings, violas, violins), not one line".into()
+            } else {
+                "write two voices that sound together (the section divided), not one line".into()
+            });
+        }
+    }
     if let (Some(k), Some(sc), false, false) = (key, key.and_then(scale), role == "drums", notes.is_empty()) {
         let share = notes.iter().filter(|n| sc[n.pitch as usize % 12]).count() as f64 / notes.len() as f64;
         if share < MIN_IN_KEY {
@@ -208,10 +275,20 @@ pub fn problems(notes: &[Note], role: &str, range: (f64, f64), key: Option<&str>
     out
 }
 
+/// How many notes sound together most of the time: the median, over the
+/// part's note starts, of the notes sounding there.
+pub fn voices(notes: &[Note]) -> usize {
+    let mut at: Vec<usize> = notes.iter().map(|a| notes.iter().filter(|b| b.start <= a.start + 1e-6 && b.start + b.len > a.start + 1e-6).count()).collect();
+    at.sort_unstable();
+    at.get(at.len() / 2).copied().unwrap_or(0)
+}
+
 /// The result of writing a part.
 pub struct Written {
     pub name: String,
     pub notes: Vec<Note>,
+    /// Controller curves (the DYNAMICS line as controller 1).
+    pub cc: Vec<Cc>,
     pub problems: Vec<String>,
     pub rounds: usize,
 }
@@ -229,8 +306,13 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
         ("drums", _) | (_, None) => String::new(),
         (_, Some((k, numbers))) => format!("\nThe notes of {k} in that range, as MIDI numbers: {numbers}."),
     };
+    let extra = match role.strip_prefix("strings:") {
+        Some(section) => format!("\n{STRINGS}\nOnly the {section} section plays this part (other sections may come as parts of their own): write it in two voices, divided, inside its range."),
+        None if role == "strings" => format!("\n{STRINGS}"),
+        None => String::new(),
+    };
     let ask_for = format!(
-        "The song:\n{sheet}\nWrite a {role} part for bars {b0}-{last}, pitch range {lo}-{hi}: \"{request}\"{in_key}"
+        "The song:\n{sheet}\nWrite a {role} part for bars {b0}-{last}, pitch range {lo}-{hi}: \"{request}\"{in_key}{extra}"
     );
     let mut prompt = ask_for.clone();
     let mut last_written: Option<Written> = None;
@@ -239,11 +321,14 @@ pub fn write_part(request: &str, role: &str, sheet: &str, bars: Bars, range: (f6
         progress(&if round == 1 { format!("{who} is writing the part") } else { format!("{who} is fixing the part") }, (round - 1) as f32 / rounds as f32);
         let answer = if round == 1 { llm::ask(BRIEF, &prompt, MAX_TOKENS, work)? } else { llm::ask_again(BRIEF, &prompt, MAX_TOKENS, work)? };
         let _ = std::fs::write(work.join(format!("answer-{round}.md")), &answer);
-        match parse_answer(&answer, bars) {
-            Ok((name, mut notes)) => {
+        match parse_answer(&answer, bars).and_then(|(name, notes)| Ok((name, notes, parse_dynamics(&answer, bars)?))) {
+            Ok((name, mut notes, cc)) => {
                 fit(&mut notes, range);
-                let found = problems(&notes, role, range, key.as_deref());
-                let w = Written { name, notes, problems: found, rounds: round };
+                let mut found = problems(&notes, role, range, key.as_deref());
+                if is_strings(role) && cc.is_empty() {
+                    found.push("give the DYNAMICS line (the strings' loudness over time)".into());
+                }
+                let w = Written { name, notes, cc, problems: found, rounds: round };
                 if w.problems.is_empty() {
                     return Ok(w);
                 }
@@ -288,6 +373,32 @@ mod tests {
         assert_eq!(key_of("Key: E minor. Tempo: about 125 bpm."), Some("E minor".into()));
         assert_eq!(scale_pitches("E minor", (28, 36)).unwrap(), "28 E, 30 F#, 31 G, 33 A, 35 B, 36 C");
         assert!(scale("Bb major").unwrap()[10] && scale("E minor").unwrap()[7] && !scale("E minor").unwrap()[8]);
+    }
+
+    #[test]
+    fn a_strings_answer_has_dynamics_and_held_voices() {
+        let bars = Bars { first_beat: 0.0, per_bar: 4, count: 8 };
+        let a = "NAME: Strings\n```json\n[[1, 1, 4, 45, 80], [1, 1, 4, 52, 80], [1, 1, 4, 60, 80], [2, 1, 4, 47, 80], [2, 1, 4, 55, 80], [2, 1, 4, 62, 80]]\n```\nDYNAMICS: [[1, 1, 30], [3, 1, 110]]";
+        let (_, notes) = parse_answer(a, bars).unwrap();
+        assert_eq!(notes.len(), 6, "the DYNAMICS array is not read as notes");
+        let cc = parse_dynamics(a, bars).unwrap();
+        assert_eq!(cc, vec![Cc { beat: 0.0, num: 1, value: 30.0 / 127.0 }, Cc { beat: 8.0, num: 1, value: 110.0 / 127.0 }]);
+        assert_eq!(voices(&notes), 3);
+        assert!(problems(&notes, "strings", (0.0, 32.0), Some("A minor")).is_empty(), "{:?}", problems(&notes, "strings", (0.0, 32.0), Some("A minor")));
+        // stabs, one line at a time
+        let stabs: Vec<Note> = (0..16).map(|i| Note { start: i as f64, len: 0.25, pitch: 57, vel: 0.8 }).collect();
+        let p = problems(&stabs, "strings", (0.0, 32.0), Some("A minor"));
+        assert!(p.iter().any(|x| x.contains("shorter than a beat")) && p.iter().any(|x| x.contains("voices")), "{p:?}");
+        assert!(parse_dynamics("no line", bars).unwrap().is_empty());
+        // a violins sound: its range, two voices are enough
+        assert_eq!(strings_role_for("Bowed Strings, Violin"), "strings:violin");
+        assert_eq!(strings_role_for("Bowed Strings, Double Bass"), "strings:bass");
+        assert_eq!(strings_role_for("Synth Pad"), "strings");
+        let low: Vec<Note> = [(45, 0.0), (60, 0.0)].iter().map(|&(p, s)| Note { start: s, len: 4.0, pitch: p, vel: 0.8 }).collect();
+        let p = problems(&low, "strings:violin", (0.0, 32.0), Some("A minor"));
+        assert!(p.iter().any(|x| x.contains("outside the pitch range 55-100")), "{p:?}");
+        let two: Vec<Note> = [(60, 0.0), (64, 0.0)].iter().map(|&(p, s)| Note { start: s, len: 4.0, pitch: p, vel: 0.8 }).collect();
+        assert!(problems(&two, "strings:violin", (0.0, 32.0), None).iter().all(|x| !x.contains("voices")));
     }
 
     #[test]

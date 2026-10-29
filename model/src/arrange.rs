@@ -352,6 +352,22 @@ pub fn apply(p: &mut Project, edit: &Edit, new_id: &mut dyn FnMut() -> String) {
         out.sort_by(|a, b| a.start.total_cmp(&b.start));
         *notes = out;
     }
+    // controller curves and level automation go where their points are heard
+    for t in p.tracks.iter_mut() {
+        if let Some(cc) = t.cc.as_mut() {
+            let mut out: Vec<_> = cc
+                .iter()
+                .flat_map(|c| map_point(pieces, old_grid.time_of(c.beat)).into_iter().map(|at| crate::Cc { beat: new_grid.beat_at(at), ..c.clone() }))
+                .collect();
+            out.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+            *cc = out;
+        }
+        if let Some(auto) = t.automation.as_mut() {
+            let mut out: Vec<_> = auto.iter().flat_map(|g| map_point(pieces, g.t).into_iter().map(|t| crate::GainPoint { t, db: g.db })).collect();
+            out.sort_by(|a, b| a.t.total_cmp(&b.t));
+            *auto = out;
+        }
+    }
 }
 
 /// The song's sections of a kind ("verse", "chorus", ...) a word names.
@@ -580,6 +596,8 @@ mod tests {
             // beat 32 = 16 s (the chorus), beat 40 = 20 s
             notes: Some(vec![Note { start: 32.0, len: 2.0, pitch: 60, vel: 0.8 }, Note { start: 40.0, len: 1.0, pitch: 64, vel: 0.8 }]),
             instrument: None,
+            cc: None,
+            automation: None,
         });
         p
     }

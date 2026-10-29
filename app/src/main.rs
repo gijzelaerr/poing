@@ -27,6 +27,7 @@ mod model_view;
 mod models;
 mod paths;
 mod song_writer;
+mod sounds;
 pub(crate) use poing_model as model;
 mod state;
 mod timeline;
@@ -1638,6 +1639,13 @@ fn extend_song(st: &mut EditorState, jobs: &Jobs, bundle: PathBuf, secs: f64, te
     format!("Making the song {secs:.0} s longer as take {n} (about a minute)...")
 }
 
+/// A sound the text names exactly, else the best sound matching all its words.
+fn named_sound(st: &EditorState, text: &str) -> Option<sounds::SoundInfo> {
+    let lib = sounds::cached(&st.plugin_library);
+    let exact = lib.iter().find(|s| s.name.eq_ignore_ascii_case(text.trim())).cloned();
+    exact.or_else(|| sounds::search(&lib, text).first().map(|s| (*s).clone()))
+}
+
 /// Describe that names an installed plugin ("Raum on the vocals"): put it on
 /// the lane, or the master. None when no plugin is named.
 /// An installed plugin the text names: (name, bundle path).
@@ -2489,19 +2497,23 @@ impl App {
                     st.analysing = Some((message, progress));
                     line
                 }
-                JobUpdate::MidiReady { bundle, name, role, notes, request, note } => {
+                JobUpdate::MidiReady { bundle, name, role, notes, cc, request, note } => {
                     let Some(st) = song_in(&mut self.state, &mut self.others, &bundle) else { continue };
                     st.analysing = None;
                     let code = synth::BUILTIN.iter().find(|(r, _, _)| *r == role).map(|(_, _, c)| *c).unwrap_or(synth::BUILTIN[2].2);
-                    match st.add_midi_track(&name, code, notes, Some(request)) {
+                    match st.add_midi_track(&name, code, notes, cc, Some(request)) {
                         Ok(lane) => {
                             st.select(Selection::Track(lane));
-                            let by = match st.next_instrument.take() {
-                                Some((plugin, path)) => match st.set_instrument_plugin(lane, &plugin, &path, None) {
+                            let by = match (st.next_sound.take(), st.next_instrument.take()) {
+                                (Some(sound), _) => match st.set_instrument_sound(lane, &sound) {
+                                    Ok(()) => sound.name,
+                                    Err(e) => format!("Poing's {role} ({} could not play it: {e})", sound.name),
+                                },
+                                (None, Some((plugin, path))) => match st.set_instrument_plugin(lane, &plugin, &path, None) {
                                     Ok(()) => plugin,
                                     Err(e) => format!("Poing's {role} ({plugin} could not play it: {e})"),
                                 },
-                                None => format!("Poing's {role}"),
+                                (None, None) => format!("Poing's {role}"),
                             };
                             format!("{name} is a new MIDI lane ({note}), played by {by}. Click a note to move it, drag its end to lengthen, Delete removes it.")
                         }
@@ -2665,11 +2677,12 @@ impl App {
                 }
             },
             "add_part" => match (get(&a, "role").and_then(|v| v.as_str()), get(&a, "text").and_then(|v| v.as_str())) {
-                (Some(role @ ("bass" | "keys" | "lead" | "drums")), Some(text)) => {
+                (Some(role @ ("bass" | "keys" | "lead" | "drums" | "strings")), Some(text)) => {
                     let role: &'static str = match role {
                         "bass" => "bass",
                         "keys" => "keys",
                         "drums" => "drums",
+                        "strings" => "strings",
                         _ => "lead",
                     };
                     match index(&a, "section") {
@@ -2677,9 +2690,15 @@ impl App {
                         sel => {
                             st.select(sel.map_or(Selection::None, Selection::Section));
                             let named = get(&a, "instrument").and_then(|v| v.as_str()).map(|n| n.to_string());
-                            st.next_instrument = named.as_deref().and_then(|n| named_plugin(st, n));
-                            if named.is_some() && st.next_instrument.is_none() {
-                                Err(format!("no installed instrument called {}", named.unwrap_or_default()))
+                            st.next_sound = named.as_deref().and_then(|n| named_sound(st, n));
+                            // strings for one section's sound (violins, celli ...) keep to its range
+                            let role: &'static str = match (&st.next_sound, role) {
+                                (Some(sound), "strings") => midi_writer::strings_role_for(&sound.types),
+                                _ => role,
+                            };
+                            st.next_instrument = if st.next_sound.is_some() { None } else { named.as_deref().and_then(|n| named_plugin(st, n)) };
+                            if named.is_some() && st.next_instrument.is_none() && st.next_sound.is_none() {
+                                Err(format!("no sound or installed instrument called {} (see `sounds`)", named.unwrap_or_default()))
                             } else if st.analysing.is_some() {
                                 Err("a job is still running; try again when song.busy is false".into())
                             } else {
@@ -2692,7 +2711,7 @@ impl App {
                         }
                     }
                 }
-                _ => Err("give a role (bass, keys, lead or drums) and the style in `text`".into()),
+                _ => Err("give a role (bass, keys, lead, drums or strings) and the style in `text`".into()),
             },
             "regenerate" => {
                 let text = get(&a, "text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2711,6 +2730,80 @@ impl App {
                     (None, Some(_)) => Err("no region is marked bad; give `region` to make another one again".into()),
                 }
             }
+            "sounds" => {
+                let q = get(&a, "query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let lib = sounds::cached(&st.plugin_library);
+                let hits = sounds::search(&lib, &q);
+                let data = makepad_strict_json::Value::Arr(
+                    hits.iter()
+                        .take(25)
+                        .map(|s| {
+                            makepad_strict_json::obj(vec![
+                                ("name", makepad_strict_json::s(s.name.clone())),
+                                ("plugin", makepad_strict_json::s(s.plugin.clone())),
+                                ("tags", makepad_strict_json::s(s.types.clone())),
+                                ("saved", makepad_strict_json::Value::Bool(s.saved)),
+                            ])
+                        })
+                        .collect(),
+                );
+                let line = format!("{} sounds match \"{q}\" ({} in the library)", hits.len(), lib.len());
+                return ToolResult::ok(&id, line, "").with_data(data.to_json());
+            }
+            "set_sound" => match (index(&a, "lane").filter(|&l| l < lanes), get(&a, "sound").and_then(|v| v.as_str())) {
+                (Some(l), Some(name)) => match named_sound(st, name) {
+                    Some(sound) => st.set_instrument_sound(l, &sound).map(|()| format!("{} now plays {}.", sound.name, st.project.tracks[l].name)),
+                    None => Err(format!("no sound called {name} (see `sounds`)")),
+                },
+                _ => Err("give a MIDI lane and a sound".into()),
+            },
+            "save_sound" => match (index(&a, "lane").filter(|&l| l < lanes), get(&a, "name").and_then(|v| v.as_str())) {
+                (Some(l), Some(name)) => st.save_sound(l, name).map(|s| format!("Kept {} ({}) as a sound.", s.name, s.plugin)),
+                _ => Err("give a lane and a name".into()),
+            },
+            "automate" => match index(&a, "lane").filter(|&l| l < lanes) {
+                None => Err("no such lane".into()),
+                Some(l) => {
+                    let points: Vec<model::GainPoint> = get(&a, "points")
+                        .and_then(|v| v.as_arr())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|p| {
+                            let p = p.as_arr()?;
+                            Some(model::GainPoint { t: num(p.first()?)?, db: num(p.get(1)?)? })
+                        })
+                        .collect();
+                    if self.agent_rx.is_none() {
+                        st.checkpoint();
+                    }
+                    let n = points.len();
+                    st.set_automation(l, points).map(|()| match n {
+                        0 => format!("{}: automation cleared", st.project.tracks[l].name),
+                        n => format!("{}: level automation with {n} points", st.project.tracks[l].name),
+                    })
+                }
+            },
+            "articulate" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
+                None => Err("no such MIDI lane".into()),
+                Some(l) => {
+                    let bar = get(&a, "bar").and_then(num).unwrap_or(1.0);
+                    let named = get(&a, "articulation").and_then(|v| v.as_str()).map(str::to_lowercase);
+                    let key = match (get(&a, "key").and_then(|v| v.as_u64()), named) {
+                        (Some(k), _) => Ok((k.min(127) as u8, format!("key {k}"))),
+                        (None, Some(n)) => st
+                            .keyswitches(l)
+                            .into_iter()
+                            .find(|(t, _)| t.to_lowercase().contains(&n))
+                            .map(|(t, k)| (k, t))
+                            .ok_or_else(|| format!("the instrument reports no articulation like {n}: give its keyswitch `key` from the library's manual")),
+                        (None, None) => Err("give an articulation or a key".into()),
+                    };
+                    key.and_then(|(k, what)| {
+                        let beat = midi_writer::Bars::of(&st.project).beat(bar, 1.0);
+                        st.add_keyswitch(l, beat, k).map(|()| format!("{} switches to {what} at bar {bar}", st.project.tracks[l].name))
+                    })
+                }
+            },
             "set_lane" => match index(&a, "lane").filter(|&l| l < lanes) {
                 None => Err("no such lane".into()),
                 Some(l) => {

@@ -173,6 +173,7 @@ Each one ends with an acceptance test drawn from the two songs already made by h
 | E | Arrangement (move/duplicate/delete sections, make it longer) and editing lyrics/chords by hand | done (#11) |
 | F | MIDI keyboard: play and record into a lane, quantise, count-in, metronome | done (#12) |
 | H | Plugins phase 2: latency compensation, plugins in a helper process | done (#13) |
+| O | Orchestral parts: Kontakt 8 and BBC SO load (vst3-host patch); named sounds (NKS presets, sounds saved from a plugin's window); a strings role (held voiced notes, a dynamics curve sent as CC1, kept to the sound's range); keyswitch articulations; lane level automation; `listen`/`compare` hear VST3 plugins (second instances in offline mode) | in review |
 | QA | End-to-end, then tag v1.0 | on the Windows PC: done (below); Gijs's checks left |
 
 ### 1.0 QA on the Windows PC (2026-10-24)

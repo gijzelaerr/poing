@@ -8,33 +8,81 @@
 
 use crate::fx::FxControls;
 use makepad_script_audio_aot as aot;
-use poing_model::{BeatGrid, Note};
+use poing_model::{BeatGrid, Cc, Note};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// Voices per instrument; the oldest is taken when all are busy.
 pub const VOICES: usize = 16;
 
-/// A note starting or ending at a frame.
+/// A note starting or ending at a frame, or (`cc`) controller `pitch` set to `vel` (0..1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoteEvent {
     pub frame: u64,
     pub pitch: u8,
     pub vel: f32,
     pub on: bool,
+    pub cc: bool,
 }
 
-/// A lane's notes as frame events, note-offs before note-ons at the same frame.
-pub fn events(notes: &[Note], grid: &BeatGrid, sample_rate: u32) -> Vec<NoteEvent> {
+impl NoteEvent {
+    pub fn note(frame: u64, pitch: u8, vel: f32, on: bool) -> Self {
+        NoteEvent { frame, pitch, vel, on, cc: false }
+    }
+    /// Controllers first at a frame (a note starts at its dynamics), then note-offs, then note-ons.
+    fn rank(&self) -> u8 {
+        if self.cc {
+            0
+        } else if self.on {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// A moving controller curve is sent in steps this far apart (beats).
+const CC_STEP_BEATS: f64 = 0.125;
+
+/// A lane's notes and controller curves as frame events. A curve is sent as
+/// steps along its straight lines, only where its value changes.
+pub fn events(notes: &[Note], cc: &[Cc], grid: &BeatGrid, sample_rate: u32) -> Vec<NoteEvent> {
     let sr = sample_rate as f64;
-    let mut out = Vec::with_capacity(notes.len() * 2);
+    let mut out = Vec::with_capacity(notes.len() * 2 + cc.len() * 8);
     for n in notes {
         let a = (grid.time_of(n.start).max(0.0) * sr) as u64;
         let b = ((grid.time_of(n.start + n.len.max(1.0 / 64.0)) * sr) as u64).max(a + 1);
-        out.push(NoteEvent { frame: a, pitch: n.pitch.min(127), vel: n.vel.clamp(0.0, 1.0) as f32, on: true });
-        out.push(NoteEvent { frame: b, pitch: n.pitch.min(127), vel: 0.0, on: false });
+        out.push(NoteEvent::note(a, n.pitch.min(127), n.vel.clamp(0.0, 1.0) as f32, true));
+        out.push(NoteEvent::note(b, n.pitch.min(127), 0.0, false));
     }
-    out.sort_by(|x, y| x.frame.cmp(&y.frame).then(x.on.cmp(&y.on)));
+    let mut nums: Vec<u8> = cc.iter().map(|c| c.num.min(127)).collect();
+    nums.sort_unstable();
+    nums.dedup();
+    for num in nums {
+        let mut pts: Vec<&Cc> = cc.iter().filter(|c| c.num.min(127) == num).collect();
+        pts.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+        let mut last: Option<u8> = None;
+        let mut emit = |beat: f64, value: f64, out: &mut Vec<NoteEvent>| {
+            let v = (value.clamp(0.0, 1.0) * 127.0).round() as u8;
+            if last != Some(v) {
+                let frame = (grid.time_of(beat).max(0.0) * sr) as u64;
+                out.push(NoteEvent { frame, pitch: num, vel: v as f32 / 127.0, on: true, cc: true });
+                last = Some(v);
+            }
+        };
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let steps = ((b.beat - a.beat) / CC_STEP_BEATS).floor().max(1.0) as usize;
+            for k in 0..steps {
+                let f = k as f64 / steps as f64;
+                emit(a.beat + (b.beat - a.beat) * f, a.value + (b.value - a.value) * f, &mut out);
+            }
+        }
+        if let Some(p) = pts.last() {
+            emit(p.beat, p.value, &mut out);
+        }
+    }
+    out.sort_by(|x, y| x.frame.cmp(&y.frame).then(x.rank().cmp(&y.rank())));
     out
 }
 
@@ -157,9 +205,10 @@ pub struct PluginSound {
     buffers: vst3_host::audio::AudioBuffers,
     /// Notes the plugin holds, to release on a jump.
     held: [bool; 128],
-    /// Note events not yet given to the plugin (it was busy): (pitch, velocity, on).
+    /// Events not yet given to the plugin (it was busy): (pitch or controller,
+    /// velocity or value, kind: 0 note-off, 1 note-on, 2 controller).
     /// Room made up front, so the audio thread never allocates.
-    queued: Vec<(u8, u8, bool)>,
+    queued: Vec<(u8, u8, u8)>,
 }
 
 /// Note events a plugin instrument can have waiting while it is busy.
@@ -187,8 +236,14 @@ impl PluginSound {
     fn send(&mut self, pitch: u8, vel: f32, on: bool) {
         let note = pitch.min(127);
         if self.queued.len() < QUEUE {
-            self.queued.push((note, (vel * 127.0).round().clamp(1.0, 127.0) as u8, on));
+            self.queued.push((note, (vel * 127.0).round().clamp(1.0, 127.0) as u8, on as u8));
             self.held[note as usize] = on;
+        }
+    }
+
+    fn send_cc(&mut self, num: u8, value: f32) {
+        if self.queued.len() < QUEUE {
+            self.queued.push((num.min(127), (value * 127.0).round().clamp(0.0, 127.0) as u8, 2));
         }
     }
 
@@ -199,8 +254,8 @@ impl PluginSound {
         let Some(shared) = self.hosted.as_ref() else { return };
         // in its own process: notes and audio go through its bridge
         if let Some(b) = &shared.bridge {
-            for (note, velocity, on) in self.queued.drain(..) {
-                b.note(note, velocity, on);
+            for (a, v, kind) in self.queued.drain(..) {
+                b.event(a, v, kind);
             }
             b.run(l, r, false);
             return;
@@ -209,11 +264,11 @@ impl PluginSound {
             crate::plugins::MISSED_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
-        for (note, velocity, on) in self.queued.drain(..) {
-            let event = if on {
-                MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity }
-            } else {
-                MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
+        for (a, v, kind) in self.queued.drain(..) {
+            let event = match kind {
+                1 => MidiEvent::NoteOn { channel: MidiChannel::Ch1, note: a, velocity: v },
+                2 => MidiEvent::ControlChange { channel: MidiChannel::Ch1, controller: a, value: v },
+                _ => MidiEvent::NoteOff { channel: MidiChannel::Ch1, note: a, velocity: 0 },
             };
             let _ = plugin.send_midi_event_at(event, 0);
         }
@@ -254,6 +309,14 @@ impl Sound {
             Sound::Splash(s) => s.note_off(pitch),
             #[cfg(windows)]
             Sound::Plugin(p) => p.send(pitch, 0.0, false),
+        }
+    }
+    /// A controller: plugins take it (dynamics, expression); Splash instruments have none.
+    fn cc(&mut self, num: u8, value: f32) {
+        match self {
+            Sound::Splash(_) => {}
+            #[cfg(windows)]
+            Sound::Plugin(p) => p.send_cc(num, value),
         }
     }
     /// Release what sounds, but the pitches in `keep` (keys held live).
@@ -321,6 +384,13 @@ impl MidiLane {
             // a jump: release what sounds (but keys held live), carry on from the new place
             self.sound.all_off_but(&self.live);
             self.cursor = self.events.partition_point(|e| e.frame < start);
+            // and each controller as it stands there (its last value before the cursor)
+            let mut seen = [false; 128];
+            for e in self.events[..self.cursor].iter().rev().filter(|e| e.cc) {
+                if !std::mem::replace(&mut seen[e.pitch as usize & 127], true) {
+                    self.sound.cc(e.pitch, e.vel);
+                }
+            }
         }
         let end = start + n as u64;
         let mut at = 0usize;
@@ -333,7 +403,9 @@ impl MidiLane {
                 self.sound.render(&mut l[at..off], &mut r[at..off]);
                 at = off;
             }
-            if e.on {
+            if e.cc {
+                self.sound.cc(e.pitch, e.vel);
+            } else if e.on {
                 self.sound.note_on(e.pitch, e.vel);
             } else {
                 self.sound.note_off(e.pitch);
@@ -412,7 +484,7 @@ mod tests {
     fn a_note_sounds_from_its_offset_and_a_jump_releases_it() {
         let grid = BeatGrid::new(&[], &[], Some(120.0)); // a beat is 0.5 s
         let notes = [Note { start: 0.25, len: 0.5, pitch: 48, vel: 0.9 }];
-        let ev = events(&notes, &grid, 48000);
+        let ev = events(&notes, &[], &grid, 48000);
         assert_eq!(ev[0].frame, 6000);
         let mut lane = MidiLane::new(0, ev, Sound::Splash(synth(BUILTIN[0].2)));
         let (mut l, mut r) = (vec![0.0f32; 8000], vec![0.0f32; 8000]);
@@ -428,6 +500,23 @@ mod tests {
         lane.render(0, &mut l2, &mut r2);
         // (the 80 ms release tail fades; then silence until the note's time again)
         assert!(l2[3800..].iter().all(|x| x.abs() < 1e-2), "released on the jump: {}", l2[3800..].iter().fold(0.0f32, |m, x| m.max(x.abs())));
+    }
+
+    #[test]
+    fn a_dynamics_curve_becomes_controller_steps_before_its_notes() {
+        let grid = BeatGrid::new(&[], &[], Some(120.0)); // a beat is 0.5 s = 24000 frames
+        let notes = [Note { start: 0.0, len: 2.0, pitch: 60, vel: 0.8 }];
+        let cc = [Cc { beat: 0.0, num: 1, value: 0.0 }, Cc { beat: 1.0, num: 1, value: 1.0 }];
+        let ev = events(&notes, &cc, &grid, 48000);
+        assert!(ev[0].cc && ev[0].frame == 0 && ev[0].vel == 0.0, "the controller comes before the note at frame 0: {:?}", ev[0]);
+        assert!(ev[1].on && !ev[1].cc);
+        let ccs: Vec<&NoteEvent> = ev.iter().filter(|e| e.cc).collect();
+        assert_eq!(ccs.len(), 9, "8 steps of 1/32 note and the end point");
+        assert!(ccs.windows(2).all(|w| w[1].vel > w[0].vel && w[1].frame > w[0].frame), "rising");
+        assert_eq!(ccs.last().unwrap().vel, 1.0);
+        // a flat stretch sends nothing new
+        let flat = [Cc { beat: 0.0, num: 11, value: 0.5 }, Cc { beat: 4.0, num: 11, value: 0.5 }];
+        assert_eq!(events(&[], &flat, &grid, 48000).len(), 1);
     }
 
     #[test]

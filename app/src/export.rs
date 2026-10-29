@@ -974,6 +974,8 @@ mod tests {
             fx: None,
             notes: None,
             instrument: None,
+            cc: None,
+            automation: None,
         };
         let mut p = Project::import("t", "a.wav", 2.0, 100);
         p.tracks = vec![track("a", Some(-6.0), None), track("b", None, None), track("c", None, Some(true))];
@@ -1046,6 +1048,8 @@ mod tests {
             fx: None,
             notes: Some(vec![Note { start: 1.0, len: 0.5, pitch: 40, vel: 0.9 }]),
             instrument: None,
+            cc: None,
+            automation: None,
         });
         let mix = MixParams::from_project(&p, 1, &[]);
         let (parts, xml) = dawproject_parts(&p, &mix, 100, 200, None);

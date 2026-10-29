@@ -43,3 +43,8 @@ debug = "line-tables-only"
 [profile.release]
 incremental = true
 lto = "off"
+
+# vst3-host with tolerant compatibility metadata (Kontakt 8, BBC SO load), until
+# HelgeSverre/rust-vst3-host#16 is released
+[patch.crates-io]
+vst3-host = { git = "https://github.com/gijzelaerr/rust-vst3-host", rev = "9c067903fc4d3451448ab1ac3ba372b9778b4027" }

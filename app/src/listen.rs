@@ -379,23 +379,19 @@ pub fn range(st: &EditorState, start: Option<f64>, end: Option<f64>) -> Result<(
     Ok((start, end))
 }
 
-/// Why lane `i`'s measurement is not quite what plays (plugins cannot be
-/// run a second time here: their effects are left out, their instruments are silent).
+/// Why lane `i`'s measurement is not quite what plays.
 fn lane_notes(st: &EditorState, mix: &MixParams, i: usize) -> Vec<String> {
-    let p = &st.project;
-    let t = &p.tracks[i];
+    let t = &st.project.tracks[i];
     let mut notes = Vec::new();
     if mix.gains.get(i).is_none_or(|&g| g == 0.0) {
         notes.push(if t.muted() { "muted in the mix".to_string() } else { "not heard in the mix (another lane is soloed)".to_string() });
     }
-    if t.instrument.as_ref().is_some_and(|x| x.plugin.is_some()) {
-        notes.push("its VST3 instrument cannot be played for a measurement: measured silent".into());
-    }
-    let dry: Vec<String> = p.chain(Some(i)).iter().filter(|f| f.plugin.is_some() && !f.bypassed()).map(|f| f.name.clone()).collect();
-    if !dry.is_empty() {
-        notes.push(format!("measured without its VST3 effects ({})", dry.join(", ")));
-    }
     notes
+}
+
+/// The plugins left out because they would not load a second time.
+fn missing_note(missing: &[String]) -> Option<String> {
+    (!missing.is_empty()).then(|| format!("these plugins would not load a second time and are left out: {}", missing.join(", ")))
 }
 
 /// A section take replaces every lane over its range: lanes measured there
@@ -416,38 +412,22 @@ fn notes_value(notes: Vec<String>) -> Value {
 
 /// `listen`: the mix as it plays now over [start, end), or lane `lane` alone
 /// (with its effects, before the master). Returns its line and data.
-pub fn listen(st: &EditorState, start: f64, end: f64, lane: Option<usize>) -> Result<(String, Value), String> {
+pub fn listen(st: &mut EditorState, start: f64, end: f64, lane: Option<usize>) -> Result<(String, Value), String> {
     let t0 = std::time::Instant::now();
     let mix = st.mix_snapshot();
-    let mut rack = st.make_rack();
-    let mut notes = Vec::new();
+    let (mut rack, missing) = st.measure_rack();
+    let mut notes: Vec<String> = missing_note(&missing).into_iter().collect();
     let what = match lane {
         Some(i) => {
             if mix.song_take().is_some() {
                 return Err("a whole-song take is on: lanes are not heard, listen to the mix instead".into());
             }
-            notes = lane_notes(st, &mix, i);
+            notes.extend(lane_notes(st, &mix, i));
             notes.extend(section_note(&mix, start, end));
             rack.master.clear();
             format!("Lane {i} ({})", st.project.tracks[i].name)
         }
-        None => {
-            let p = &st.project;
-            let dry: Vec<String> = (0..p.tracks.len())
-                .flat_map(|i| p.chain(Some(i)).iter())
-                .chain(p.chain(None))
-                .filter(|f| f.plugin.is_some() && !f.bypassed())
-                .map(|f| f.name.clone())
-                .collect();
-            if !dry.is_empty() {
-                notes.push(format!("VST3 effects left out of the measurement: {}", dry.join(", ")));
-            }
-            let silent: Vec<String> = p.tracks.iter().filter(|t| t.instrument.as_ref().is_some_and(|x| x.plugin.is_some())).map(|t| t.name.clone()).collect();
-            if !silent.is_empty() && mix.song_take().is_none() {
-                notes.push(format!("lanes played by a VST3 instrument are silent in the measurement: {}", silent.join(", ")));
-            }
-            "Mix".to_string()
-        }
+        None => "Mix".to_string(),
     };
     let mix = lane.map_or(mix.clone(), |i| mix.lane_alone(i));
     let (l, r) = render(&st.stems, &mix, &mut rack, st.sr(), start, end);
@@ -462,7 +442,7 @@ pub fn listen(st: &EditorState, start: f64, end: f64, lane: Option<usize>) -> Re
 
 /// `compare`: each of `lanes` alone (all lanes when empty) and the mix, over
 /// [start, end), rendered side by side, with which lanes lead each band.
-pub fn compare(st: &EditorState, start: f64, end: f64, lanes: &[usize]) -> Result<(String, Value), String> {
+pub fn compare(st: &mut EditorState, start: f64, end: f64, lanes: &[usize]) -> Result<(String, Value), String> {
     let t0 = std::time::Instant::now();
     let mix = st.mix_snapshot();
     if mix.song_take().is_some() {
@@ -470,18 +450,32 @@ pub fn compare(st: &EditorState, start: f64, end: f64, lanes: &[usize]) -> Resul
     }
     let lanes: Vec<usize> = if lanes.is_empty() { (0..st.project.tracks.len()).collect() } else { lanes.to_vec() };
     let sr = st.sr();
-    // one render per lane and one of the mix, each with a rack of its own, side by side
-    let jobs: Vec<(Option<usize>, MixParams, FxRack)> = lanes
-        .iter()
-        .map(|&i| {
-            let mut rack = st.make_rack();
-            rack.master.clear();
-            (Some(i), mix.lane_alone(i), rack)
-        })
-        .chain(std::iter::once((None, mix.clone(), st.make_rack())))
-        .collect();
-    let stems = &st.stems;
-    let measured: Vec<(Option<usize>, Measure)> = std::thread::scope(|s| {
+    // one render per lane and one of the mix, each with a rack of its own: side by
+    // side, or one after another when plugins play (each has one measuring instance)
+    let plugins = st.has_plugin_sound();
+    let mut missing = Vec::new();
+    let mut jobs: Vec<(Option<usize>, MixParams, FxRack)> = Vec::new();
+    for &i in &lanes {
+        let mut rack = st.make_rack();
+        rack.master.clear();
+        jobs.push((Some(i), mix.lane_alone(i), rack));
+    }
+    jobs.push((None, mix.clone(), st.make_rack()));
+    let measured: Vec<(Option<usize>, Measure)> = if plugins {
+        jobs.into_iter()
+            .map(|(lane, mix, _)| {
+                let (mut rack, gone) = st.measure_rack();
+                if lane.is_some() {
+                    rack.master.clear();
+                }
+                missing = gone;
+                let (l, r) = render(&st.stems, &mix, &mut rack, sr, start, end);
+                (lane, measure(&l, &r, sr))
+            })
+            .collect()
+    } else {
+        let stems = &st.stems;
+        std::thread::scope(|s| {
         let handles: Vec<_> = jobs
             .into_iter()
             .map(|(lane, mix, mut rack)| {
@@ -492,7 +486,8 @@ pub fn compare(st: &EditorState, start: f64, end: f64, lanes: &[usize]) -> Resul
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
+        })
+    };
     let (mut per_lane, mut heard, mut mix_m) = (Vec::new(), Vec::new(), Measure::default());
     for (lane, m) in measured {
         let Some(i) = lane else {
@@ -512,7 +507,7 @@ pub fn compare(st: &EditorState, start: f64, end: f64, lanes: &[usize]) -> Resul
             heard.push((name, m));
         }
     }
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = missing_note(&missing).into_iter().collect();
     notes.extend(section_note(&mix, start, end));
     let loudest = heard.iter().filter_map(|(n, m)| Some((n, m.lufs?))).max_by(|a, b| a.1.total_cmp(&b.1));
     let line = format!(

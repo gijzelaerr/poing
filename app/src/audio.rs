@@ -177,6 +177,8 @@ pub struct MixParams {
     /// Only the lanes (with their lane takes and layers) are heard: section
     /// takes still duck the lanes under them but are not added (a stem export).
     pub lanes_only: bool,
+    /// Each track's level automation (empty: none), dB over seconds.
+    pub automation: Vec<Vec<poing_model::GainPoint>>,
 }
 
 impl MixParams {
@@ -213,7 +215,8 @@ impl MixParams {
                 fade_out: t.end < p.duration - 0.01,
             });
         }
-        Self { version, gains: p.track_gains(), regions, takes, lanes_only: false }
+        let automation = p.tracks.iter().map(|t| t.automation.clone().unwrap_or_default()).collect();
+        Self { version, gains: p.track_gains(), regions, takes, lanes_only: false, automation }
     }
 
     pub fn song_take(&self) -> Option<MixTake> {
@@ -257,6 +260,9 @@ impl MixParams {
             let a = ((t - r.start) / REGION_RAMP_S + 0.5).clamp(0.0, 1.0);
             let b = ((r.end - t) / REGION_RAMP_S + 0.5).clamp(0.0, 1.0);
             g *= 1.0 + (a * b) as f32 * (r.factor - 1.0);
+        }
+        if let Some(points) = self.automation.get(track).filter(|p| !p.is_empty()) {
+            g *= 10f32.powf(poing_model::automation_db(points, t) as f32 / 20.0);
         }
         g
     }
@@ -428,6 +434,7 @@ pub fn mix_metered(
             continue;
         }
         let varies = mix.regions.iter().any(|r| r.track == ti)
+            || mix.automation.get(ti).is_some_and(|p| !p.is_empty())
             || mix.takes.iter().flatten().any(|k| matches!(k.kind, TakeKind::Section) || k.kind == TakeKind::Lane(ti));
         let flat = mix.gains[ti];
         let lane_gain = |t: f64| if varies { mix.lane_gain_at(ti, t) } else { flat };
@@ -841,7 +848,7 @@ pub enum JobUpdate {
     /// A take finished rendering and is decoded at the project rate.
     TakeReady { bundle: PathBuf, take: Take, stem: Stem },
     /// A MIDI part Claude wrote, checked and snapped to the grid.
-    MidiReady { bundle: PathBuf, name: String, role: String, notes: Vec<poing_model::Note>, request: String, note: String },
+    MidiReady { bundle: PathBuf, name: String, role: String, notes: Vec<poing_model::Note>, cc: Vec<poing_model::Cc>, request: String, note: String },
     /// A job for `bundle` is done (its status line says what came of it).
     Finished { bundle: PathBuf, message: String },
     /// The worker finished job number `seq` (whatever it was): sent after its last update.
@@ -1571,7 +1578,7 @@ fn write_midi(bundle: &Path, request: String, role: &str, sheet: &str, bars: cra
             } else {
                 format!("{} notes; the check still says: {}", w.notes.len(), w.problems.join("; "))
             };
-            send(tx, JobUpdate::MidiReady { bundle: bundle.to_path_buf(), name: w.name, role: role.to_string(), notes: w.notes, request, note });
+            send(tx, JobUpdate::MidiReady { bundle: bundle.to_path_buf(), name: w.name, role: role.to_string(), notes: w.notes, cc: w.cc, request, note });
         }
         Ok(w) => send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The part could not be made: {}", w.problems.join("; ")) }),
         Err(e) => send(tx, JobUpdate::Failed { bundle: bundle.to_path_buf(), message: format!("The part could not be made: {e}") }),
@@ -1932,6 +1939,19 @@ mod tests {
         let (mut l2, mut r2) = (vec![0.0; 10], vec![0.0; 10]);
         mix_into(&stems, &mix, 1000, 2000, &mut l2, &mut r2, None);
         assert_eq!(l2[0], 1.0);
+    }
+
+    #[test]
+    fn automation_moves_a_lane_level_over_time() {
+        // 1000 Hz, a lane at 1.0: -inf.. well, -40 dB at 0.2 s up to 0 dB at 0.6 s
+        let stems = vec![constant(1.0, 1000)];
+        let mut mix = MixParams { gains: vec![1.0], ..Default::default() };
+        mix.automation = vec![vec![poing_model::GainPoint { t: 0.2, db: -40.0 }, poing_model::GainPoint { t: 0.6, db: 0.0 }]];
+        let (mut l, mut r) = (vec![0.0; 1000], vec![0.0; 1000]);
+        mix_into(&stems, &mix, 1000, 0, &mut l, &mut r, None);
+        assert!((l[100] - 0.01).abs() < 1e-4, "before the first point: held at -40 dB ({})", l[100]);
+        assert!((l[400] - 0.1).abs() < 1e-3, "halfway: -20 dB ({})", l[400]);
+        assert!((l[800] - 1.0).abs() < 1e-6, "after the last: 0 dB ({})", l[800]);
     }
 
     /// One lane at unity plus these takes.

@@ -42,6 +42,8 @@ mod plugins;
 mod remote;
 #[path = "song_writer.rs"]
 mod song_writer;
+#[path = "sounds.rs"]
+mod sounds;
 #[path = "state.rs"]
 mod state;
 #[path = "synth.rs"]

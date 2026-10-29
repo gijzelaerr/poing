@@ -618,7 +618,7 @@ mod tests {
         use crate::model::{Section, Track};
         let sr = 1000u32;
         let mut p = Project::import("t", "a.wav", 32.0, sr);
-        let track = |id: &str| Track { id: id.into(), name: id.into(), file: format!("stems/{id}.wav"), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None };
+        let track = |id: &str| Track { id: id.into(), name: id.into(), file: format!("stems/{id}.wav"), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None, cc: None, automation: None };
         p.tracks = vec![track("a"), track("b")];
         p.source = Some("stems/a.wav".into());
         *p.sections_mut() = ["intro", "verse", "chorus", "outro"].iter().enumerate().map(|(i, l)| Section { start: i as f64 * 8.0, end: i as f64 * 8.0 + 8.0, label: l.to_string() }).collect();

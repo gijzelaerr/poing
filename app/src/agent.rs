@@ -25,7 +25,7 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "listen",
-        "Hear a range of the song (seconds, at most 30; about a second to compute): the mix as it plays now, or with `lane` that lane alone (its level, takes and effects, before the master). Returns loudness (`lufs` integrated, `short_term_max_lufs`), `true_peak_dbtp`, `clipped_samples`, `crest_db` (peak over RMS: under ~8 dense or squashed, over ~14 punchy or spiky), stereo `correlation` (1 mono, 0 unrelated, below 0 phase trouble) and `width` (side over mid: 0 mono, ~1 very wide), and `band_db`, the level in each band: sub 20-60 Hz, bass 60-120, upper_bass 120-250, low_mid 250-500 (mud), mid 500-1k (boxy), upper_mid 1-2k (nasal), high_mid 2-4k (harsh, vocal clarity), presence 4-8k (bite, sibilance), air 8-20k. `notes` says what the measurement leaves out (VST3 plugins cannot be run a second time: their effects are measured dry, their instruments silent).",
+        "Hear a range of the song (seconds, at most 30; about a second to compute): the mix as it plays now, or with `lane` that lane alone (its level, takes and effects, before the master). Returns loudness (`lufs` integrated, `short_term_max_lufs`), `true_peak_dbtp`, `clipped_samples`, `crest_db` (peak over RMS: under ~8 dense or squashed, over ~14 punchy or spiky), stereo `correlation` (1 mono, 0 unrelated, below 0 phase trouble) and `width` (side over mid: 0 mono, ~1 very wide), and `band_db`, the level in each band: sub 20-60 Hz, bass 60-120, upper_bass 120-250, low_mid 250-500 (mud), mid 500-1k (boxy), upper_mid 1-2k (nasal), high_mid 2-4k (harsh, vocal clarity), presence 4-8k (bite, sibilance), air 8-20k. `notes` says what the measurement leaves out. VST3 effects and instruments are heard through a second instance of each with the same state (the first listen to a sample player such as Kontakt loads it: seconds).",
         r#"{"type":"object","properties":{"start":{"type":"number","minimum":0},"end":{"type":"number","minimum":0},"lane":{"type":"integer","minimum":0}},"required":["start","end"],"additionalProperties":false}"#,
         Risk::Read,
     ))
@@ -49,9 +49,39 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "add_part",
-        "Have Claude write a new MIDI part on the song's key, chords and beat grid, as a new lane: `role` is bass, keys, lead or drums; `text` says the style (\"walking upright bass, smooth jazz\"); `section` limits it to that section; `instrument` names an installed VST3 instrument to play it (else Poing's built-in synth). Returns when the part is in (about a minute).",
-        r#"{"type":"object","properties":{"role":{"type":"string","enum":["bass","keys","lead","drums"]},"text":{"type":"string","maxLength":500},"section":{"type":"integer","minimum":0},"instrument":{"type":"string"}},"required":["role","text"],"additionalProperties":false}"#,
+        "Have Claude write a new MIDI part on the song's key, chords and beat grid, as a new lane: `role` is bass, keys, lead, drums or strings (an orchestral section: held voiced notes and a dynamics curve, for a sampled library); `text` says the style (\"walking upright bass, smooth jazz\"); `section` limits it to that section; `instrument` names a sound from `sounds` (\"Strings: Discover - Violins 1\", what most sample libraries need) or an installed VST3 instrument (else Poing's built-in synth). Returns when the part is in (about a minute).",
+        r#"{"type":"object","properties":{"role":{"type":"string","enum":["bass","keys","lead","drums","strings"]},"text":{"type":"string","maxLength":500},"section":{"type":"integer","minimum":0},"instrument":{"type":"string"}},"required":["role","text"],"additionalProperties":false}"#,
         Risk::Request,
+    ))
+    .with_tool(tool(
+        "sounds",
+        "Find instrument sounds: NKS presets of the installed plugins (BBC Symphony Orchestra, Massive X, ...) and sounds saved from Poing (a Kontakt instrument chosen in its own window and kept with `save_sound`). `query` words must all match the name, tags or plugin (\"violins\", \"bowed cello\", \"grand piano\"). Returns up to 25: name, plugin, tags, saved.",
+        r#"{"type":"object","properties":{"query":{"type":"string","maxLength":200}},"required":["query"],"additionalProperties":false}"#,
+        Risk::Read,
+    ))
+    .with_tool(tool(
+        "set_sound",
+        "Play a MIDI lane with a sound from `sounds` (by its name): its plugin loads with the sound's state. A sample library takes a few seconds to load.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"sound":{"type":"string","maxLength":300}},"required":["lane","sound"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
+        "save_sound",
+        "Keep the plugin playing a MIDI lane, as it is now, as a named sound for later parts (after an instrument was chosen in its own window, e.g. a Kontakt library).",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"name":{"type":"string","maxLength":120}},"required":["lane","name"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
+        "automate",
+        "A lane's level over time, on top of its `gain_db`: `points` are [seconds, dB] pairs with straight lines between them, flat before the first and after the last ([[60, -40], [90, -12], [150, 0]] fades a lane in over 1:00-2:30). An empty list clears it. Use it to bring a part in slowly, duck a lane under a breakdown, or fade an outro.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"maxItems":256}},"required":["lane","points"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
+        "articulate",
+        "Switch a MIDI lane's articulation (legato, staccato, pizzicato ...) from bar `bar` (1-based) on, for sample libraries that switch by key: `articulation` names one the plugin reports (`keyswitches` in `song`), or `key` gives the library's keyswitch note number from its manual. Adds a short note on that key just before the bar.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"bar":{"type":"number","minimum":1},"articulation":{"type":"string","maxLength":80},"key":{"type":"integer","minimum":0,"maximum":127}},"required":["lane","bar"],"additionalProperties":false}"#,
+        Risk::Act,
     ))
     .with_tool(tool(
         "live",
@@ -184,6 +214,16 @@ pub fn summary(st: &EditorState, status: &str) -> String {
                 let by = t.instrument.as_ref().filter(|x| x.plugin.is_some()).map(|x| x.name.clone()).unwrap_or_else(|| "Poing's built-in synth".into());
                 fields.push(("instrument", json::s(by)));
                 fields.extend(plugin_fields(st, &t.id));
+                if let Some(cc) = t.cc.as_ref().filter(|c| !c.is_empty()) {
+                    fields.push(("dynamics_points", Value::Int(cc.iter().filter(|c| c.num == 1).count() as i64)));
+                }
+                let ks = st.keyswitches(i);
+                if !ks.is_empty() {
+                    fields.push(("keyswitches", Value::Arr(ks.into_iter().map(|(n, k)| json::obj(vec![("name", json::s(n)), ("key", Value::Int(k as i64))])).collect())));
+                }
+            }
+            if let Some(a) = t.automation.as_ref().filter(|a| !a.is_empty()) {
+                fields.push(("automation", Value::Arr(a.iter().map(|p| Value::Arr(vec![f(p.t), f(p.db)])).collect())));
             }
             json::obj(fields)
         })

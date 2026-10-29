@@ -173,13 +173,15 @@ impl Bridge {
     }
 
     /// A note for the plugin, at the frame the next block starts (audio thread).
-    pub fn note(&self, pitch: u8, velocity: u8, on: bool) {
+    /// A MIDI event for the worker: `kind` 0 note-off, 1 note-on (pitch, velocity),
+    /// 2 controller (number, value).
+    pub fn event(&self, a: u8, b: u8, kind: u8) {
         use std::sync::atomic::Ordering;
         let ring = &*self.ring;
         let k = ring.ev_written.load(Ordering::Relaxed);
         let slot = (k as usize) % EVENTS;
         ring.ev_frame[slot].store(ring.written.load(Ordering::Relaxed), Ordering::Relaxed);
-        ring.ev_data[slot].store(pitch as u32 | (velocity as u32) << 8 | (on as u32) << 16, Ordering::Relaxed);
+        ring.ev_data[slot].store(a as u32 | (b as u32) << 8 | (kind as u32) << 16, Ordering::Relaxed);
         ring.ev_written.store(k + 1, Ordering::Release);
     }
 
@@ -303,10 +305,10 @@ fn bridge_worker(ring: &Ring, plugin: &std::sync::Mutex<vst3_host::Plugin>, inst
                 }
                 let d = ring.ev_data[slot].load(Ordering::Relaxed);
                 let (note, velocity) = ((d & 0x7f) as u8, ((d >> 8) & 0x7f) as u8);
-                let event = if d >> 16 != 0 {
-                    MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity }
-                } else {
-                    MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }
+                let event = match d >> 16 {
+                    1 => MidiEvent::NoteOn { channel: MidiChannel::Ch1, note, velocity },
+                    2 => MidiEvent::ControlChange { channel: MidiChannel::Ch1, controller: note, value: velocity },
+                    _ => MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 },
                 };
                 let _ = p.send_midi_event_at(event, frame.saturating_sub(read) as i32);
                 ev_read += 1;
@@ -394,6 +396,15 @@ impl Handle {
                 let _ = p.set_parameter(id, v);
             }
         }
+    }
+
+    /// The articulations the plugin switches by key, as it reports them (VST3
+    /// keyswitches): (name, key). Many sample libraries report none.
+    pub fn keyswitches(&self) -> Vec<(String, u8)> {
+        let Ok(p) = self.hosted.plugin.try_lock() else { return Vec::new() };
+        p.keyswitches(0, vst3_host::midi::MidiChannel::Ch1)
+            .map(|ks| ks.into_iter().map(|k| (k.title, k.remapped_key.unwrap_or(k.key_min).clamp(0, 127) as u8)).collect())
+            .unwrap_or_default()
     }
 
     /// The plugin's whole state (presets, wavetables, every parameter), if it is free.
@@ -629,6 +640,18 @@ pub fn pump_window_messages() {
     }
 }
 
+/// Release every note an instrument may hold (each key off, then All Notes Off):
+/// heard from its next processed block. UI thread, the plugin not playing elsewhere.
+#[cfg(windows)]
+pub fn all_notes_off(shared: &Shared) {
+    use vst3_host::midi::{MidiChannel, MidiEvent};
+    let Ok(mut p) = shared.plugin.lock() else { return };
+    for note in 0..128u8 {
+        let _ = p.send_midi_event_at(MidiEvent::NoteOff { channel: MidiChannel::Ch1, note, velocity: 0 }, 0);
+    }
+    let _ = p.send_midi_event_at(MidiEvent::ControlChange { channel: MidiChannel::Ch1, controller: 123, value: 0 }, 0);
+}
+
 /// How to load a plugin.
 #[cfg(windows)]
 #[derive(Clone, Copy, Default)]
@@ -675,6 +698,11 @@ pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u
     }
     if instrument {
         let _ = plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
+    }
+    // an offline render (export, a measurement) runs faster than real time: in
+    // offline mode a sample player loads what a note needs instead of dropping it
+    if !how.realtime {
+        let _ = plugin.set_process_mode(vst3_host::ProcessMode::Offline);
     }
     plugin.start_processing().map_err(|e| format!("{} did not start: {e}", info.name))?;
     if instrument {
@@ -960,7 +988,7 @@ mod bench {
             let (h, shared) = load(Path::new(SERUM), SR, None, None, LoadAs { instrument: true, isolated, realtime: true }).unwrap();
             let mut sound = PluginSound::new("midi1", SR);
             sound.hosted = Some(shared);
-            let note = |frame, on| NoteEvent { frame, pitch: 60, vel: 0.9, on };
+            let note = |frame, on| NoteEvent::note(frame, 60, 0.9, on);
             let mut lane = MidiLane::new(0, vec![note(4800, true), note(28800, false)], Sound::Plugin(sound));
             let n = 48000;
             let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
@@ -990,6 +1018,107 @@ mod bench {
             println!("  live key, isolated {isolated}: first sound at {live:?}");
             let live = live.expect("the live key sounds");
             assert!(live >= h.latency() as usize && live < h.latency() as usize + 480, "{live}");
+            drop(lane);
+            h.shut_down();
+        }
+    }
+
+    /// Smoke test for sample players and synths at their default patch: each loads as an
+    /// instrument, takes a held note and says whether it sounds. Kontakt and BBC SO open
+    /// with nothing loaded, so silence there is expected until a sound is chosen.
+    #[test]
+    #[ignore]
+    fn installed_instruments_load_and_play() {
+        use crate::synth::{MidiLane, NoteEvent, PluginSound, Sound};
+        const VST3: &str = "C:/Program Files/Common Files/VST3";
+        let names = std::env::var("POING_SMOKE")
+            .unwrap_or_else(|_| "Kontakt 8,BBC Symphony Orchestra (64 Bit),Serum2,Vital,Massive X,FM8".into());
+        let mut report = Vec::new();
+        for name in names.split(',') {
+            let path = Path::new(VST3).join(format!("{name}.vst3"));
+            let t0 = Instant::now();
+            let loaded = load(&path, SR, None, None, LoadAs { instrument: true, isolated: true, realtime: false });
+            let (h, shared) = match loaded {
+                Ok(x) => x,
+                Err(e) => {
+                    report.push(format!("{name}: did not load: {e}"));
+                    continue;
+                }
+            };
+            let took = t0.elapsed();
+            let mut sound = PluginSound::new("midi1", SR);
+            sound.hosted = Some(shared);
+            let note = |frame, on| NoteEvent::note(frame, 60, 0.8, on);
+            let mut lane = MidiLane::new(0, vec![note(4800, true), note(4 * 48000, false)], Sound::Plugin(sound));
+            let n = 5 * 48000;
+            let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            for a in (0..n).step_by(480) {
+                lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
+            }
+            let peak = l.iter().chain(&r).fold(0.0f32, |m, x| m.max(x.abs()));
+            let state = h.save_state().map(|s| s.len()).unwrap_or(0);
+            report.push(format!("{name}: loaded in {took:.1?}, {} params, state {state} B, peak {:.1} dBFS",
+                h.params.len(), 20.0 * peak.max(1e-9).log10()));
+            drop(lane);
+            h.shut_down();
+        }
+        println!("{}", report.join("\n"));
+    }
+
+    /// The sound library on this PC, then sounds from it played with a dynamics
+    /// curve: `POING_SMOKE_SOUNDS="violins 1,discover piano"` picks them.
+    #[test]
+    #[ignore]
+    fn sounds_from_the_library_play() {
+        use crate::synth::{events, MidiLane, PluginSound, Sound};
+        use poing_model::{BeatGrid, Cc, Note};
+        let plugins = library();
+        let t0 = Instant::now();
+        let lib = crate::sounds::library(&plugins);
+        let mut by_plugin: std::collections::BTreeMap<&str, usize> = Default::default();
+        for s in &lib {
+            *by_plugin.entry(s.plugin.as_str()).or_default() += 1;
+        }
+        println!("{} sounds in {:.1?}: {by_plugin:?}", lib.len(), t0.elapsed());
+        let picks = std::env::var("POING_SMOKE_SOUNDS").unwrap_or_else(|_| "discover violins 1,discover celli,massive x pad".into());
+        let grid = BeatGrid::new(&[], &[], Some(120.0)); // a beat is 0.5 s
+        for q in picks.split(',') {
+            let Some(s) = crate::sounds::search(&lib, q).into_iter().next() else {
+                println!("{q}: no sound");
+                continue;
+            };
+            let path = plugins.iter().find(|(p, _)| *p == s.plugin).map(|(_, p)| p.clone()).unwrap();
+            let state = crate::sounds::state_of(s).unwrap();
+            let t0 = Instant::now();
+            let (h, shared) = load(&path, SR, None, Some(&state), LoadAs { instrument: true, isolated: std::env::var_os("POING_SMOKE_INPROC").is_none(), realtime: false }).unwrap();
+            let took = t0.elapsed();
+            {
+                let p = shared.plugin.lock().unwrap();
+                let ks = p.keyswitches(0, vst3_host::midi::MidiChannel::Ch1).map(|k| k.iter().map(|k| format!("{} {}", k.title, k.key_min)).collect::<Vec<_>>());
+                let names: Vec<String> = p.get_parameters().map(|ps| ps.iter().filter(|x| { let n = x.name.to_lowercase(); n.contains("artic") || n.contains("dynamic") || n.contains("express") }).map(|x| x.name.clone()).take(8).collect()).unwrap_or_default();
+                println!("{q}: keyswitches {ks:?}; params {names:?}");
+            }
+            let mut sound = PluginSound::new("midi1", SR);
+            sound.hosted = Some(shared);
+            // an A held 6 beats, dynamics from pp up to ff
+            let ks: Option<u8> = std::env::var("POING_SMOKE_KS").ok().and_then(|k| k.parse().ok());
+            let mut notes = vec![Note { start: 1.0, len: 6.0, pitch: 69, vel: 0.7 }];
+            if let Some(k) = ks {
+                notes.insert(0, Note { start: 0.5, len: 0.25, pitch: k, vel: 0.7 });
+            }
+            let cc = [Cc { beat: 0.0, num: 1, value: 0.1 }, Cc { beat: 7.0, num: 1, value: 1.0 }];
+            let mut lane = MidiLane::new(0, events(&notes, &cc, &grid, SR), Sound::Plugin(sound));
+            let n = 5 * SR as usize;
+            let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            for a in (0..n).step_by(480) {
+                lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
+                // a sample player streams from disk while it plays: give it real time
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let rms = |a: usize, b: usize| (l[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt();
+            let db = |x: f32| 20.0 * x.max(1e-9).log10();
+            let s1 = SR as usize;
+            println!("{q} -> {} ({}): loaded in {took:.1?}; soft 0.7-1.2 s {:.1} dB, loud 2.9-3.4 s {:.1} dB", s.name, s.plugin, db(rms(s1 * 7 / 10, s1 * 12 / 10)), db(rms(s1 * 29 / 10, s1 * 34 / 10)));
             drop(lane);
             h.shut_down();
         }

@@ -157,9 +157,11 @@ pub fn midi_part(text: &str) -> Option<&'static str> {
     let asks = has(&["add", "write", "make", "voeg", "maak", "midi"]);
     let part = if has(&["drum", "beat", "groove", "percussion", "hihat", "kick", "trommel"]) {
         Some("drums")
+    } else if has(&["string", "orchestra", "violin", "viola", "cello", "strijk", "orkest", "viool"]) {
+        Some("strings")
     } else if has(&["bass"]) {
         Some("bass")
-    } else if has(&["chord", "pad", "keys", "piano", "organ", "string", "akkoord"]) {
+    } else if has(&["chord", "pad", "keys", "piano", "organ", "akkoord"]) {
         Some("keys")
     } else if has(&["melod", "lead", "hook", "riff", "arp", "counter", "solo"]) {
         Some("lead")
@@ -357,6 +359,44 @@ pub struct Track {
     /// The instrument of a MIDI lane: a Splash `voice()` shader (`file`) or,
     /// later, an instrument plugin.
     pub instrument: Option<Fx>,
+    /// A MIDI lane's controller curves (dynamics, expression), in beats like its notes.
+    pub cc: Option<Vec<Cc>>,
+    /// The lane's level over time on top of `gain_db`: (seconds, dB) points,
+    /// straight lines between them, held flat before the first and after the last.
+    pub automation: Option<Vec<GainPoint>>,
+}
+
+/// One point of a MIDI controller curve: controller `num` (1 dynamics,
+/// 11 expression) reaches `value` (0..1) at grid beat `beat`.
+#[derive(SerJson, DeJson, Clone, Debug, PartialEq)]
+pub struct Cc {
+    pub beat: f64,
+    pub num: u8,
+    pub value: f64,
+}
+
+/// A lane level point: `db` relative to the lane's gain at `t` seconds.
+#[derive(SerJson, DeJson, Clone, Debug, PartialEq)]
+pub struct GainPoint {
+    pub t: f64,
+    pub db: f64,
+}
+
+/// The automation gain (dB) at `t`: linear between points, flat outside them.
+pub fn automation_db(points: &[GainPoint], t: f64) -> f64 {
+    match points {
+        [] => 0.0,
+        [p] => p.db,
+        _ if t <= points[0].t => points[0].db,
+        _ => {
+            let i = points.partition_point(|p| p.t <= t);
+            if i >= points.len() {
+                return points[points.len() - 1].db;
+            }
+            let (a, b) = (&points[i - 1], &points[i]);
+            a.db + (b.db - a.db) * ((t - a.t) / (b.t - a.t).max(1e-9)).clamp(0.0, 1.0)
+        }
+    }
 }
 
 /// A note on a MIDI lane, in beats of the song's beat grid.
@@ -578,6 +618,8 @@ impl Project {
                 fx: None,
                 notes: None,
                 instrument: None,
+                cc: None,
+                automation: None,
             }],
             sample_rate: Some(sample_rate),
             sections: Some(Vec::new()),
@@ -612,7 +654,7 @@ impl Project {
                 continue;
             }
             let name = STEMS.iter().find(|(s, _)| s == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.clone());
-            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None });
+            self.tracks.push(Track { id: id.clone(), name, file: file.clone(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None, cc: None, automation: None });
             added.push(self.tracks.len() - 1);
         }
         if !added.is_empty() {
@@ -758,8 +800,8 @@ mod tests {
             name: "t".into(),
             duration: 2.0,
             tracks: vec![
-                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None },
-                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None, fx: None, notes: None, instrument: None },
+                Track { id: "a".into(), name: "A".into(), file: "stems/a.wav".into(), gain_db: None, mute: None, solo: None, fx: None, notes: None, instrument: None, cc: None, automation: None },
+                Track { id: "b".into(), name: "B".into(), file: "stems/b.wav".into(), gain_db: Some(-6.0), mute: None, solo: None, fx: None, notes: None, instrument: None, cc: None, automation: None },
             ],
             sample_rate: Some(48000),
             sections: Some(vec![Section { start: 0.0, end: 2.0, label: "verse".into() }]),
@@ -813,12 +855,29 @@ mod tests {
     }
 
     #[test]
+    fn automation_is_straight_lines_held_flat_outside() {
+        let p = |t, db| GainPoint { t, db };
+        let pts = [p(10.0, -40.0), p(20.0, -10.0), p(30.0, 0.0)];
+        assert_eq!(automation_db(&pts, 0.0), -40.0);
+        assert_eq!(automation_db(&pts, 15.0), -25.0);
+        assert_eq!(automation_db(&pts, 25.0), -5.0);
+        assert_eq!(automation_db(&pts, 99.0), 0.0);
+        assert_eq!(automation_db(&[], 5.0), 0.0);
+        // a lane without the new fields still reads
+        let old = r#"{"id":"a","name":"A","file":"a.wav","gain_db":null,"mute":null,"solo":null,"fx":null,"notes":null,"instrument":null}"#;
+        let t = Track::deserialize_json(old).unwrap();
+        assert!(t.cc.is_none() && t.automation.is_none());
+    }
+
+    #[test]
     fn midi_parts_are_read_from_describe() {
         assert_eq!(midi_part("add a funky bassline"), Some("bass"));
         assert_eq!(midi_part("add a four on the floor drum beat"), Some("drums"));
         assert_eq!(midi_part("write warm pad chords under the chorus"), Some("keys"));
         assert_eq!(midi_part("add a catchy melody"), Some("lead"));
         assert_eq!(midi_part("make a midi part for the bridge"), Some("lead"));
+        assert_eq!(midi_part("add slow swelling strings under the breakdown"), Some("strings"));
+        assert_eq!(midi_part("write a cello and violin part"), Some("strings"));
         assert_eq!(midi_part("1960s Beatles beat pop, warm tape"), None, "a style is a cover");
         assert_eq!(midi_part("tape saturation on the whole mix"), None);
     }
