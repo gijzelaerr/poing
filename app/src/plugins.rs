@@ -652,6 +652,10 @@ pub fn all_notes_off(shared: &Shared) {
     let _ = p.send_midi_event_at(MidiEvent::ControlChange { channel: MidiChannel::Ch1, controller: 123, value: 0 }, 0);
 }
 
+/// Instruments that need time after a load before they sound: (name, seconds).
+#[cfg(windows)]
+const WARM_UP: [(&str, f64); 1] = [("Massive X", 5.0)];
+
 /// How to load a plugin.
 #[cfg(windows)]
 #[derive(Clone, Copy, Default)]
@@ -698,6 +702,8 @@ pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u
     }
     if instrument {
         let _ = plugin.set_bus_active(MediaType::Event, BusDirection::Input, 0, true);
+        // its main output too: some (Vital, Massive X) do not mark it active by default and stay silent
+        let _ = plugin.set_bus_active(MediaType::Audio, BusDirection::Output, 0, true);
     }
     // an offline render (export, a measurement) runs faster than real time: in
     // offline mode a sample player loads what a note needs instead of dropping it
@@ -707,6 +713,17 @@ pub fn load(path: &Path, sample_rate: u32, saved: Option<&Fx>, state: Option<&[u
     plugin.start_processing().map_err(|e| format!("{} did not start: {e}", info.name))?;
     if instrument {
         let _ = plugin.set_playing(true);
+    }
+    // An offline render plays at once; some engines start in the background after a
+    // load and are silent until then (Massive X: about 2 s here, more in its own process).
+    if !how.realtime && instrument {
+        if let Some((_, secs)) = WARM_UP.iter().find(|(n, _)| info.name.contains(n)) {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_secs_f64(*secs) {
+                pump_window_messages();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
     // a state that changed its latency (linear phase) has said so by now
     let _ = plugin.service_host_requests();
@@ -1037,7 +1054,17 @@ mod bench {
         for name in names.split(',') {
             let path = Path::new(VST3).join(format!("{name}.vst3"));
             let t0 = Instant::now();
-            let loaded = load(&path, SR, None, None, LoadAs { instrument: true, isolated: true, realtime: false });
+            if std::env::var_os("POING_SMOKE_WSA").is_some() {
+                #[link(name = "ws2_32")]
+                extern "system" {
+                    fn WSAStartup(version: u16, data: *mut u8) -> i32;
+                }
+                let mut data = [0u8; 1024];
+                // SAFETY: WSAStartup fills a buffer larger than WSADATA.
+                println!("WSAStartup: {}", unsafe { WSAStartup(0x0202, data.as_mut_ptr()) });
+            }
+            let isolated = std::env::var_os("POING_SMOKE_INPROC").is_none();
+            let loaded = load(&path, SR, None, None, LoadAs { instrument: true, isolated, realtime: false });
             let (h, shared) = match loaded {
                 Ok(x) => x,
                 Err(e) => {
@@ -1057,8 +1084,18 @@ mod bench {
             let mut lane = MidiLane::new(0, vec![note(4800, true), note(4 * 48000, false)], Sound::Plugin(sound));
             let n = 5 * 48000;
             let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            let pump = std::env::var("POING_SMOKE_PUMP").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let t1 = Instant::now();
+            while t1.elapsed() < Duration::from_secs(pump) {
+                pump_window_messages();
+                std::thread::sleep(Duration::from_millis(5));
+            }
             for a in (0..n).step_by(480) {
                 lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
+                if pump > 0 {
+                    pump_window_messages();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             let peak = l.iter().chain(&r).fold(0.0f32, |m, x| m.max(x.abs()));
             let saved = h.save_state();

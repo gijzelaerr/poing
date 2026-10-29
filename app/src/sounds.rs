@@ -284,6 +284,21 @@ fn serum_root() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("USERPROFILE")?).join("Documents").join("Xfer").join("Serum 2 Presets").join("Presets"))
 }
 
+/// Vital's preset folder: `POING_VITAL`, else Vital's place in Documents.
+fn vital_root() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("POING_VITAL") {
+        return Some(PathBuf::from(d));
+    }
+    Some(PathBuf::from(std::env::var_os("USERPROFILE")?).join("Documents").join("Vital"))
+}
+
+/// A Vital preset's style ("Bass", "Pad" ...) from the start of its JSON (the file
+/// itself is Vital's state; it can run to megabytes of wavetables).
+fn vital_style(head: &[u8]) -> String {
+    let s = String::from_utf8_lossy(head);
+    s.split("\"preset_style\":\"").nth(1).and_then(|r| r.split('"').next()).unwrap_or_default().to_string()
+}
+
 /// An `XferJson` file (a Serum 2 preset or state): its JSON header, and what follows it.
 pub fn xfer_split(b: &[u8]) -> Result<(&str, &[u8]), String> {
     if !b.starts_with(b"XferJson\0") || b.len() < 17 {
@@ -398,7 +413,30 @@ pub fn library(plugins: &[(String, PathBuf)]) -> Vec<SoundInfo> {
         }
         _ => Vec::new(),
     };
+    let vital: Vec<PathBuf> = match vital_root() {
+        Some(root) if plugins.iter().any(|(p, _)| p == "Vital") => {
+            let mut v = Vec::new();
+            walk_ext(&root, 0, "vital", &mut v);
+            v
+        }
+        _ => Vec::new(),
+    };
     let mut index = Index::default();
+    for f in vital {
+        let key = f.to_string_lossy().into_owned();
+        let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+        let known = old.seen.iter().find(|(k, s, _)| *k == key && *s == size).map(|(_, _, i)| i.clone());
+        let info = known.unwrap_or_else(|| {
+            let mut head = vec![0u8; 4096];
+            let n = std::io::Read::read(&mut std::fs::File::open(&f).ok()?, &mut head).ok()?;
+            let style = vital_style(&head[..n]);
+            // the pack: the folder above Presets (Documents/Vital/<pack>/Presets/...)
+            let pack = f.ancestors().skip(1).find(|p| p.parent().is_some_and(|q| Some(q) == vital_root().as_deref())).and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let types = [style, pack].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
+            Some(SoundInfo { name: f.file_stem()?.to_string_lossy().into_owned(), plugin: "Vital".into(), types, file: key.clone(), saved: false })
+        });
+        index.seen.push((key, size, info));
+    }
     for f in serum {
         let key = f.to_string_lossy().into_owned();
         let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
@@ -485,6 +523,10 @@ pub fn state_of(s: &SoundInfo, template: Option<&[u8]>) -> Result<Vec<u8>, Strin
     }
     if needs_template(s) {
         return serum_state(template.ok_or("Serum 2's own state is needed first")?, &bytes);
+    }
+    // a Vital preset is Vital's state as it is
+    if s.file.to_lowercase().ends_with(".vital") {
+        return Ok(bytes);
     }
     Ok(read_nks(&bytes)?.state)
 }
