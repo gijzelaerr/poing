@@ -48,7 +48,9 @@ def overall(stage, within):
 def separate(audio: Path, out: Path, device: str):
     import demucs.separate
     emit("stems", overall("stems", 0.0), "Separating vocals, drums, bass and other")
-    with tempfile.TemporaryDirectory() as tmp:
+    # inside the bundle: the stems are moved, and a move to another drive is not a rename
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out, prefix=".stems-") as tmp:
         demucs.separate.main(["-n", "htdemucs_ft", "-d", device, "-o", tmp,
                               "--filename", "{stem}.{ext}", str(audio)])
         src = Path(tmp) / "htdemucs_ft"
