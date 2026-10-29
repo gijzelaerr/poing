@@ -72,6 +72,18 @@ pub fn manifest() -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(tool(
+        "dynamics",
+        "Set a MIDI lane's controller curve: `points` are [bar, level] pairs (bar 1-based and may be fractional, level 0-127) with straight lines between them. Controller 1 (the default) is dynamics, how loud and how hard a sampled orchestral instrument plays (pp ~20, mf ~70, ff ~127): BBC SO and most libraries are soft without it. 11 is expression. Replaces that controller's curve (an empty list clears it); one undo step.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"controller":{"type":"integer","minimum":0,"maximum":127},"points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"maxItems":512}},"required":["lane","points"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
+        "velocity",
+        "Change how hard a MIDI lane's notes are played: each velocity times `scale`, plus `add` (in MIDI steps, -127..127), between bars `from_bar` and `to_bar` (both included; the whole lane without them). Velocity is how loud plucked and struck sounds play (harp, piano, mallets); bowed and blown sample libraries take their loudness from `dynamics` instead. One undo step.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"scale":{"type":"number","minimum":0,"maximum":4},"add":{"type":"number","minimum":-127,"maximum":127},"from_bar":{"type":"number","minimum":1},"to_bar":{"type":"number","minimum":1}},"required":["lane"],"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
         "humanize",
         "Make a MIDI lane sound played rather than quantised: timing a little off the grid (chord notes not all at once), legato notes overlapping the next (sample libraries play legato transitions), varied velocities, long notes that swell and taper on the dynamics curve, a slow drift in expression. `amount` 0..1 (0.6 default; strings and winds parts already come in at 0.6), `seed` for another take of it. One undo step.",
         r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"amount":{"type":"number","minimum":0,"maximum":1},"seed":{"type":"integer","minimum":0}},"required":["lane"],"additionalProperties":false}"#,

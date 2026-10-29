@@ -2770,6 +2770,44 @@ impl App {
                 (Some(l), Some(name)) => st.save_sound(l, name).map(|s| format!("Kept {} ({}) as a sound.", s.name, s.plugin)),
                 _ => Err("give a lane and a name".into()),
             },
+            "dynamics" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
+                None => Err("no such MIDI lane".into()),
+                Some(l) => {
+                    let num = get(&a, "controller").and_then(|v| v.as_u64()).unwrap_or(1).min(127) as u8;
+                    let bars = midi_writer::Bars::of(&st.project);
+                    let points: Vec<model::Cc> = get(&a, "points")
+                        .and_then(|v| v.as_arr())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|p| {
+                            let p = p.as_arr()?;
+                            Some(model::Cc { beat: bars.beat(agent::num(p.first()?)?, 1.0), num, value: agent::num(p.get(1)?)? / 127.0 })
+                        })
+                        .collect();
+                    let n = points.len();
+                    st.set_cc(l, num, points).map(|()| format!("{}: controller {num} curve with {n} points", st.project.tracks[l].name))
+                }
+            },
+            "velocity" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
+                None => Err("no such MIDI lane".into()),
+                Some(l) => {
+                    let bars = midi_writer::Bars::of(&st.project);
+                    let from = get(&a, "from_bar").and_then(agent::num).map_or(f64::MIN, |b| bars.beat(b, 1.0));
+                    let to = get(&a, "to_bar").and_then(agent::num).map_or(f64::MAX, |b| bars.beat(b + 1.0, 1.0));
+                    let scale = get(&a, "scale").and_then(agent::num).unwrap_or(1.0);
+                    let add = get(&a, "add").and_then(agent::num).unwrap_or(0.0) / 127.0;
+                    let mut notes = st.project.tracks[l].notes.clone().unwrap_or_default();
+                    let mut n = 0;
+                    for x in notes.iter_mut().filter(|x| x.start >= from && x.start < to) {
+                        x.vel = (x.vel * scale + add).clamp(0.05, 1.0);
+                        n += 1;
+                    }
+                    st.checkpoint();
+                    st.set_notes(l, notes);
+                    st.sel_changed = true;
+                    Ok(format!("{}: {n} notes' velocity changed", st.project.tracks[l].name))
+                }
+            },
             "humanize" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
                 None => Err("no such MIDI lane".into()),
                 Some(l) => {

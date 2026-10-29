@@ -921,6 +921,25 @@ impl EditorState {
         Ok(n)
     }
 
+    /// Replace MIDI lane `lane`'s curve for controller `num` (1 dynamics, 11
+    /// expression) with `points` (grid beat, 0..1); empty clears it. One undo step.
+    pub fn set_cc(&mut self, lane: usize, num: u8, mut points: Vec<poing_model::Cc>) -> Result<(), String> {
+        let t = self.project.tracks.get(lane).filter(|t| t.is_midi()).ok_or("that lane has no notes")?;
+        let mut cc: Vec<poing_model::Cc> = t.cc.clone().unwrap_or_default().into_iter().filter(|c| c.num != num).collect();
+        for p in &mut points {
+            p.num = num;
+            p.value = p.value.clamp(0.0, 1.0);
+        }
+        cc.extend(points);
+        cc.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+        self.checkpoint();
+        self.project.tracks[lane].cc = (!cc.is_empty()).then_some(cc);
+        self.dirty = true;
+        self.publish_fx();
+        self.sel_changed = true;
+        Ok(())
+    }
+
     /// Set lane `lane`'s level automation (dB over seconds; empty clears it).
     pub fn set_automation(&mut self, lane: usize, mut points: Vec<poing_model::GainPoint>) -> Result<(), String> {
         let t = self.project.tracks.get_mut(lane).ok_or("no such lane")?;
