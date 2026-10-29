@@ -539,6 +539,16 @@ impl EditorState {
         }
     }
 
+    /// Close plugin `id`'s own window, if open (what was changed there is kept).
+    pub fn close_editor(&mut self, id: &str) {
+        #[cfg(windows)]
+        if let Some(h) = self.plugins.get_mut(id) {
+            h.close_editor();
+            self.save_plugin_states();
+        }
+        let _ = id;
+    }
+
     /// Open the window of plugin `id` (an effect id, or a MIDI lane's track id).
     pub fn open_editor(&mut self, id: &str) -> Result<String, String> {
         #[cfg(windows)]
@@ -882,7 +892,18 @@ impl EditorState {
     pub fn set_instrument_sound(&mut self, lane: usize, sound: &crate::sounds::SoundInfo) -> Result<(), String> {
         let path = self.plugin_library.iter().find(|(n, _)| *n == sound.plugin).map(|(_, p)| p.clone()).ok_or_else(|| format!("{} is not installed", sound.plugin))?;
         let Some(id) = self.project.tracks.get(lane).filter(|t| t.is_midi()).map(|t| t.id.clone()) else { return Err("that lane has no notes".into()) };
-        let state = crate::sounds::state_of(sound)?;
+        // a sound built on the plugin's own state (a Serum 2 preset): load it plain first
+        let template = if crate::sounds::needs_template(sound) {
+            self.set_instrument_plugin(lane, &sound.plugin, &path, None)?;
+            #[cfg(windows)]
+            let t = self.plugins.get(&id).and_then(|h| h.save_state());
+            #[cfg(not(windows))]
+            let t: Option<Vec<u8>> = None;
+            Some(t.ok_or("the plugin gave no state to build the sound on")?)
+        } else {
+            None
+        };
+        let state = crate::sounds::state_of(sound, template.as_deref())?;
         self.next_state.insert(id.clone(), state);
         let done = self.set_instrument_plugin(lane, &sound.name, &path, Some(format!("sound: {}", sound.name)));
         self.next_state.remove(&id);

@@ -78,6 +78,12 @@ pub fn manifest() -> ServiceManifest {
         Risk::Act,
     ))
     .with_tool(tool(
+        "plugin_window",
+        "Open (or with `open: false` close) a VST3 plugin's own window: the instrument playing MIDI lane `lane`, or with `effect` that effect in lane `lane`'s chain (the master's without a lane). `own_process` runs that plugin in a process of its own or back in Poing (some plugins only show their window in their own process). What is changed there (an instrument chosen in Kontakt's browser, a preset) is kept with the song; `save_sound` keeps an instrument as a named sound.",
+        r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"effect":{"type":"integer","minimum":0},"open":{"type":"boolean"},"own_process":{"type":"boolean"}},"additionalProperties":false}"#,
+        Risk::Act,
+    ))
+    .with_tool(tool(
         "velocity",
         "Change how hard a MIDI lane's notes are played: each velocity times `scale`, plus `add` (in MIDI steps, -127..127), between bars `from_bar` and `to_bar` (both included; the whole lane without them). Velocity is how loud plucked and struck sounds play (harp, piano, mallets); bowed and blown sample libraries take their loudness from `dynamics` instead. One undo step.",
         r#"{"type":"object","properties":{"lane":{"type":"integer","minimum":0},"scale":{"type":"number","minimum":0,"maximum":4},"add":{"type":"number","minimum":-127,"maximum":127},"from_bar":{"type":"number","minimum":1},"to_bar":{"type":"number","minimum":1}},"required":["lane"],"additionalProperties":false}"#,

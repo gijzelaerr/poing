@@ -2788,6 +2788,26 @@ impl App {
                     st.set_cc(l, num, points).map(|()| format!("{}: controller {num} curve with {n} points", st.project.tracks[l].name))
                 }
             },
+            "plugin_window" => {
+                let lane = index(&a, "lane");
+                let id = match (lane, index(&a, "effect")) {
+                    (Some(l), None) if l < lanes => Some(st.project.tracks[l].id.clone()),
+                    (lane, Some(i)) if lane.is_none_or(|l| l < lanes) => st.project.chain(lane).get(i).map(|f| f.id.clone()),
+                    _ => None,
+                };
+                match id {
+                    None => Err("give a lane played by a plugin, or an effect (with its lane, none for the master)".into()),
+                    Some(id) if get(&a, "own_process").and_then(|v| v.as_bool()).is_some() => {
+                        let on = get(&a, "own_process").and_then(|v| v.as_bool()).unwrap_or(false);
+                        st.set_isolated(&id, on)
+                    }
+                    Some(id) if get(&a, "open").and_then(|v| v.as_bool()) == Some(false) => {
+                        st.close_editor(&id);
+                        Ok("Closed its window".into())
+                    }
+                    Some(id) => st.open_editor(&id),
+                }
+            }
             "velocity" => match index(&a, "lane").filter(|&l| l < lanes && st.project.tracks[l].is_midi()) {
                 None => Err("no such MIDI lane".into()),
                 Some(l) => {

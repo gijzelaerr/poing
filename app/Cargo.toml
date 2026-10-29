@@ -23,6 +23,7 @@ makepad-network.workspace = true
 makepad-core-util.workspace = true
 # Keys played live: lock-free queues to and from the audio thread.
 crossbeam-queue = "0.3"
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 
 # The Windows PC's side of a Mac UI: Poing's GPU jobs served over the LAN.
 [[bin]]

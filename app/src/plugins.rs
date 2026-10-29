@@ -1046,6 +1046,11 @@ mod bench {
                 }
             };
             let took = t0.elapsed();
+            {
+                let p = shared.plugin.lock().unwrap();
+                let i = p.info();
+                println!("{name}: in {} out {} midi-in {} category {:?}; buses {:?}", i.audio_inputs, i.audio_outputs, i.has_midi_input, i.category, p.bus_arrangements().map(|b| format!("{b:?}")));
+            }
             let mut sound = PluginSound::new("midi1", SR);
             sound.hosted = Some(shared);
             let note = |frame, on| NoteEvent::note(frame, 60, 0.8, on);
@@ -1056,7 +1061,11 @@ mod bench {
                 lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
             }
             let peak = l.iter().chain(&r).fold(0.0f32, |m, x| m.max(x.abs()));
-            let state = h.save_state().map(|s| s.len()).unwrap_or(0);
+            let saved = h.save_state();
+            if let (Some(dir), Some(bytes)) = (std::env::var_os("POING_SMOKE_STATE_OUT"), saved.as_ref()) {
+                let _ = std::fs::write(Path::new(&dir).join(format!("{name}.state")), bytes);
+            }
+            let state = saved.map(|s| s.len()).unwrap_or(0);
             report.push(format!("{name}: loaded in {took:.1?}, {} params, state {state} B, peak {:.1} dBFS",
                 h.params.len(), 20.0 * peak.max(1e-9).log10()));
             drop(lane);
@@ -1088,7 +1097,13 @@ mod bench {
                 continue;
             };
             let path = plugins.iter().find(|(p, _)| *p == s.plugin).map(|(_, p)| p.clone()).unwrap();
-            let state = crate::sounds::state_of(s).unwrap();
+            let template = crate::sounds::needs_template(s).then(|| {
+                let (h, _) = load(&path, SR, None, None, LoadAs { instrument: true, isolated: false, realtime: false }).unwrap();
+                let t = h.save_state().unwrap();
+                h.shut_down();
+                t
+            });
+            let state = crate::sounds::state_of(s, template.as_deref()).unwrap();
             let t0 = Instant::now();
             let (h, shared) = load(&path, SR, None, Some(&state), LoadAs { instrument: true, isolated: std::env::var_os("POING_SMOKE_INPROC").is_none(), realtime: false }).unwrap();
             let took = t0.elapsed();
@@ -1119,6 +1134,76 @@ mod bench {
             let db = |x: f32| 20.0 * x.max(1e-9).log10();
             let s1 = SR as usize;
             println!("{q} -> {} ({}): loaded in {took:.1?}; soft 0.7-1.2 s {:.1} dB, loud 2.9-3.4 s {:.1} dB", s.name, s.plugin, db(rms(s1 * 7 / 10, s1 * 12 / 10)), db(rms(s1 * 29 / 10, s1 * 34 / 10)));
+            drop(lane);
+            h.shut_down();
+        }
+    }
+
+    /// A plugin's own state, saved after a knob change, loads into a fresh instance:
+    /// `POING_SMOKE_PLUGIN=<bundle>`.
+    #[test]
+    #[ignore]
+    fn a_saved_state_round_trips() {
+        let path = std::env::var("POING_SMOKE_PLUGIN").unwrap_or_else(|_| "C:/Program Files/Common Files/VST3/Serum2.vst3".into());
+        let how = LoadAs { instrument: true, isolated: std::env::var_os("POING_SMOKE_INPROC").is_none(), realtime: false };
+        let (mut h, _) = load(Path::new(&path), SR, None, None, how).unwrap();
+        let knob = knob_params(&h.params).into_iter().next().unwrap();
+        let before = h.hosted.plugin.lock().unwrap().get_parameter(knob.id).unwrap();
+        let want = if before > 0.5 { 0.1 } else { 0.9 };
+        h.set_param(knob.id, want);
+        let run = |h: &Handle| {
+            let mut b = vst3_host::audio::AudioBuffers::new(0, 2, PLUGIN_BLOCK, SR as f64);
+            for _ in 0..40 {
+                let _ = h.hosted.plugin.lock().unwrap().process_audio(&mut b);
+            }
+        };
+        run(&h);
+        std::thread::sleep(Duration::from_millis(300));
+        let state = h.save_state().unwrap();
+        h.shut_down();
+        let (h2, _) = load(Path::new(&path), SR, None, Some(&state), how).unwrap();
+        run(&h2);
+        let after = h2.hosted.plugin.lock().unwrap().get_parameter(knob.id).unwrap();
+        println!("{path}: knob {} {before:.3} -> set {want} -> fresh instance with the state reads {after:.3} (state {} B)", knob.name, state.len());
+        h2.shut_down();
+    }
+
+    /// A plugin given a file as its state (a Kontakt .nki/.nkm, a Serum 2 or Vital preset):
+    /// does it load and play? `POING_SMOKE_PLUGIN=<bundle> POING_SMOKE_NKI="<file>|<pitch>;..."`;
+    /// Kontakt 8 by default. (Kontakt takes minutes over such a state and comes up empty.)
+    #[test]
+    #[ignore]
+    fn a_state_file_plays() {
+        use crate::synth::{MidiLane, NoteEvent, PluginSound, Sound};
+        let plugin_path = std::env::var("POING_SMOKE_PLUGIN").unwrap_or_else(|_| "C:/Program Files/Common Files/VST3/Kontakt 8.vst3".into());
+        let kontakt = plugin_path.as_str();
+        let picks = std::env::var("POING_SMOKE_NKI").unwrap_or_default();
+        for pick in picks.split(';').filter(|p| !p.is_empty()) {
+            let (file, pitch) = pick.split_once('|').unwrap_or((pick, "60"));
+            let bytes = std::fs::read(file).unwrap();
+            let t0 = Instant::now();
+            let (h, shared) = match load(Path::new(kontakt), SR, None, Some(&bytes), LoadAs { instrument: true, isolated: std::env::var_os("POING_SMOKE_INPROC").is_none(), realtime: false }) {
+                Ok(x) => x,
+                Err(e) => {
+                    println!("{file}: did not load: {e}");
+                    continue;
+                }
+            };
+            let took = t0.elapsed();
+            let mut sound = PluginSound::new("midi1", SR);
+            sound.hosted = Some(shared);
+            let p: u8 = pitch.parse().unwrap_or(60);
+            let mut lane = MidiLane::new(0, vec![NoteEvent::note(4800, p, 0.8, true), NoteEvent::note(3 * 48000, p, 0.0, false)], Sound::Plugin(sound));
+            let n = 4 * SR as usize;
+            let (mut l, mut r) = (vec![0.0; n], vec![0.0; n]);
+            // a sample player loads its samples in the background: give it time, then play
+            std::thread::sleep(Duration::from_secs(8));
+            for a in (0..n).step_by(480) {
+                lane.render(a as u64, &mut l[a..a + 480], &mut r[a..a + 480]);
+            }
+            let peak = l.iter().chain(&r).fold(0.0f32, |m, x| m.max(x.abs()));
+            let back = h.save_state().map(|s| s.len()).unwrap_or(0);
+            println!("{file}: loaded in {took:.1?}, peak {:.1} dBFS, state after {back} B (nki {} B)", 20.0 * peak.max(1e-9).log10(), bytes.len());
             drop(lane);
             h.shut_down();
         }

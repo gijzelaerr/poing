@@ -14,6 +14,7 @@
 //!   in the per-user `sounds` folder.
 
 use makepad_micro_serde::*;
+use makepad_strict_json::Value;
 use std::path::{Path, PathBuf};
 
 /// One sound Poing can put on a MIDI lane.
@@ -257,6 +258,10 @@ fn registered_content_dirs() -> Vec<PathBuf> {
 }
 
 fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    walk_ext(dir, depth, "nksf", out)
+}
+
+fn walk_ext(dir: &Path, depth: u32, ext: &str, out: &mut Vec<PathBuf>) {
     if depth > 6 {
         return;
     }
@@ -264,11 +269,108 @@ fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     for e in rd.flatten() {
         let p = e.path();
         match e.file_type() {
-            Ok(t) if t.is_dir() => walk(&p, depth + 1, out),
-            Ok(_) if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nksf")) => out.push(p),
+            Ok(t) if t.is_dir() => walk_ext(&p, depth + 1, ext, out),
+            Ok(_) if p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)) => out.push(p),
             _ => {}
         }
     }
+}
+
+/// Serum 2's preset folder: `POING_SERUM`, else Xfer's place in Documents.
+fn serum_root() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("POING_SERUM") {
+        return Some(PathBuf::from(d));
+    }
+    Some(PathBuf::from(std::env::var_os("USERPROFILE")?).join("Documents").join("Xfer").join("Serum 2 Presets").join("Presets"))
+}
+
+/// An `XferJson` file (a Serum 2 preset or state): its JSON header, and what follows it.
+pub fn xfer_split(b: &[u8]) -> Result<(&str, &[u8]), String> {
+    if !b.starts_with(b"XferJson\0") || b.len() < 17 {
+        return Err("not an Xfer file".into());
+    }
+    let n = u64::from_le_bytes(b[9..17].try_into().unwrap()) as usize;
+    let json = b.get(17..17 + n).ok_or("the header runs past the end")?;
+    Ok((std::str::from_utf8(json).map_err(|e| e.to_string())?, &b[17 + n..]))
+}
+
+/// A Serum 2 preset's name and tags.
+fn serum_info(b: &[u8]) -> Option<(String, String)> {
+    let (json, _) = xfer_split(b).ok()?;
+    let Value::Obj(pairs) = makepad_strict_json::parse(json.as_bytes()).ok()? else { return None };
+    let get = |k: &str| pairs.iter().find(|(x, _)| x == k).map(|(_, v)| v);
+    let name = get("presetName")?.as_str()?.to_string();
+    let tags: Vec<String> = get("tags").and_then(|t| t.as_arr()).unwrap_or_default().iter().filter_map(|t| t.as_str().map(str::to_string)).collect();
+    Some((name, tags.join(", ")))
+}
+
+/// A zstd frame holding `data` uncompressed (raw blocks), which every decoder reads.
+fn zstd_raw(data: &[u8]) -> Vec<u8> {
+    let mut out = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    // frame header: single segment, 4-byte content size, no checksum
+    out.push(0b1010_0000);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let mut chunks = data.chunks(128 * 1024).peekable();
+    if chunks.peek().is_none() {
+        out.extend_from_slice(&[1, 0, 0]); // one empty last raw block
+    }
+    while let Some(c) = chunks.next() {
+        let header = (c.len() as u32) << 3 | chunks.peek().is_none() as u32;
+        out.extend_from_slice(&header.to_le_bytes()[..3]);
+        out.extend_from_slice(c);
+    }
+    out
+}
+
+/// A Serum 2 state that plays `preset`: the patch (CBOR, in the preset's zstd frame) with
+/// the processor's own entries added, under `template`'s (a state Serum 2 gave) headers,
+/// the processor header's hash (MD5 of the frame) made new.
+pub fn serum_state(template: &[u8], preset: &[u8]) -> Result<Vec<u8>, String> {
+    const MAGIC: &[u8; 16] = b"VST3HOST_STATE\0\0";
+    if !template.starts_with(MAGIC) || template.len() < 28 {
+        return Err("the template is not a saved Serum 2 state".into());
+    }
+    let word = |o: usize| u32::from_le_bytes(template[o..o + 4].try_into().unwrap()) as usize;
+    let (clen, ctl) = (word(20), word(24));
+    let comp = template.get(28..28 + clen).ok_or("a short template")?;
+    let ctrl = if ctl == u32::MAX as usize { &[][..] } else { template.get(28 + clen..28 + clen + ctl).ok_or("a short template")? };
+    let (proc_json, _) = xfer_split(comp)?;
+    let (_, rest) = xfer_split(preset)?;
+    if rest.len() < 8 {
+        return Err("the preset has no patch".into());
+    }
+    let flag = &rest[4..8];
+    let mut cbor = Vec::new();
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(&rest[8..]).map_err(|e| format!("the patch: {e}"))?;
+    std::io::Read::read_to_end(&mut dec, &mut cbor).map_err(|e| format!("the patch: {e}"))?;
+    // a definite map at the top: three more entries
+    let (count, body) = match cbor.first() {
+        Some(0xb8) if cbor.len() > 2 => (cbor[1] as usize, &cbor[2..]),
+        Some(0xb9) if cbor.len() > 3 => (u16::from_be_bytes([cbor[1], cbor[2]]) as usize, &cbor[3..]),
+        Some(&t) if (0xa0..0xb8).contains(&t) => ((t - 0xa0) as usize, &cbor[1..]),
+        _ => return Err("the patch is not a map".into()),
+    };
+    let n = count + 3;
+    let mut patch = if n < 256 { vec![0xb8, n as u8] } else { vec![0xb9, (n >> 8) as u8, n as u8] };
+    patch.extend_from_slice(body);
+    patch.extend_from_slice(b"\x69component\x69processor\x6fmodMatrixLocked\xf4\x72scalarCurvesLocked\x82\xf4\xf4");
+    let frame = zstd_raw(&patch);
+    let hash = format!("{:032x}", md5(&frame));
+    let at = proc_json.find("\"hash\":\"").ok_or("no hash in the template")? + 8;
+    let json = format!("{}{hash}{}", &proc_json[..at], proc_json.get(at + 32..).ok_or("a short hash")?);
+    let mut c = b"XferJson\0".to_vec();
+    c.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    c.extend_from_slice(json.as_bytes());
+    c.extend_from_slice(&(patch.len() as u32).to_le_bytes());
+    c.extend_from_slice(flag);
+    c.extend_from_slice(&frame);
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(if ctrl.is_empty() { u32::MAX } else { ctrl.len() as u32 }).to_le_bytes());
+    out.extend_from_slice(&c);
+    out.extend_from_slice(ctrl);
+    Ok(out)
 }
 
 /// The index cached in the sounds folder: NKS presets read once.
@@ -288,7 +390,27 @@ pub fn library(plugins: &[(String, PathBuf)]) -> Vec<SoundInfo> {
     for root in nks_roots() {
         walk(&root, 0, &mut files);
     }
+    let serum: Vec<PathBuf> = match serum_root() {
+        Some(root) if plugins.iter().any(|(p, _)| p == "Serum2") => {
+            let mut v = Vec::new();
+            walk_ext(&root, 0, "SerumPreset", &mut v);
+            v
+        }
+        _ => Vec::new(),
+    };
     let mut index = Index::default();
+    for f in serum {
+        let key = f.to_string_lossy().into_owned();
+        let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+        let known = old.seen.iter().find(|(k, s, _)| *k == key && *s == size).map(|(_, _, i)| i.clone());
+        let info = known.unwrap_or_else(|| {
+            let (name, tags) = std::fs::read(&f).ok().and_then(|b| serum_info(&b))?;
+            let folder = f.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let types = [tags, folder].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
+            Some(SoundInfo { name, plugin: "Serum2".into(), types, file: key.clone(), saved: false })
+        });
+        index.seen.push((key, size, info));
+    }
     for f in files {
         let key = f.to_string_lossy().into_owned();
         let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
@@ -349,13 +471,65 @@ pub fn forget() {
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// The sound's plugin state.
-pub fn state_of(s: &SoundInfo) -> Result<Vec<u8>, String> {
+/// A sound that is built on a state its plugin gives first (a Serum 2 preset).
+pub fn needs_template(s: &SoundInfo) -> bool {
+    s.file.to_lowercase().ends_with(".serumpreset")
+}
+
+/// The sound's plugin state; `template` is the plugin's own state, for the sounds
+/// that are built on one ([`needs_template`]).
+pub fn state_of(s: &SoundInfo, template: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let bytes = std::fs::read(&s.file).map_err(|e| format!("{}: {e}", s.file))?;
     if s.saved {
         return Ok(bytes);
     }
+    if needs_template(s) {
+        return serum_state(template.ok_or("Serum 2's own state is needed first")?, &bytes);
+    }
     Ok(read_nks(&bytes)?.state)
+}
+
+/// MD5 (RFC 1321), for Serum 2's header hash.
+fn md5(data: &[u8]) -> u128 {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11,
+        16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_le_bytes());
+    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    for chunk in msg.chunks(64) {
+        let m: Vec<u32> = chunk.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    for (i, w) in [a0, b0, c0, d0].iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    u128::from_be_bytes(out)
 }
 
 /// Keep a plugin's state as a named sound (replacing one of the same name).
@@ -441,6 +615,17 @@ mod tests {
         let plugins = vec![("BBC Symphony Orchestra (64 Bit)".to_string(), PathBuf::from("bbc.vst3")), ("Serum2".to_string(), PathBuf::from("s.vst3"))];
         assert_eq!(plugin_for(&nks, &plugins).as_deref(), Some("BBC Symphony Orchestra (64 Bit)"));
         assert!(read_nks(b"RIFF\0\0\0\0WAVE").is_err());
+    }
+
+    #[test]
+    fn md5_and_a_raw_zstd_frame_are_standard() {
+        assert_eq!(format!("{:032x}", md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(format!("{:032x}", md5(b"The quick brown fox jumps over the lazy dog")), "9e107d9d372bb6826bd81d3542a419d6");
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut back = Vec::new();
+        let frame = zstd_raw(&data);
+        std::io::Read::read_to_end(&mut ruzstd::decoding::StreamingDecoder::new(&frame[..]).unwrap(), &mut back).unwrap();
+        assert_eq!(back, data);
     }
 
     #[test]
