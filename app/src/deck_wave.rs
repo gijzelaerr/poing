@@ -1,11 +1,11 @@
 //! A deck's waveform in live mode: the song scrolling under a fixed playhead
 //! (four seconds either side), the stems each in their colour, with the beat
 //! grid, the hot cues, the sections and the loop; under it the whole song
-//! with where the deck is. It reads the deck the audio thread publishes; it
-//! takes no input.
+//! with where the deck is. It reads the deck the audio thread publishes. A
+//! click on either part sends the deck there.
 
 use crate::audio::PEAK_BLOCK;
-use crate::decks::{DeckSong, DECKS};
+use crate::decks::{Cmd, DeckSong, DECKS};
 use crate::state::EditorState;
 use makepad_widgets::*;
 use std::sync::atomic::Ordering;
@@ -37,6 +37,27 @@ const COLORS: [u32; 4] = [0xffb454, 0x5ad1e6, 0xc38bff, 0x6fcf7a];
 
 fn rgba(hex: u32, a: f32) -> Vec4f {
     vec4(((hex >> 16) & 0xff) as f32 / 255.0, ((hex >> 8) & 0xff) as f32 / 255.0, (hex & 0xff) as f32 / 255.0, a)
+}
+
+/// The song time a click at `at` asks for, in a waveform drawn in `rect`
+/// with the playhead at `t` of a song `seconds` long: the scrolling part is
+/// seconds either side of the middle, the strip under it the whole song.
+/// None in the gap between them, or past the song's ends.
+pub fn time_at(rect: Rect, at: DVec2, t: f64, seconds: f64) -> Option<f64> {
+    let w = rect.size.x.floor().max(1.0);
+    let h = (rect.size.y - OVERVIEW_H - GAP).max(20.0);
+    let (x, y) = (at.x - rect.pos.x, at.y - rect.pos.y);
+    if x < 0.0 || x > w || y < 0.0 {
+        return None;
+    }
+    let to = if y < h {
+        t + (x - w * 0.5) * SPAN_S / w
+    } else if y >= h + GAP && y <= h + GAP + OVERVIEW_H {
+        x / w * seconds
+    } else {
+        return None;
+    };
+    (0.0..=seconds).contains(&to).then_some(to)
 }
 
 /// The lanes of a deck's song that make sound: (stem index, level, the stem
@@ -97,6 +118,9 @@ pub struct DeckWave {
     overview: Vec<f32>,
     #[rust]
     overview_of: (usize, usize),
+    /// Where it was last drawn.
+    #[rust]
+    rect: Rect,
 }
 
 impl DeckWave {
@@ -216,14 +240,25 @@ impl DeckWave {
 }
 
 impl Widget for DeckWave {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if self.next_frame.is_event(event).is_some() {
             self.area.redraw(cx);
+        }
+        if let Hit::FingerDown(fe) = event.hits(cx, self.area) {
+            let Some(st) = scope.data_mut().get_mut::<EditorState>() else { return };
+            let decks = &st.shared.decks;
+            let d = (self.deck as usize).min(DECKS - 1);
+            let Some(song) = decks.song(d) else { return };
+            if let Some(to) = time_at(self.rect, fe.abs, decks.deck[d].pos.get(), song.seconds()) {
+                decks.deck[d].send(Cmd::Jump(to));
+                self.area.redraw(cx);
+            }
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let rect = cx.walk_turtle_with_area(&mut self.area, walk);
+        self.rect = rect;
         self.draw_bg.draw_abs(cx, rect);
         if let Some(st) = scope.data_mut().get_mut::<EditorState>() {
             self.draw_deck(cx, st, rect);
@@ -238,6 +273,22 @@ mod tests {
     use crate::audio::{MixParams, Stem, Stems};
     use crate::decks::Grid;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_click_on_the_waveform_is_a_time_in_the_song() {
+        // 800 wide, 150 high: the scrolling part is the top 122, the strip the bottom 22
+        let rect = Rect { pos: dvec2(100.0, 50.0), size: dvec2(800.0, 150.0) };
+        let at = |x: f64, y: f64| time_at(rect, dvec2(100.0 + x, 50.0 + y), 60.0, 200.0);
+        assert_eq!(at(400.0, 30.0), Some(60.0), "the middle is where the deck is");
+        assert_eq!(at(600.0, 30.0), Some(62.0), "a quarter of the width is two seconds");
+        assert_eq!(at(0.0, 30.0), Some(56.0));
+        assert_eq!(at(400.0, 125.0), None, "the gap between the two");
+        assert_eq!(at(400.0, 140.0), Some(100.0), "the strip is the whole song");
+        assert_eq!(at(800.0, 140.0), Some(200.0));
+        assert_eq!(at(900.0, 30.0), None);
+        // near the song's start the left of the scrolling part is before it
+        assert_eq!(time_at(rect, dvec2(110.0, 80.0), 1.0, 200.0), None);
+    }
 
     #[test]
     fn the_waveform_shows_the_lanes_that_sound_at_their_levels() {

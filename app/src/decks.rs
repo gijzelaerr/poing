@@ -299,6 +299,9 @@ pub enum Cmd {
     /// To this many seconds (the tests).
     #[allow(dead_code)]
     Seek(f64),
+    /// To this many seconds (a click on the waveform): while playing it
+    /// lands as far past a beat as the deck is now, like a hot cue.
+    Jump(f64),
 }
 
 /// One deck's controls (UI and MIDI → audio) and what it is doing (audio → UI).
@@ -1278,6 +1281,7 @@ impl DeckPlayer {
                 self.pos = s.clamp(0.0, song.seconds()) * sr;
                 self.loop_on = false;
             }
+            Cmd::Jump(s) => jump(self, s.clamp(0.0, song.seconds())),
         }
         if self.pos != before {
             self.jumped = true;
@@ -1854,6 +1858,30 @@ mod tests {
         decks.deck[0].send(Cmd::Loop(1.0));
         let _ = run(&mut p, &decks, 1.0);
         assert!(!decks.deck[0].loop_on.load(Ordering::Relaxed) && decks.deck[0].pos.get() > 9.0);
+    }
+
+    #[test]
+    fn a_click_on_the_waveform_jumps_and_keeps_the_beat_while_playing() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        decks.load(0, song(sr, 30.0));
+        let d = &decks.deck[0];
+        // stopped: exactly there
+        d.send(Cmd::Jump(12.3));
+        let _ = run(&mut p, &decks, 0.05);
+        assert!((d.pos.get() - 12.3).abs() < 1e-6 && !d.playing.load(Ordering::Relaxed), "{}", d.pos.get());
+        // playing, 0.2 s past a beat: it lands 0.2 s past the beat nearest the click
+        d.send(Cmd::Seek(3.0));
+        d.send(Cmd::Play);
+        let _ = run(&mut p, &decks, 0.2);
+        d.send(Cmd::Jump(20.1));
+        let _ = run(&mut p, &decks, 0.01);
+        assert!(d.playing.load(Ordering::Relaxed) && (d.pos.get() - 20.21).abs() < 0.005, "{}", d.pos.get());
+        // past the end: the end
+        d.send(Cmd::Jump(99.0));
+        let _ = run(&mut p, &decks, 0.05);
+        assert!((d.pos.get() - 30.0).abs() < 0.01);
     }
 
     #[test]
