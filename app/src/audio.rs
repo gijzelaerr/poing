@@ -584,6 +584,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut stems: Stems = shared.stems.lock().map(|s| s.clone()).unwrap_or_default();
     let mut stems_gen = shared.stems_gen.load(Ordering::Acquire);
     let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
+    let (mut cue_l, mut cue_r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
     let mut rack = Box::new(FxRack::empty());
     let mut was_playing = false;
     let mut last_live: Option<usize> = None;
@@ -632,9 +633,20 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
             let n_src = ((dev_frames as f64 * ratio).ceil() as usize).max(1);
             l.resize(n_src, 0.0);
             r.resize(n_src, 0.0);
+            // an output with four channels carries the headphones on its second pair
+            if out.channel_count() >= 4 {
+                cue_l.resize(n_src, 0.0);
+                cue_r.resize(n_src, 0.0);
+                decks.render_cue(&shared.decks, &mut l, &mut r, Some((&mut cue_l, &mut cue_r)));
+                if !muted {
+                    play_out(out, 0, &l, &r, ratio);
+                    play_out(out, 2, &cue_l, &cue_r, ratio);
+                }
+                return;
+            }
             decks.render(&shared.decks, &mut l, &mut r);
             if !muted {
-                play_out(out, &l, &r, ratio);
+                play_out(out, 0, &l, &r, ratio);
             }
             return;
         }
@@ -733,7 +745,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
             n_src
         };
         if !muted {
-            play_out(out, &l[..n_src], &r[..n_src], ratio);
+            play_out(out, 0, &l[..n_src], &r[..n_src], ratio);
         }
     });
 }
@@ -760,13 +772,14 @@ fn start_headphones(cx: &mut Cx, shared: Arc<Shared>, sr: u32, muted: bool) {
         r.resize(n, 0.0);
         reader.pull(&shared.decks.cue, &mut l, &mut r);
         if !muted {
-            play_out(out, &l, &r, ratio);
+            play_out(out, 0, &l, &r, ratio);
         }
     });
 }
 
-/// Stem-rate frames l/r to the device's frames (nearest frame at another rate).
-fn play_out(out: &mut AudioBuffer, l: &[f32], r: &[f32], ratio: f64) {
+/// Stem-rate frames l/r to the device's frames (nearest frame at another
+/// rate), on the pair of channels from `first`.
+fn play_out(out: &mut AudioBuffer, first: usize, l: &[f32], r: &[f32], ratio: f64) {
     let n_src = l.len().min(r.len());
     if n_src == 0 {
         return;
@@ -774,9 +787,9 @@ fn play_out(out: &mut AudioBuffer, l: &[f32], r: &[f32], ratio: f64) {
     let chans = out.channel_count();
     for i in 0..out.frame_count() {
         let j = ((i as f64 * ratio) as usize).min(n_src - 1);
-        if chans >= 2 {
-            out.channel_mut(0)[i] = l[j];
-            out.channel_mut(1)[i] = r[j];
+        if chans >= first + 2 {
+            out.channel_mut(first)[i] = l[j];
+            out.channel_mut(first + 1)[i] = r[j];
         } else {
             out.channel_mut(0)[i] = 0.5 * (l[j] + r[j]);
         }
