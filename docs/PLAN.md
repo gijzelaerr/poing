@@ -203,7 +203,7 @@ Fixed during QA: the Settings switches for AI and compute (they were text only);
 - **Gijs's checks:** the Mac UI against this PC (docs/REMOTE.md), the rekordbox import onto the OMNIS-DUO (PR #6 steps), the installer on a clean account, clicking inside a plugin's own window.
 - Build note: `poing-engine` must be built with `MAKEPAD_CUDA_ROOT` (CLAUDE.md) or the local model and native analysis fall back / fail; a plain `cargo build` gives the CPU stub.
 
-**Live (docs/LIVE.md):** two decks played from the OMNIS-DUO (2026-10-24, not yet on the hardware); a deck plays the song's lane effects and MIDI lanes, VST3 included (2026-11-11). Key lock and a headphone cue on a second sound output (2026-11-11). Next: the hardware checks, a waveform view, recording the set.
+**Live (docs/LIVE.md):** two decks played from the OMNIS-DUO (2026-10-24, not yet on the hardware); a deck plays the song's lane effects and MIDI lanes, VST3 included (2026-11-11). Key lock and a headphone cue on a second sound output (2026-11-11). Deck waveforms and recording the set (2026-11-11). Next: the hardware checks.
 
 **After 1.0:** isolated plugins restart on every tab switch (in-process ones stay loaded); tool calls with unknown arguments are ignored instead of refused; the small model's chords are short stabs; long take names in DJ file names are cut with "…".
 

@@ -153,6 +153,25 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
   - An output with four channels gets the headphones on channels 3 and 4 as well, with no second output and no delay. That needs Makepad to open more than two channels, which on Windows it does not do yet.
   - The live view's status line names the headphones' output, and the `live` tool gives `headphones_level_db`.
 
+### The waveforms
+
+Each deck shows its song under a fixed playhead in the middle, four seconds either side, scrolling as the deck moves (also under the hand on the platter).
+
+- **The stems** each have a colour: vocals orange, drums blue, bass purple, other green. In every column the widest is drawn first, so the quieter ones stay visible on top. A muted stem stays as a shadow. A whole-song remix is one piece of audio and shows in one colour. MIDI lanes have no waveform.
+- **The beat grid** is a line per beat, every fourth one brighter (counted from the grid's first beat). **Sections** have a line and their name along the bottom. **Hot cues** are a red line with their letter, the **cue point** a yellow tick at the bottom, a running **loop** a blue band.
+- **Under it** is the whole song in one strip: what has been played is dimmed, with a line where the deck is and ticks for the hot cues.
+- It only shows; it takes no clicks.
+
+### Recording the set
+
+**Record the set** (top right of the live view) writes what live mode plays, both decks through the mixer and the beat FX, to a WAV file (24-bit stereo, at the song's sample rate). The button then reads **Stop recording** with the time so far.
+
+- **Where.** `Music\Poing\Sets\set-2026-11-11-153000.wav` (the songs folder, `POING_SONGS` moves it). The date and time in the name are UTC. The status line says where it went when it stops.
+- **When it stops.** With the button, on leaving live mode, or by itself after three hours or when the disk is full.
+- **A muted Poing records too** (`POING_MUTE`): the file is what would have played.
+- **The disk does not hold up the sound.** The audio callback puts the frames in a ring and a thread of its own writes them. If the disk stands still for over two thirds of a second, what could not be kept is left out, and the status line says how much. The file's header is brought up to date every second, so a recording that is cut off is still a WAV file.
+- The `live` tool takes `record: true` or `false` and gives `recording` (on, file, seconds).
+
 ### The map is a data file
 
 - **Where it is.** The mapping is [`app/live/omnis-duo.map`](../app/live/omnis-duo.map), built into Poing. A copy in Poing's config folder overrides it, so a wrong control can be fixed without a rebuild: `%APPDATA%\Poing\omnis-duo.map` on Windows, `~/Library/Application Support/Poing/omnis-duo.map` on a Mac.
@@ -206,9 +225,15 @@ Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a h
 - Settings shows the second choice under Sound ("No headphones in live mode").
 - `live_test.sh` again on a fresh Poing: 13 of 13.
 - Not checked: sound through a second output (the callback that plays the headphones never ran here), and how key lock sounds. Four clips for the ear are made by the `key_lock_by_ear` test (12 s of a song at +8% and −8%, like vinyl and locked).
-- After these runs the loop handling changed (nothing rendered past a loop's end, the note on a loop's first beat, a jump under key lock heard at once) and the headphones' distance behind the decks became two blocks. Those changes have unit tests only: the PC's remote desktop session had disconnected by then, which left Windows without a sound output, so the decks of a hidden Poing did not run.
+- After these runs the loop handling changed (nothing rendered past a loop's end, the note on a loop's first beat, a jump under key lock heard at once) and the headphones' distance behind the decks became two blocks. Run again later that day with those changes in: `live_test.sh` 13 of 13, and with key lock on both decks the same moves with a 2-beat loop held for 6 s, the phase difference under 0.02 beat throughout. (A hidden Poing's decks only run while Windows has a sound output: with the remote desktop session disconnected there is none.)
 
-The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another. For key lock: a 440 Hz tone at +8% reads 475 Hz like vinyl and 440 Hz locked (at −8% too) at a steady level, the song's own tempo gives the mixer's samples back, and turning the lock on and off leaves no step between two frames larger than a tone's own. For loops, with and without key lock: a note that starts exactly at a one-beat loop's end is not heard in it, and a note on its first beat sounds each of six times round at +3.7%. For the headphones: a cued deck is in the cue ring and not in the master with its fader down, and the reader starts two blocks behind, goes 200 blocks of 1500 frames without a gap whichever output goes first, plays silence when it catches up and skips when far behind.
+**The waveforms and recording the set, 2026-11-11, on glacier.**
+
+- A screenshot of the live view with deck 1 playing and deck 2 in a 2-beat loop from hot cue B with its vocals muted: both waveforms with their four stems, the beat lines, the section names, the B marker, the loop's band over two beats and the vocals as a shadow on deck 2; the strips under them with the position.
+- `live {"record": true}`, six seconds, `{"record": false}`: a 24-bit stereo 48 kHz WAV of 6.26 s in `Sets`, peaking at 0.9, no frames lost. The button read "Stop recording · 0:06.1" meanwhile.
+- Nobody has listened to a recorded set yet.
+
+The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another. For key lock: a 440 Hz tone at +8% reads 475 Hz like vinyl and 440 Hz locked (at −8% too) at a steady level, the song's own tempo gives the mixer's samples back, and turning the lock on and off leaves no step between two frames larger than a tone's own. For loops, with and without key lock: a note that starts exactly at a one-beat loop's end is not heard in it, and a note on its first beat sounds each of six times round at +3.7%. For the set: 2.5 s pushed through the ring comes out of the file sample for sample with a header that matches, and a writer kept away for too long gets the newest half of the ring and counts the rest as lost. For the waveform: the lanes that sound, at their levels, per stem. For the headphones: a cued deck is in the cue ring and not in the master with its fader down, and the reader starts two blocks behind, goes 200 blocks of 1500 frames without a gap whichever output goes first, plays silence when it catches up and skips when far behind.
 
 ### To check on the real DUO
 
@@ -229,6 +254,5 @@ The unit tests (`cargo test`, `deckmap` and `decks`) check every documented mess
 - Bringing back a deck's plugin after its process crashed. In the song's tab a plugin that runs in its own process is reloaded when its helper dies; a deck's instance is not, so that lane stays silent until the next Load.
 - A cue/master mix and a level for the headphones in Poing, and master and headphones on one four-channel output.
 - Saving changed cue points to the song.
-- A waveform view (the live view shows the decks as text and bars).
 - Decks 3 and 4.
-- Recording the set.
+- A click on the waveform to jump there (needle search).

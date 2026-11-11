@@ -333,6 +333,8 @@ pub struct Deck {
     pub beat: AF64,
     pub loop_on: AtomicBool,
     pub loop_beats: AF32,
+    /// Where the loop starts (seconds).
+    pub loop_start: AF64,
     pub cue: AF64,
     pub meter: AF32,
     /// The song: published by generation; the UI keeps the one it replaced
@@ -367,6 +369,7 @@ impl Default for Deck {
             beat: AF64::new(0.0),
             loop_on: AtomicBool::new(false),
             loop_beats: AF32::new(4.0),
+            loop_start: AF64::new(0.0),
             cue: AF64::new(0.0),
             meter: AF32::new(0.0),
             song: Mutex::new(None),
@@ -407,6 +410,9 @@ pub struct Decks {
     /// What the headphones play, and its level.
     pub cue: CueRing,
     pub cue_meter: AF32,
+    /// What live mode plays, for the set recorder (written while `taping`).
+    pub tape: CueRing,
+    pub taping: AtomicBool,
     pub ports_in: [AtomicU64; PORTS],
     pub ports_out: [AtomicU64; PORTS],
     /// Messages from the controller that the map does not know, for the log.
@@ -429,6 +435,8 @@ impl Default for Decks {
             bpm: AF64::new(0.0),
             cue: CueRing::default(),
             cue_meter: AF32::new(0.0),
+            tape: CueRing::default(),
+            taping: AtomicBool::new(false),
             ports_in: std::array::from_fn(|_| AtomicU64::new(0)),
             ports_out: std::array::from_fn(|_| AtomicU64::new(0)),
             unmapped: ArrayQueue::new(64),
@@ -666,6 +674,30 @@ impl CueRing {
             self.r[s].store(r[i].to_bits(), Ordering::Relaxed);
         }
         self.written.store(base + n as u64, Ordering::Release);
+    }
+
+    /// Frames written so far.
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
+    }
+
+    /// A reader that wants every frame (the set recorder): the next frames
+    /// from `at` into l/r, and `at` moved on. Returns how many it gave, and
+    /// how many it had to skip because the writer had come too close to them
+    /// (the reader was away for over half the ring).
+    pub fn take(&self, at: &mut u64, l: &mut [f32], r: &mut [f32]) -> (usize, u64) {
+        let written = self.written();
+        let oldest = written.saturating_sub(CUE_RING as u64 / 2);
+        let missed = oldest.saturating_sub(*at);
+        *at = (*at).max(oldest);
+        let n = ((written - *at) as usize).min(l.len()).min(r.len());
+        for i in 0..n {
+            let s = (*at as usize + i) % CUE_RING;
+            l[i] = f32::from_bits(self.l[s].load(Ordering::Relaxed));
+            r[i] = f32::from_bits(self.r[s].load(Ordering::Relaxed));
+        }
+        *at += n as u64;
+        (n, missed)
     }
 }
 
@@ -1570,6 +1602,7 @@ impl DeckPlayer {
         deck.beat.set(self.song.as_ref().map_or(0.0, |s| s.grid.beat_at(t)));
         deck.loop_on.store(self.loop_on, Ordering::Relaxed);
         deck.loop_beats.set(self.loop_beats);
+        deck.loop_start.set(self.song.as_ref().map_or(0.0, |s| s.grid.time_at(self.loop_a)));
         deck.cue.set(self.song.as_ref().map_or(0.0, |s| self.cue / s.sr as f64));
     }
 }
@@ -1688,6 +1721,9 @@ impl Player {
         }
         if let Some(fx) = self.fx.as_mut() {
             fx.run(shared, bpm, l, r);
+        }
+        if shared.taping.load(Ordering::Relaxed) {
+            shared.tape.push(l, r);
         }
         shared.cue.push(&self.cue_l[..n], &self.cue_r[..n]);
         let peak = self.cue_l[..n].iter().chain(&self.cue_r[..n]).fold(0.0f32, |p, x| p.max(x.abs()));

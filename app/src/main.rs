@@ -17,7 +17,9 @@ mod fx;
 mod fx_writer;
 mod listen;
 mod live;
+mod deck_wave;
 mod live_view;
+mod setrec;
 mod llm;
 mod plugins;
 mod remote;
@@ -550,6 +552,7 @@ script_mod! {
                                 draw_text +: {color: TEXT text_style: theme.font_bold{font_size: 20}}
                             }
                             live_status := Caption{width: Fill text: ""}
+                            live_rec := PillButton{text: "Record the set"}
                             live_done := PillButton{text: "Back to the song"}
                         }
                         View{
@@ -557,6 +560,7 @@ script_mod! {
                             DeckPanel{
                                 d0_title := CardTitle{text: ""}
                                 d0_time := DeckBig{text: ""}
+                                d0_wave := mod.widgets.DeckWave{deck: 0}
                                 d0_info := DeckLine{text: ""}
                                 d0_pads := DeckLine{text: ""}
                                 d0_stems := DeckLine{text: ""}
@@ -578,6 +582,7 @@ script_mod! {
                             DeckPanel{
                                 d1_title := CardTitle{text: ""}
                                 d1_time := DeckBig{text: ""}
+                                d1_wave := mod.widgets.DeckWave{deck: 1}
                                 d1_info := DeckLine{text: ""}
                                 d1_pads := DeckLine{text: ""}
                                 d1_stems := DeckLine{text: ""}
@@ -770,6 +775,11 @@ pub struct App {
     live_shown: bool,
     #[rust]
     live_pump: Timer,
+    /// The set being recorded, and the last one that was.
+    #[rust]
+    set_rec: Option<setrec::SetRec>,
+    #[rust]
+    set_done: Option<setrec::Recorded>,
     #[rust]
     live_map: Option<std::sync::Arc<deckmap::Map>>,
     #[rust]
@@ -3576,6 +3586,11 @@ impl MatchEvent for App {
             self.show_live(cx, false);
             return;
         }
+        if ui.button(cx, ids!(live_rec)).clicked(actions) {
+            let on = self.set_rec.is_none();
+            self.record_set(cx, on);
+            return;
+        }
         if ui.button(cx, ids!(render_btn)).clicked(actions) {
             let on = !self.export_shown;
             self.show_export(cx, on);
@@ -3842,6 +3857,7 @@ impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
         crate::timeline::script_mod(vm);
+        crate::deck_wave::script_mod(vm);
         self::script_mod(vm)
     }
 

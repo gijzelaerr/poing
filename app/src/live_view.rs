@@ -120,6 +120,8 @@ impl App {
                 self.live_pump = cx.start_interval(0.05);
             }
         } else {
+            // the set ends with live mode
+            self.record_set(cx, false);
             shared.decks.on.store(false, Ordering::Relaxed);
             // the song waits at its playhead (Space may have started it meanwhile)
             shared.set_playing(false);
@@ -146,6 +148,10 @@ impl App {
         }
         if shared.decks.retired() {
             self.live_retired.clear();
+        }
+        // a recording that ended by itself (the disk, three hours)
+        if self.set_rec.as_ref().is_some_and(|r| r.ended()) {
+            self.record_set(cx, false);
         }
         while let Some(m) = shared.decks.unmapped.pop() {
             log!("poing: live: unmapped {:02X} {:02X} {:02X}", m[0], m[1], m[2]);
@@ -240,15 +246,58 @@ impl App {
             (None, _) => "no headphones output (Settings, Sound)".to_string(),
         };
         ui.label(cx, ids!(live_status)).set_text(cx, &format!("{port} · {phones}"));
+        let rec = match &self.set_rec {
+            Some(r) => format!("Stop recording · {}", clock(r.seconds())),
+            None => "Record the set".to_string(),
+        };
+        ui.button(cx, ids!(live_rec)).set_text(cx, &rec);
         ui.view(cx, ids!(live_view)).redraw(cx);
     }
 
-    /// The `live` tool: turn live mode on or off, and both decks as they are.
+    /// Start or stop recording the set: what live mode plays, into a WAV file
+    /// in the songs folder's `Sets`. The status line says where it went.
+    pub(crate) fn record_set(&mut self, cx: &mut Cx, on: bool) {
+        let Some(st) = self.state.as_ref() else { return };
+        let shared = st.shared.clone();
+        if on && self.set_rec.is_none() {
+            let path = crate::audio::songs_dir().join("Sets").join(crate::setrec::file_name());
+            match crate::setrec::SetRec::start(shared.clone(), &path, st.sr()) {
+                Ok(rec) => {
+                    shared.decks.taping.store(true, Ordering::Relaxed);
+                    self.set_rec = Some(rec);
+                    self.set_status(cx, &format!("Recording the set to {}", path.display()));
+                }
+                Err(e) => self.set_status(cx, &format!("The set is not being recorded: {e}")),
+            }
+        } else if !on {
+            let Some(rec) = self.set_rec.take() else { return };
+            shared.decks.taping.store(false, Ordering::Relaxed);
+            match rec.finish() {
+                Ok(done) => {
+                    let gap = if done.lost > 0 { format!(" (the disk fell behind: {:.1} s are missing)", done.lost as f64 / st.sr() as f64) } else { String::new() };
+                    self.set_status(cx, &format!("The set is in {} · {}{gap}", done.path.display(), clock(done.seconds)));
+                    self.set_done = Some(done);
+                }
+                Err(e) => self.set_status(cx, &format!("The set's recording failed: {e}")),
+            }
+        }
+        if self.live_shown {
+            self.refresh_live(cx);
+        }
+    }
+
+    /// The `live` tool: turn live mode on or off, record the set, and both decks as they are.
     pub(crate) fn live_tool(&mut self, cx: &mut Cx, args: &[(String, Value)]) -> Result<(String, String), String> {
         if let Some(on) = crate::agent::get(args, "on").and_then(|v| v.as_bool()) {
             if on != self.live_shown {
                 self.show_live(cx, on);
             }
+        }
+        if let Some(on) = crate::agent::get(args, "record").and_then(|v| v.as_bool()) {
+            if on && !self.live_shown {
+                return Err("live mode is off: turn it on to record the set".into());
+            }
+            self.record_set(cx, on);
         }
         let st = self.state.as_ref().ok_or("no song is open")?;
         let decks = &st.shared.decks;
@@ -289,6 +338,14 @@ impl App {
             ("bpm", f(decks.bpm.get())),
             ("xfader", f(decks.xfader.get() as f64)),
             ("headphones_level_db", json::s(db(decks.cue_meter.get()))),
+            (
+                "recording",
+                match (&self.set_rec, &self.set_done) {
+                    (Some(r), _) => json::obj(vec![("on", Value::Bool(true)), ("file", json::s(r.path.display().to_string())), ("seconds", f(r.seconds()))]),
+                    (None, Some(d)) => json::obj(vec![("on", Value::Bool(false)), ("file", json::s(d.path.display().to_string())), ("seconds", f(d.seconds)), ("lost_frames", Value::F64(d.lost as f64))]),
+                    (None, None) => json::obj(vec![("on", Value::Bool(false))]),
+                },
+            ),
             ("headphones_output", load_phones().filter(|_| self.sound_outputs().len() > 1).map_or(Value::Null, json::s)),
             (
                 "fx",

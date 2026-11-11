@@ -109,8 +109,8 @@ pub fn manifest() -> ServiceManifest {
     ))
     .with_tool(tool(
         "live",
-        "Live mode: two decks played from the OMNIS-DUO controller (docs/LIVE.md). `on` turns it on (both decks get the open song) or off. Returns both decks: song, playing, `t` (seconds), `beat` (on the song's beat grid), `speed`, `bpm` as heard, `sync`, section, cue, hot cues A-D, which stems play, the loop, EQ, filter, fader and level; the crossfader, the beat FX, the tempo heard and `phase_diff_beats` (deck 2's beat phase minus deck 1's).",
-        r#"{"type":"object","properties":{"on":{"type":"boolean"}},"additionalProperties":false}"#,
+        "Live mode: two decks played from the OMNIS-DUO controller (docs/LIVE.md). `on` turns it on (both decks get the open song) or off. `record` starts or stops recording the set (what live mode plays, to a WAV file in the songs folder's Sets; `recording` says where and how long). Returns both decks: song, playing, `t` (seconds), `beat` (on the song's beat grid), `speed`, `bpm` as heard, `sync`, section, cue, hot cues A-D, which stems play, the loop, EQ, filter, fader and level; the crossfader, the beat FX, the tempo heard and `phase_diff_beats` (deck 2's beat phase minus deck 1's).",
+        r#"{"type":"object","properties":{"on":{"type":"boolean"},"record":{"type":"boolean"}},"additionalProperties":false}"#,
         Risk::Act,
     ))
     .with_tool(tool(
