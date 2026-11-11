@@ -593,6 +593,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     // where the last block ended: playback from anywhere else is a jump
     let mut expected = usize::MAX;
     start_headphones(cx, shared.clone(), sr, muted);
+    shared.decks.rate.store(sr, Ordering::Relaxed);
     cx.audio_output(0, move |info, out| {
         out.zero();
         // A new effects rack: adopt the old one's state, hand the old one back

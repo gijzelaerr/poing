@@ -410,9 +410,11 @@ pub struct Decks {
     /// What the headphones play, and its level.
     pub cue: CueRing,
     pub cue_meter: AF32,
-    /// What live mode plays, for the set recorder (written while `taping`).
+    /// What live mode plays, for the set recorder (written while `taping`),
+    /// and the sample rate the decks play at (0 until the output starts).
     pub tape: CueRing,
     pub taping: AtomicBool,
+    pub rate: AtomicU32,
     pub ports_in: [AtomicU64; PORTS],
     pub ports_out: [AtomicU64; PORTS],
     /// Messages from the controller that the map does not know, for the log.
@@ -437,6 +439,7 @@ impl Default for Decks {
             cue_meter: AF32::new(0.0),
             tape: CueRing::default(),
             taping: AtomicBool::new(false),
+            rate: AtomicU32::new(0),
             ports_in: std::array::from_fn(|_| AtomicU64::new(0)),
             ports_out: std::array::from_fn(|_| AtomicU64::new(0)),
             unmapped: ArrayQueue::new(64),

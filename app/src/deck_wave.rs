@@ -9,7 +9,6 @@ use crate::decks::{DeckSong, DECKS};
 use crate::state::EditorState;
 use makepad_widgets::*;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -190,7 +189,8 @@ impl DeckWave {
 
         // the whole song, and where the deck is in it
         let oy = top + h + GAP;
-        let key = (Arc::as_ptr(&song) as usize, w as usize);
+        // (by the deck's load count: another song may get the same address)
+        let key = (deck.gen.load(Ordering::Relaxed) as usize, w as usize);
         if self.overview_of != key {
             let per = song.seconds() / w;
             self.overview = (0..w as usize).map(|px| swing(&song, &lanes, px as f64 * per, (px + 1) as f64 * per, &|_| true)).collect();
@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::audio::{MixParams, Stem, Stems};
     use crate::decks::Grid;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn the_waveform_shows_the_lanes_that_sound_at_their_levels() {

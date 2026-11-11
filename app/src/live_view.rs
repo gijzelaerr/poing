@@ -261,7 +261,12 @@ impl App {
         let shared = st.shared.clone();
         if on && self.set_rec.is_none() {
             let path = crate::audio::songs_dir().join("Sets").join(crate::setrec::file_name());
-            match crate::setrec::SetRec::start(shared.clone(), &path, st.sr()) {
+            // the rate the decks play at (the first song's), not this tab's
+            let rate = match shared.decks.rate.load(Ordering::Relaxed) {
+                0 => st.sr(),
+                r => r,
+            };
+            match crate::setrec::SetRec::start(shared.clone(), &path, rate) {
                 Ok(rec) => {
                     shared.decks.taping.store(true, Ordering::Relaxed);
                     self.set_rec = Some(rec);
@@ -275,7 +280,9 @@ impl App {
             match rec.finish() {
                 Ok(done) => {
                     let gap = if done.lost > 0 { format!(" (the disk fell behind: {:.1} s are missing)", done.lost as f64 / st.sr() as f64) } else { String::new() };
-                    self.set_status(cx, &format!("The set is in {} · {}{gap}", done.path.display(), clock(done.seconds)));
+                    // over full scale it is kept as played: say so, a player would cut it off
+                    let hot = if done.peak > 1.0 { format!(" · it peaks {:+.1} dB over full scale: turn it down by that much before sharing it", 20.0 * done.peak.log10()) } else { String::new() };
+                    self.set_status(cx, &format!("The set is in {} · {}{gap}{hot}", done.path.display(), clock(done.seconds)));
                     self.set_done = Some(done);
                 }
                 Err(e) => self.set_status(cx, &format!("The set's recording failed: {e}")),
@@ -342,7 +349,7 @@ impl App {
                 "recording",
                 match (&self.set_rec, &self.set_done) {
                     (Some(r), _) => json::obj(vec![("on", Value::Bool(true)), ("file", json::s(r.path.display().to_string())), ("seconds", f(r.seconds()))]),
-                    (None, Some(d)) => json::obj(vec![("on", Value::Bool(false)), ("file", json::s(d.path.display().to_string())), ("seconds", f(d.seconds)), ("lost_frames", Value::F64(d.lost as f64))]),
+                    (None, Some(d)) => json::obj(vec![("on", Value::Bool(false)), ("file", json::s(d.path.display().to_string())), ("seconds", f(d.seconds)), ("lost_frames", Value::F64(d.lost as f64)), ("peak_db", f(20.0 * (d.peak.max(1e-9) as f64).log10()))]),
                     (None, None) => json::obj(vec![("on", Value::Bool(false))]),
                 },
             ),
