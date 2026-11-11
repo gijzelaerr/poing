@@ -43,6 +43,13 @@ impl NoteEvent {
 
 /// A moving controller curve is sent in steps this far apart (beats).
 const CC_STEP_BEATS: f64 = 0.125;
+/// A controller that holds its value is sent again this often. A sample
+/// library that was not ready when a render started dropped what it was sent
+/// then, and ignores the same value sent again (BBC SO plays a held dynamics
+/// curve at its default loudness): so the refresh is a step off and back, the
+/// step a block before the value.
+const CC_REFRESH_BEATS: f64 = 4.0;
+const CC_NUDGE_FRAMES: u64 = 2 * crate::fx::PLUGIN_BLOCK as u64;
 
 /// A lane's notes and controller curves as frame events. A curve is sent as
 /// steps along its straight lines, only where its value changes.
@@ -55,19 +62,26 @@ pub fn events(notes: &[Note], cc: &[Cc], grid: &BeatGrid, sample_rate: u32) -> V
         out.push(NoteEvent::note(a, n.pitch.min(127), n.vel.clamp(0.0, 1.0) as f32, true));
         out.push(NoteEvent::note(b, n.pitch.min(127), 0.0, false));
     }
+    let notes_end = notes.iter().map(|n| n.start + n.len).fold(f64::MIN, f64::max);
     let mut nums: Vec<u8> = cc.iter().map(|c| c.num.min(127)).collect();
     nums.sort_unstable();
     nums.dedup();
     for num in nums {
         let mut pts: Vec<&Cc> = cc.iter().filter(|c| c.num.min(127) == num).collect();
         pts.sort_by(|a, b| a.beat.total_cmp(&b.beat));
-        let mut last: Option<u8> = None;
+        let mut last: Option<(u8, f64)> = None;
         let mut emit = |beat: f64, value: f64, out: &mut Vec<NoteEvent>| {
             let v = (value.clamp(0.0, 1.0) * 127.0).round() as u8;
-            if last != Some(v) {
+            let refresh = last.is_some_and(|(lv, lb)| lv == v && beat - lb >= CC_REFRESH_BEATS - 1e-9);
+            if refresh || last.is_none_or(|(lv, _)| lv != v) {
                 let frame = (grid.time_of(beat).max(0.0) * sr) as u64;
+                if refresh {
+                    let off = if v == 0 { 1 } else { v - 1 };
+                    out.push(NoteEvent { frame, pitch: num, vel: off as f32 / 127.0, on: true, cc: true });
+                }
+                let frame = if refresh { frame + CC_NUDGE_FRAMES } else { frame };
                 out.push(NoteEvent { frame, pitch: num, vel: v as f32 / 127.0, on: true, cc: true });
-                last = Some(v);
+                last = Some((v, beat));
             }
         };
         for w in pts.windows(2) {
@@ -80,6 +94,13 @@ pub fn events(notes: &[Note], cc: &[Cc], grid: &BeatGrid, sample_rate: u32) -> V
         }
         if let Some(p) = pts.last() {
             emit(p.beat, p.value, &mut out);
+            // held after its last point while the notes still sound
+            // (whole beats: `emit` sends again a bar after what it last sent)
+            let mut beat = p.beat.floor() + 1.0;
+            while beat < notes_end {
+                emit(beat, p.value, &mut out);
+                beat += 1.0;
+            }
         }
     }
     out.sort_by(|x, y| x.frame.cmp(&y.frame).then(x.rank().cmp(&y.rank())));
@@ -514,9 +535,14 @@ mod tests {
         assert_eq!(ccs.len(), 9, "8 steps of 1/32 note and the end point");
         assert!(ccs.windows(2).all(|w| w[1].vel > w[0].vel && w[1].frame > w[0].frame), "rising");
         assert_eq!(ccs.last().unwrap().vel, 1.0);
-        // a flat stretch sends nothing new
-        let flat = [Cc { beat: 0.0, num: 11, value: 0.5 }, Cc { beat: 4.0, num: 11, value: 0.5 }];
-        assert_eq!(events(&[], &flat, &grid, 48000).len(), 1);
+        // a flat stretch sends its value again once a bar, and after its last point while notes sound
+        let flat = [Cc { beat: 0.0, num: 11, value: 0.5 }, Cc { beat: 3.0, num: 11, value: 0.5 }];
+        assert_eq!(events(&[], &flat, &grid, 48000).len(), 1, "within a bar: once");
+        let long = [Note { start: 0.0, len: 16.0, pitch: 60, vel: 0.8 }];
+        let held: Vec<(u64, f32)> = events(&long, &flat, &grid, 48000).iter().filter(|e| e.cc).map(|e| (e.frame, e.vel)).collect();
+        let (v, off, nudge) = (64.0 / 127.0, 63.0 / 127.0, CC_NUDGE_FRAMES);
+        let want: Vec<(u64, f32)> = std::iter::once((0, v)).chain([4u64, 8, 12].iter().flat_map(|b| [(b * 24000, off), (b * 24000 + nudge, v)])).collect();
+        assert_eq!(held, want, "a held value is sent again each 4 beats while the note sounds, as a step off and back");
     }
 
     #[test]
