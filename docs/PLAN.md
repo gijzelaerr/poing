@@ -203,7 +203,13 @@ Fixed during QA: the Settings switches for AI and compute (they were text only);
 - **Gijs's checks:** the Mac UI against this PC (docs/REMOTE.md), the rekordbox import onto the OMNIS-DUO (PR #6 steps), the installer on a clean account, clicking inside a plugin's own window.
 - Build note: `poing-engine` must be built with `MAKEPAD_CUDA_ROOT` (CLAUDE.md) or the local model and native analysis fall back / fail; a plain `cargo build` gives the CPU stub.
 
-**Live (docs/LIVE.md):** two decks played from the OMNIS-DUO (2026-10-24, not yet on the hardware); a deck plays the song's lane effects and MIDI lanes, VST3 included (2026-11-11). Key lock and a headphone cue on a second sound output (2026-11-11). Deck waveforms and recording the set (2026-11-11). Next: the hardware checks.
+**Live (docs/LIVE.md):** two decks played from the OMNIS-DUO (2026-10-24, not yet on the hardware); a deck plays the song's lane effects and MIDI lanes, VST3 included (2026-11-11). Key lock and a headphone cue on a second sound output (2026-11-11). Deck waveforms (a click jumps there) and recording the set (2026-11-11).
+
+Where live mode stands (2026-11-11), to pick up from:
+- **Needs the OMNIS-DUO plugged in:** the ten checks under "To check on the real DUO" in LIVE.md. The first to do is whether its master and headphones show as two sound outputs in Settings. If it is one four-channel output, the headphone cue needs Makepad to open more than two channels on Windows (`channels.clamp(1, 2)` in its Windows `audio.rs`), a small upstream PR and a new pin.
+- **Never heard, only measured:** sound through a second output for the headphones, a recorded set, lane effects and MIDI lanes on a deck. Key lock was judged fine by ear on four clips.
+- **Not done:** dragging on the waveform to scrub and the DUO's needle search strip, a cue/master mix for the headphones, saving changed cue points to the song, decks 3 and 4, real downbeats for the waveform's bar lines (they are every fourth beat from the grid's first), reloading a deck's plugin after its helper process crashed.
+- **Testing it without the hardware:** `app/live/live_test.sh` against a hidden, muted Poing. Its decks only run while Windows has a sound output; with the remote desktop session disconnected there is none and every deck stays at 0.0 s.
 
 **After 1.0:** isolated plugins restart on every tab switch (in-process ones stay loaded); tool calls with unknown arguments are ignored instead of refused; the small model's chords are short stabs; long take names in DJ file names are cut with "…".
 
