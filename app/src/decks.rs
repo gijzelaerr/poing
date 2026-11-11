@@ -5,8 +5,14 @@
 //! export's beat grid and cues) and publishes it by generation. The MIDI thread
 //! turns the controller's messages into [`Decks`]' atomics and commands. The
 //! audio callback's [`Player`] owns the transport: it renders each deck at its
-//! speed from the song's own mixer, through its EQ, filter, fader and the
-//! crossfader, then the beat FX (Splash shaders in an [`FxRack`]).
+//! speed from the song's own mixer and effects rack (the lanes' effects and
+//! the MIDI lanes' instruments, a rack per deck), through its EQ, filter,
+//! fader and the crossfader, then the beat FX (Splash shaders in an [`FxRack`]).
+//!
+//! A deck renders every frame of its song once, in order, through its rack,
+//! and plays that at its speed (so instruments and effects bend with the
+//! tempo, like the stems). What it rendered last stays in a short history:
+//! the platter going back plays that, as a record would.
 
 use crate::audio::{mix_into, MixParams, Stems};
 use crate::deckmap::{Act, Control, Decoder, Map, Msg};
@@ -35,6 +41,14 @@ pub const FX_BEATS: [f32; 5] = [0.25, 0.5, 0.75, 1.0, 2.0];
 pub const FX_NAMES: [&str; 2] = ["Echo", "Reverb"];
 /// Furthest the scratch moves the playhead per output frame.
 const MAX_RATE: f64 = 4.0;
+/// The song as heard that a deck keeps behind its playhead (seconds): what the
+/// platter can go back over.
+const HISTORY_S: f64 = 4.0;
+/// A stem mute fades over this long (seconds), in steps of this many frames.
+const FADE_S: f64 = 0.02;
+const FADE_STEP: usize = 64;
+/// The playhead may be this many frames past what was rendered and still carry on from it.
+const GAP: u64 = 16;
 
 // ------------------------------------------------------------------ the grid
 
@@ -130,6 +144,10 @@ pub struct DeckSong {
     pub sections: Vec<(f64, String)>,
     /// Per lane, the stem it mutes with (0..4 as `deckmap::STEMS`).
     pub role: Vec<u8>,
+    /// The song's effects and instruments for this deck. The callback takes
+    /// it while the song is on the deck and puts it back when it lets go, so
+    /// it is dropped with the song, on the UI thread.
+    pub rack: Mutex<Option<Box<FxRack>>>,
 }
 
 /// The stem a lane is (by its id or name); anything else is "other".
@@ -193,6 +211,7 @@ impl DeckSong {
             bpm,
             hot,
             sections,
+            rack: Mutex::new(Some(Box::new(st.make_rack()))),
         }
     }
 
@@ -754,18 +773,28 @@ struct DeckPlayer {
     loop_a: f64,
     scratch: f64,
     nudge: f64,
-    /// The mix as heard (its lane gains with the mutes), and one to change to.
+    /// The mix as heard (its lane gains with the mutes).
     mix: MixParams,
-    next: MixParams,
+    /// The stems wanted muted (a bit each), and how far each is faded in (0..1).
     mutes: u8,
+    mute_f: [f32; 4],
     speed: f64,
     strip: Strip,
+    /// The song's rack while it is on this deck, and the frames its output
+    /// comes late (read ahead by that much, so the deck stays on its grid).
+    rack: Option<Box<FxRack>>,
+    late: u64,
+    /// The song as rendered, a ring by song frame: frames [h_lo, h_hi).
+    hist_l: Vec<f32>,
+    hist_r: Vec<f32>,
+    h_lo: u64,
+    h_hi: u64,
+    /// The playhead was moved (a cue, a loop's end): forward play renders afresh.
+    jumped: bool,
     win_l: Vec<f32>,
     win_r: Vec<f32>,
     out_l: Vec<f32>,
     out_r: Vec<f32>,
-    alt_l: Vec<f32>,
-    alt_r: Vec<f32>,
 }
 
 /// Frames a block of the player holds (device blocks are cut to this).
@@ -781,6 +810,7 @@ fn reserved_mix() -> MixParams {
 impl DeckPlayer {
     fn new(sr: u32) -> DeckPlayer {
         let win = (BLOCK as f64 * MAX_RATE) as usize + 8;
+        let hist = ((HISTORY_S * sr as f64) as usize).max(2 * win);
         DeckPlayer {
             song: None,
             gen: 0,
@@ -794,16 +824,21 @@ impl DeckPlayer {
             scratch: 0.0,
             nudge: 0.0,
             mix: reserved_mix(),
-            next: reserved_mix(),
             mutes: 0,
+            mute_f: [1.0; 4],
             speed: 1.0,
             strip: Strip::new(sr),
+            rack: None,
+            late: 0,
+            hist_l: vec![0.0; hist],
+            hist_r: vec![0.0; hist],
+            h_lo: 0,
+            h_hi: 0,
+            jumped: false,
             win_l: vec![0.0; win],
             win_r: vec![0.0; win],
             out_l: vec![0.0; BLOCK],
             out_r: vec![0.0; BLOCK],
-            alt_l: vec![0.0; BLOCK],
-            alt_r: vec![0.0; BLOCK],
         }
     }
 
@@ -812,15 +847,39 @@ impl DeckPlayer {
     }
 
     /// Adopt a newly published song (it starts at its first hot cue, stopped).
+    /// The rack of the song it replaces goes back into that song, which the UI
+    /// still holds: nothing is dropped here.
     fn adopt(&mut self, deck: &Deck) {
         let gen = deck.gen.load(Ordering::Acquire);
         if gen == self.gen {
             return;
         }
         let Ok(slot) = deck.song.try_lock() else { return };
-        // the UI holds the one this replaces until `seen` moves: never its last drop here
-        self.song = slot.clone();
+        let new = slot.clone();
         drop(slot);
+        let same = matches!((&self.song, &new), (Some(a), Some(b)) if Arc::ptr_eq(a, b));
+        if !same {
+            // both racks' slots, or wait a block: the UI is in one of them
+            let mut theirs = match &new {
+                Some(s) => match s.rack.try_lock() {
+                    Ok(r) => Some(r),
+                    Err(_) => return,
+                },
+                None => None,
+            };
+            if let Some(old) = &self.song {
+                let Ok(mut back) = old.rack.try_lock() else { return };
+                if back.is_none() {
+                    *back = self.rack.take();
+                }
+            }
+            // (a rack that could not go back stays here, unused, rather than be dropped)
+            if self.rack.is_none() {
+                self.rack = theirs.as_mut().and_then(|r| r.take());
+            }
+        }
+        // the UI holds the song this replaces until `seen` moves: never its last drop here
+        self.song = new;
         self.gen = gen;
         deck.seen.store(gen, Ordering::Release);
         self.playing = false;
@@ -828,22 +887,29 @@ impl DeckPlayer {
         self.loop_on = false;
         self.scratch = 0.0;
         self.nudge = 0.0;
+        self.h_lo = 0;
+        self.h_hi = 0;
+        self.jumped = true;
         if let Some(s) = &self.song {
             let start = s.hot[0].as_ref().map_or(0.0, |h| h.0);
             self.pos = start * s.sr as f64;
             self.cue = self.pos;
             self.mix.clone_from(&s.mix);
             self.mutes = 0;
+            self.mute_f = [1.0; 4];
+            // a song take plays through the master only
+            let lanes = |r: &FxRack| if s.mix.song_take().is_some() { 0 } else { r.latency };
+            self.late = self.rack.as_ref().map_or(0, |r| (lanes(r) + r.master_latency()) as u64);
         }
         self.strip.clear();
     }
 
-    /// The deck's gains with these stems muted, into `mix`.
-    fn apply_mutes(song: &DeckSong, mutes: u8, mix: &mut MixParams) {
+    /// The deck's gains with each stem as far in as `f` says, into `mix`.
+    fn apply_mutes(song: &DeckSong, f: &[f32; 4], mix: &mut MixParams) {
         for (i, g) in mix.gains.iter_mut().enumerate() {
             let base = song.mix.gains.get(i).copied().unwrap_or(0.0);
-            let role = song.role.get(i).copied().unwrap_or(3);
-            *g = if mutes & (1 << role) != 0 { 0.0 } else { base };
+            let role = song.role.get(i).copied().unwrap_or(3) as usize;
+            *g = base * f[role.min(3)];
         }
     }
 
@@ -852,6 +918,7 @@ impl DeckPlayer {
         let sr = song.sr as f64;
         let g = &song.grid;
         let t = self.pos / sr;
+        let before = self.pos;
         let jump = |me: &mut Self, target: f64| {
             let to = if me.playing { keep_phase(g, t, target) } else { target };
             me.pos = to.clamp(0.0, song.seconds()) * sr;
@@ -935,6 +1002,9 @@ impl DeckPlayer {
                 self.loop_on = false;
             }
         }
+        if self.pos != before {
+            self.jumped = true;
+        }
     }
 
     /// A loop of `beats` from the beat (or the part of one) the deck is in.
@@ -945,8 +1015,16 @@ impl DeckPlayer {
         self.loop_on = true;
     }
 
-    /// Render `n` frames (at the output rate) of the deck at `speed`, into out_l/out_r.
+    /// Render `n` frames (at the output rate) of the deck at `speed`, through
+    /// its channel strip, into out_l/out_r.
     fn render(&mut self, deck: &Deck, speed: f64, live_sr: u32, n: usize) {
+        self.play(deck, speed, live_sr, n);
+        self.strip.set(deck);
+        self.strip.run(&mut self.out_l[..n], &mut self.out_r[..n]);
+    }
+
+    /// The deck's song at `speed`, before the strip.
+    fn play(&mut self, deck: &Deck, speed: f64, live_sr: u32, n: usize) {
         self.out_l[..n].fill(0.0);
         self.out_r[..n].fill(0.0);
         let Some(song) = self.song.clone() else { return };
@@ -979,13 +1057,9 @@ impl DeckPlayer {
             self.nudge = 0.0;
         }
         rate = rate.clamp(-MAX_RATE, MAX_RATE);
-        // the stems as muted now; a change crossfades over this block
-        let mutes = deck.mutes.load(Ordering::Relaxed);
-        let fade = mutes != self.mutes;
-        if fade {
-            self.next.clone_from(&self.mix);
-            Self::apply_mutes(&song, mutes, &mut self.next);
-        }
+        // the stems as muted now: what is rendered from here on fades to it
+        self.mutes = deck.mutes.load(Ordering::Relaxed);
+        let held = deck.touch.load(Ordering::Relaxed);
         let g = &song.grid;
         // a stopped (or held) record is silent, not its last sample held
         let mut done = if rate == 0.0 { n } else { 0 };
@@ -997,19 +1071,17 @@ impl DeckPlayer {
             if looping {
                 if self.pos >= lb || self.pos < la - 1.0 {
                     self.pos = la + (self.pos - la).rem_euclid((lb - la).max(1.0));
+                    self.jumped = true;
                 }
                 k = k.min(((lb - self.pos) / rate).ceil().max(1.0) as usize);
             }
-            self.segment(&song, rate, done, k, fade, n);
+            self.segment(&song, rate, done, k, held);
             self.pos += rate * k as f64;
             if looping && self.pos >= lb {
                 self.pos -= lb - la;
+                self.jumped = true;
             }
             done += k;
-        }
-        if fade {
-            std::mem::swap(&mut self.mix, &mut self.next);
-            self.mutes = mutes;
         }
         if self.pos < 0.0 {
             self.pos = 0.0;
@@ -1019,41 +1091,97 @@ impl DeckPlayer {
             self.playing = false;
         }
         self.speed = if self.playing { rate / to_song } else { 0.0 };
-        self.strip.set(deck);
-        self.strip.run(&mut self.out_l[..n], &mut self.out_r[..n]);
     }
 
     /// Frames [at, at + k) of the block: the song from `pos` on at `rate`,
-    /// rendered by the song's own mixer over the source window they need and
-    /// read between its frames. `fade`: crossfade from `mix` to `next` over the
-    /// whole block of `n`.
-    fn segment(&mut self, song: &DeckSong, rate: f64, at: usize, k: usize, fade: bool, n: usize) {
+    /// read between the frames of the history, which is rendered on as far as
+    /// they need. Going back past the history's start (the platter turned back
+    /// right after a jump) is the song's mixer alone, without the rack.
+    fn segment(&mut self, song: &DeckSong, rate: f64, at: usize, k: usize, held: bool) {
         let end = self.pos + rate * (k.max(1) - 1) as f64;
-        let lo = self.pos.min(end).floor().max(0.0);
-        let len = ((self.pos.max(end).ceil() - lo) as usize + 3).min(self.win_l.len());
-        let start = lo as usize;
-        let mixes: &[&MixParams] = if fade { &[&self.mix, &self.next] } else { &[&self.mix] };
-        for (m, mix) in mixes.iter().enumerate() {
-            mix_into(&song.stems, mix, song.sr, start, &mut self.win_l[..len], &mut self.win_r[..len], None);
-            let (ol, or) = if m == 0 { (&mut self.out_l, &mut self.out_r) } else { (&mut self.alt_l, &mut self.alt_r) };
-            for i in 0..k {
-                let p = self.pos + rate * i as f64;
-                if p < 0.0 {
-                    continue;
-                }
-                let j = (p - lo) as usize;
-                let f = (p - lo - j as f64) as f32;
-                let (j, j1) = (j.min(len - 1), (j + 1).min(len - 1));
-                ol[at + i] = self.win_l[j] + (self.win_l[j1] - self.win_l[j]) * f;
-                or[at + i] = self.win_r[j] + (self.win_r[j1] - self.win_r[j]) * f;
+        let (first, last) = (self.pos.min(end), self.pos.max(end));
+        if last < 0.0 {
+            return;
+        }
+        let lo = first.floor().max(0.0) as u64;
+        let hi = last.floor() as u64 + 2;
+        let cap = self.hist_l.len() as u64;
+        if rate > 0.0 {
+            // playing on from a jump, or from somewhere the history is not: afresh from here
+            if (self.jumped && !held) || lo < self.h_lo || lo > self.h_hi + GAP {
+                self.h_lo = lo;
+                self.h_hi = lo;
+            }
+            if !held {
+                self.jumped = false;
             }
         }
-        if fade {
-            for i in at..at + k {
-                let w = (i as f32 + 0.5) / n as f32;
-                self.out_l[i] += (self.alt_l[i] - self.out_l[i]) * w;
-                self.out_r[i] += (self.alt_r[i] - self.out_r[i]) * w;
+        if lo < self.h_lo || lo > self.h_hi + GAP || hi - lo >= cap {
+            return self.dry(song, rate, at, k, lo as usize, (hi - lo) as usize + 1);
+        }
+        if hi > self.h_hi {
+            self.extend(song, hi);
+        }
+        for i in 0..k {
+            let p = self.pos + rate * i as f64;
+            if p < 0.0 {
+                continue;
             }
+            let j = p as u64;
+            let f = (p - j as f64) as f32;
+            let (a, b) = ((j % cap) as usize, ((j + 1) % cap) as usize);
+            self.out_l[at + i] = self.hist_l[a] + (self.hist_l[b] - self.hist_l[a]) * f;
+            self.out_r[at + i] = self.hist_r[a] + (self.hist_r[b] - self.hist_r[a]) * f;
+        }
+    }
+
+    /// Render the song on from where the history ends up to frame `to`: each
+    /// frame once, in order, through the rack. A stem being muted or unmuted
+    /// fades over the frames rendered here.
+    fn extend(&mut self, song: &DeckSong, to: u64) {
+        let cap = self.hist_l.len();
+        let per_frame = (1.0 / (FADE_S * song.sr as f64)) as f32;
+        while self.h_hi < to {
+            let mut k = ((to - self.h_hi) as usize).min(self.win_l.len());
+            let mutes = self.mutes;
+            let want = |s: usize| if mutes & (1 << s) != 0 { 0.0 } else { 1.0 };
+            if (0..4).any(|s| self.mute_f[s] != want(s)) {
+                k = k.min(FADE_STEP);
+                let step = per_frame * k as f32;
+                for s in 0..4 {
+                    let (f, w) = (self.mute_f[s], want(s));
+                    self.mute_f[s] = if w > f { (f + step).min(1.0) } else { (f - step).max(0.0) };
+                }
+                Self::apply_mutes(song, &self.mute_f, &mut self.mix);
+            }
+            let start = (self.h_hi + self.late) as usize;
+            mix_into(&song.stems, &self.mix, song.sr, start, &mut self.win_l[..k], &mut self.win_r[..k], self.rack.as_deref_mut());
+            let at = (self.h_hi % cap as u64) as usize;
+            let first = k.min(cap - at);
+            self.hist_l[at..at + first].copy_from_slice(&self.win_l[..first]);
+            self.hist_r[at..at + first].copy_from_slice(&self.win_r[..first]);
+            self.hist_l[..k - first].copy_from_slice(&self.win_l[first..k]);
+            self.hist_r[..k - first].copy_from_slice(&self.win_r[first..k]);
+            self.h_hi += k as u64;
+        }
+        self.h_lo = self.h_lo.max(self.h_hi.saturating_sub(cap as u64));
+    }
+
+    /// [`Self::segment`] where the history is not: the lanes from the song's
+    /// mixer over the window they need, without effects or instruments.
+    fn dry(&mut self, song: &DeckSong, rate: f64, at: usize, k: usize, start: usize, len: usize) {
+        let len = len.min(self.win_l.len());
+        mix_into(&song.stems, &self.mix, song.sr, start, &mut self.win_l[..len], &mut self.win_r[..len], None);
+        for i in 0..k {
+            let p = self.pos + rate * i as f64 - start as f64;
+            if p < 0.0 {
+                continue;
+            }
+            let j = p as usize;
+            let f = (p - j as f64) as f32;
+            let (j, j1) = (j.min(len - 1), (j + 1).min(len - 1));
+            self.out_l[at + i] = self.win_l[j] + (self.win_l[j1] - self.win_l[j]) * f;
+            self.out_r[at + i] = self.win_r[j] + (self.win_r[j1] - self.win_r[j]) * f;
         }
     }
 
@@ -1189,6 +1317,7 @@ mod tests {
             hot: [Some((0.0, "Intro".into())), Some((8.0, "Chorus 1".into())), Some((16.0, "Chorus 2".into())), None],
             sections: vec![(0.0, "Intro".into()), (8.0, "Chorus 1".into()), (16.0, "Chorus 2".into())],
             role: vec![0, 1, 2, 3],
+            rack: Mutex::new(None),
         })
     }
 
@@ -1332,6 +1461,173 @@ mod tests {
         d.touch.store(false, Ordering::Relaxed);
         let _ = run(&mut p, &decks, 0.5);
         assert!(d.pos.get() > held, "let go: it plays on");
+    }
+
+    /// A short feedback delay: what it gives depends on every frame before.
+    const DELAY: &str = "var b = [0.0; 4096]\nvar w = int(0)\nfn effect(l, r) {\n    let y = tap(b, w, 1000.0)\n    b[w] = (l + r) * 0.5 + y * 0.5\n    w = (w + 1) % 4096\n    vec2(l + y, r - y)\n}\n";
+
+    fn fx(id: &str) -> poing_model::Fx {
+        poing_model::Fx { id: id.into(), name: id.into(), file: String::new(), params: None, bypass: None, prompt: None, plugin: None, isolate: None }
+    }
+
+    /// Two lanes of noise, the first through [`DELAY`]: (stems, mix, a rack).
+    fn song_with_fx(sr: u32, frames: usize) -> (Stems, MixParams, FxRack) {
+        let mut seed = 12345u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        let mut lane = || Arc::new(Stem::new((0..frames).map(|_| noise()).collect(), (0..frames).map(|_| noise()).collect()));
+        let stems: Stems = Arc::new(vec![lane(), lane()]);
+        let mix = MixParams { version: 1, gains: vec![0.8, 0.5], ..Default::default() };
+        let shader = crate::fx::compile_source(DELAY).expect("the delay compiles");
+        let unit = FxUnit::new("fx1", shader.clone(), FxControls::new(&shader, &fx("fx1"), None), sr);
+        (stems, mix, FxRack::new(vec![vec![unit], Vec::new()], Vec::new()))
+    }
+
+    fn deck_song(sr: u32, stems: Stems, mix: MixParams, frames: usize, rack: FxRack) -> Arc<DeckSong> {
+        let n = mix.gains.len();
+        Arc::new(DeckSong {
+            name: "test".into(),
+            stems,
+            mix,
+            sr,
+            frames,
+            grid: Grid::new((0..=frames / (sr as usize / 2)).map(|k| k as f64 * 0.5).collect()),
+            bpm: 120.0,
+            hot: [Some((0.0, "Intro".into())), None, None, None],
+            sections: vec![(0.0, "Intro".into())],
+            role: vec![3; n],
+            rack: Mutex::new(Some(Box::new(rack))),
+        })
+    }
+
+    #[test]
+    fn a_deck_plays_the_lane_effects_as_the_song_does() {
+        let sr = 48000;
+        let frames = sr as usize * 2;
+        for block in [512usize, 333] {
+            // the song's own mixer, in one go
+            let (stems, mix, mut rack) = song_with_fx(sr, frames);
+            let (mut want_l, mut want_r) = (vec![0.0f32; sr as usize], vec![0.0f32; sr as usize]);
+            mix_into(&stems, &mix, sr, 0, &mut want_l, &mut want_r, Some(&mut rack));
+            let dry = {
+                let (mut l, mut r) = (vec![0.0f32; 4800], vec![0.0f32; 4800]);
+                mix_into(&stems, &mix, sr, 0, &mut l, &mut r, None);
+                l
+            };
+            assert!(want_l[2000..4800].iter().zip(&dry[2000..]).any(|(a, b)| (a - b).abs() > 0.05), "the delay is heard");
+            // the deck, at the song's speed, in blocks
+            let (stems, mix, rack) = song_with_fx(sr, frames);
+            let decks = Decks::default();
+            decks.load(0, deck_song(sr, stems, mix, frames, rack));
+            let deck = &decks.deck[0];
+            let mut p = DeckPlayer::new(sr);
+            p.adopt(deck);
+            p.command(Cmd::Play);
+            let (mut got_l, mut got_r) = (Vec::new(), Vec::new());
+            while got_l.len() < want_l.len() {
+                let k = (want_l.len() - got_l.len()).min(block);
+                p.play(deck, 1.0, sr, k);
+                got_l.extend_from_slice(&p.out_l[..k]);
+                got_r.extend_from_slice(&p.out_r[..k]);
+            }
+            let worst = got_l.iter().zip(&want_l).chain(got_r.iter().zip(&want_r)).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(worst < 1e-6, "blocks of {block}: off by {worst}");
+        }
+    }
+
+    /// A song of one MIDI lane on the built-in bass: (on, off) frames of its one note.
+    fn midi_song(sr: u32, seconds: f64, note: (u64, u64)) -> Arc<DeckSong> {
+        use crate::synth::{MidiLane, NoteEvent, Sound, Synth, BUILTIN};
+        let shader = crate::fx::compile_instrument(BUILTIN[0].2).expect("the bass compiles");
+        let synth = Synth::new(shader.clone(), FxControls::new(&shader, &fx("midi1"), None), sr);
+        let mut rack = FxRack::new(vec![Vec::new()], Vec::new());
+        let events = vec![NoteEvent::note(note.0, 40, 0.9, true), NoteEvent::note(note.1, 40, 0.0, false)];
+        rack.midi.push(MidiLane::new(0, events, Sound::Splash(synth)));
+        let stems: Stems = Arc::new(vec![Arc::new(Stem::new(Vec::new(), Vec::new()))]);
+        let mix = MixParams { version: 1, gains: vec![1.0], ..Default::default() };
+        deck_song(sr, stems, mix, (seconds * sr as f64) as usize, rack)
+    }
+
+    fn peak(x: &[f32]) -> f32 {
+        x.iter().fold(0.0f32, |p, v| p.max(v.abs()))
+    }
+
+    #[test]
+    fn a_midi_lane_plays_on_a_deck_at_the_deck_s_speed() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        // a note from 0.5 s to 2.5 s of the song
+        decks.load(0, midi_song(sr, 10.0, (24000, 120000)));
+        decks.xfader.set(0.0);
+        decks.deck[0].tempo.set(0.5 + 0.05 / (2.0 * TEMPO_RANGE)); // +5%
+        decks.deck[0].send(Cmd::Play);
+        let (l, _) = run(&mut p, &decks, 2.0);
+        assert!((decks.deck[0].speed.get() - 1.05).abs() < 1e-6);
+        // heard from 0.5 s / 1.05
+        let on = (24000.0 / 1.05) as usize;
+        assert!(peak(&l[..on - 20]) < 1e-5, "silent before the note: {}", peak(&l[..on - 20]));
+        assert!(peak(&l[on..on + 480]) > 0.01, "the note starts on time: {}", peak(&l[on..on + 480]));
+        // and held all the way: a note let go (a block taken for a jump) would be gone
+        for w in l[on + 480..].chunks(2400) {
+            assert!(peak(w) > 0.01, "the note sounds on: {}", peak(w));
+        }
+    }
+
+    #[test]
+    fn a_loop_s_end_lets_go_of_the_notes_it_cuts() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        // a note from 8.4 s to 8.6 s, and a one-beat loop from 8.0 s: it ends inside the note
+        decks.load(0, midi_song(sr, 20.0, (403200, 412800)));
+        decks.xfader.set(0.0);
+        let d = &decks.deck[0];
+        d.send(Cmd::Seek(8.0));
+        d.send(Cmd::Loop(1.0));
+        d.send(Cmd::Play);
+        let (l, _) = run(&mut p, &decks, 2.0);
+        assert!(d.loop_on.load(Ordering::Relaxed) && (8.0..8.5).contains(&d.pos.get()));
+        // the fourth time round: quiet until the note comes again
+        let at = |s: f64| ((1.5 + s) * sr as f64) as usize;
+        assert!(peak(&l[at(0.0)..at(0.05)]) > 1e-3, "the cut note's release is heard after the loop's end (rendered again, not replayed)");
+        assert!(peak(&l[at(0.2)..at(0.38)]) < 1e-3, "nothing hangs over the loop's end: {}", peak(&l[at(0.2)..at(0.38)]));
+        assert!(peak(&l[at(0.41)..at(0.5)]) > 0.01, "the note plays each time round");
+    }
+
+    #[test]
+    fn the_platter_turned_back_past_what_was_played_still_sounds() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        decks.load(0, song(sr, 30.0));
+        decks.xfader.set(0.0);
+        let d = &decks.deck[0];
+        // on a cue, nothing played yet, the hand goes back
+        d.send(Cmd::Seek(8.0));
+        d.touch.store(true, Ordering::Relaxed);
+        d.scratch.fetch_add(-72, Ordering::Relaxed);
+        let (l, _) = run(&mut p, &decks, 0.3);
+        assert!((8.0 - d.pos.get() - 0.18).abs() < 0.01, "{}", d.pos.get());
+        assert!(peak(&l) > 1.0, "the lanes are heard: {}", peak(&l));
+    }
+
+    #[test]
+    fn a_deck_gives_its_rack_back_with_the_song() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        let first = midi_song(sr, 10.0, (0, 4800));
+        decks.load(0, first.clone());
+        let _ = run(&mut p, &decks, 0.05);
+        assert!(first.rack.lock().unwrap().is_none(), "the deck has it");
+        let old = decks.load(0, midi_song(sr, 10.0, (0, 4800)));
+        assert!(!decks.retired());
+        let _ = run(&mut p, &decks, 0.05);
+        assert!(decks.retired() && old.is_some());
+        assert!(first.rack.lock().unwrap().is_some(), "back in its song, for the UI to drop");
     }
 
     #[test]

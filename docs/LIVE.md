@@ -88,7 +88,7 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 ### Using it
 
 - **Starting it.** Open a song and press **Live** in the top bar. Both decks load the song in front. The hardware **Load** button loads the song in front onto that deck, so a version or remix opened in another tab can go on deck 2. **Live** again goes back to the song.
-- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
+- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Splash effects on the lanes and the master are heard, and so are MIDI lanes played by Splash instruments: each deck has its own copy of the song's effects rack, and their knobs are the song's own (turn one in the song's tab and the deck follows). The deck renders the song through that rack and then plays it at its speed, so effects and instruments bend with the tempo as the stems do. Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
 - **Tempo.** Speed and pitch move together, like vinyl. There is no key lock yet.
 - **Beat grid and hot cues.** These are the DJ export's own: `dj_grid` and `dj_cues` from `djexport.rs`. Hot cues A–D sit on the intro, the first chorus, the bridge or drop (else the last chorus), and the outro (else the last section). A song may have fewer than four. "It's Autumn" has no outro and its last section is chorus 3, so it gets A, B and C, and pad 4 stays dark.
 
@@ -113,7 +113,7 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 ### Jog, tempo, sync
 
 - **Jog side turn: nudge.** Each step moves the deck 1 ms. It is spread over a few blocks at up to 5% speed, so you hear a pitch bend.
-- **Jog top, touched: scratch-lite.** The platter drives the playhead at one revolution per 1.8 s of audio (33⅓ rpm, 720 steps a revolution, assumed). The playhead follows the hand with a short glide, backwards too. Let go and the deck plays on.
+- **Jog top, touched: scratch-lite.** The platter drives the playhead at one revolution per 1.8 s of audio (33⅓ rpm, 720 steps a revolution, assumed). The playhead follows the hand with a short glide, backwards too. Let go and the deck plays on. Going back, the platter plays what the deck played last (it keeps 4 s, with the effects in it, like a record). Turned back further than that, or back from a cue the deck has not played from yet, you hear the lanes without their effects and without the MIDI lanes.
 - **Tempo fader.** ±8%. The low end of the travel is −8% (to check on the hardware: the map has `invert`).
 - **Sync** (the touch panel's button) makes the deck follow the other deck:
   - its rate is set so their local tempos match on Poing's beat grid;
@@ -186,7 +186,8 @@ The unit tests (`cargo test`, `deckmap` and `decks`) check every documented mess
 
 ### Not in this first version
 
-- Lane effects and MIDI lanes. A deck plays the song's audio through the song's own mixer, with no effects rack, so a Splash or VST3 effect on a lane and the MIDI lanes' instruments are not heard live.
+- VST3 effects and VST3 instruments on a deck (a VST3 effect passes its lane through unchanged and a MIDI lane played by a VST3 instrument is silent).
+- Changes to the song after it was loaded: press Load again.
 - Key lock (time-stretch).
 - Headphone cueing.
 - Saving changed cue points to the song.
