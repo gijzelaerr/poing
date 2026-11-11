@@ -436,6 +436,8 @@ script_mod! {
                             View{width: Fill height: Fit flow: Down spacing: 6
                                 out_dd := DropDown{width: 420 labels: ["Default output"]}
                                 out_status := Caption{width: Fill text: ""}
+                                cue_dd := DropDown{width: 420 labels: ["No headphones in live mode"]}
+                                cue_status := Caption{width: Fill text: ""}
                             }
                         }
                         SettingsRow{
@@ -904,6 +906,8 @@ fn write_requests(bundle: &Path, list: &[Request]) {
 pub struct Settings {
     /// The sound output by name (None: the system default).
     pub audio_output: Option<String>,
+    /// The output live mode's headphone cue plays through, by name (None: none).
+    pub headphones: Option<String>,
     /// Who writes and answers: "local" (Poing's own model) or "claude"
     /// (None: local, unless `POING_LLM` says otherwise).
     pub ai: Option<String>,
@@ -3279,6 +3283,13 @@ impl App {
             (None, None) => "No sound output found.".into(),
         };
         ui.label(cx, ids!(out_status)).set_text(cx, &now);
+        let phones = load_settings().headphones;
+        let mut labels = vec!["No headphones in live mode".to_string()];
+        labels.extend(outputs.iter().map(|d| format!("Headphones in live mode: {}", d.name)));
+        let chosen = phones.as_ref().and_then(|n| outputs.iter().position(|d| &d.name == n)).map_or(0, |i| i + 1);
+        ui.drop_down(cx, ids!(cue_dd)).set_labels(cx, labels);
+        ui.drop_down(cx, ids!(cue_dd)).set_selected_item(cx, chosen);
+        ui.label(cx, ids!(cue_status)).set_text(cx, &self.headphones_line());
         let ai = match (llm::provider(), agent::claude_installed(), agent::unavailable()) {
             (llm::Provider::Local, claude, why) => format!(
                 "Poing's own model (Qwen3.5 4B, on this PC's GPU) writes effects, MIDI parts and new songs and answers the Describe bar: no subscription needed.{}{}",
@@ -3320,6 +3331,39 @@ impl App {
     }
 }
 
+impl App {
+    /// The sound outputs to open: the one the song and the decks play
+    /// through (the one chosen in Settings while it is connected, else the
+    /// default), then live mode's headphones when Settings names another
+    /// connected output for them.
+    fn sound_outputs(&self) -> Vec<AudioDeviceId> {
+        let settings = load_settings();
+        let named = |name: &str| self.audio_devices.iter().find(|d| d.device_type.is_output() && !d.has_failed && d.name == name).map(|d| d.device_id);
+        let mut out = match settings.audio_output.as_deref().and_then(named) {
+            Some(id) => vec![id],
+            None => AudioDevicesEvent { descs: self.audio_devices.clone() }.default_output(),
+        };
+        out.truncate(1);
+        if let Some(id) = settings.headphones.as_deref().and_then(named).filter(|id| !out.contains(id)) {
+            if !out.is_empty() {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Where live mode's headphone cue plays, in words.
+    pub(crate) fn headphones_line(&self) -> String {
+        let outs = self.sound_outputs();
+        match load_settings().headphones {
+            None => "Live mode's cue buttons need a second sound output for the headphones (on the OMNIS-DUO: its other output).".into(),
+            Some(n) if outs.len() > 1 => format!("The decks with their cue button on play through {n}."),
+            Some(n) if self.audio_devices.iter().any(|d| d.device_type.is_output() && d.name == n) => format!("{n} is the output the decks play through: the headphones need another one."),
+            Some(n) => format!("{n} is not connected: no headphone cue."),
+        }
+    }
+}
+
 impl MatchEvent for App {
     /// Play through the system's default output (the audio callback only
     /// runs once an output device is opened).
@@ -3329,8 +3373,7 @@ impl MatchEvent for App {
         }
         self.audio_devices = devices.descs.clone();
         // the output chosen in Settings, while it is connected; else the default
-        let chosen = load_settings().audio_output.map(|n| devices.descs.iter().filter(|d| d.device_type.is_output() && !d.has_failed && d.name == n).map(|d| d.device_id).collect::<Vec<_>>()).filter(|v| !v.is_empty());
-        let out = chosen.unwrap_or_else(|| devices.default_output());
+        let out = self.sound_outputs();
         log!("poing: playing through {:?}", out);
         // The device list can come empty first and complete a moment later.
         let none = "No audio output is available (is another app holding the sound card?): playback stays silent until one is free. Export still works.";
@@ -3394,11 +3437,15 @@ impl MatchEvent for App {
             let mut settings = load_settings();
             settings.audio_output = if i == 0 { None } else { outputs.get(i - 1).map(|d| d.name.clone()) };
             save_settings(&settings);
-            let id = match i {
-                0 => AudioDevicesEvent { descs: self.audio_devices.clone() }.default_output(),
-                _ => outputs.get(i - 1).map(|d| vec![d.device_id]).unwrap_or_default(),
-            };
-            cx.use_audio_outputs(&id);
+            cx.use_audio_outputs(&self.sound_outputs());
+            self.refresh_settings(cx);
+        }
+        if let Some(i) = ui.drop_down(cx, ids!(cue_dd)).changed(actions) {
+            let outputs: Vec<AudioDeviceDesc> = self.audio_devices.iter().filter(|d| d.device_type.is_output()).cloned().collect();
+            let mut settings = load_settings();
+            settings.headphones = if i == 0 { None } else { outputs.get(i - 1).map(|d| d.name.clone()) };
+            save_settings(&settings);
+            cx.use_audio_outputs(&self.sound_outputs());
             self.refresh_settings(cx);
         }
         if let Some(i) = ui.drop_down(cx, ids!(ai_dd)).changed(actions) {

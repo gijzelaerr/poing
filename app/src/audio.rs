@@ -591,6 +591,7 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
     let mut decks = crate::decks::Player::new(sr);
     // where the last block ended: playback from anywhere else is a jump
     let mut expected = usize::MAX;
+    start_headphones(cx, shared.clone(), sr, muted);
     cx.audio_output(0, move |info, out| {
         out.zero();
         // A new effects rack: adopt the old one's state, hand the old one back
@@ -733,6 +734,33 @@ pub fn start_output(cx: &mut Cx, shared: Arc<Shared>, sr: u32) {
         };
         if !muted {
             play_out(out, &l[..n_src], &r[..n_src], ratio);
+        }
+    });
+}
+
+/// The headphones (audio output 1, when Settings names one): live mode's
+/// headphone mix from the cue ring. Its device has its own clock and block
+/// size, so it takes just the frames its own time has gone on by.
+fn start_headphones(cx: &mut Cx, shared: Arc<Shared>, sr: u32, muted: bool) {
+    let mut reader = crate::decks::CueReader::default();
+    let (mut l, mut r) = (Vec::<f32>::with_capacity(8192), Vec::<f32>::with_capacity(8192));
+    // the part of a frame owed from the last block
+    let mut owed = 0.0f64;
+    cx.audio_output(1, move |info, out| {
+        out.zero();
+        if !shared.decks.on() {
+            reader.stop();
+            return;
+        }
+        let ratio = sr as f64 / info.sample_rate.max(1.0);
+        let want = out.frame_count() as f64 * ratio + owed;
+        let n = (want as usize).clamp(1, 8192);
+        owed = (want - n as f64).clamp(0.0, 1.0);
+        l.resize(n, 0.0);
+        r.resize(n, 0.0);
+        reader.pull(&shared.decks.cue, &mut l, &mut r);
+        if !muted {
+            play_out(out, &l, &r, ratio);
         }
     });
 }

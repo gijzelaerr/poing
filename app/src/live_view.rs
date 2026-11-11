@@ -48,6 +48,11 @@ fn filter_text(v: f32) -> &'static str {
     }
 }
 
+/// The output Settings names for the headphones.
+fn load_phones() -> Option<String> {
+    crate::load_settings().headphones
+}
+
 /// Deck 2's beat phase minus deck 1's (beats, -0.5..0.5).
 pub fn phase_diff(decks: &Decks) -> f64 {
     (decks.deck[1].beat.get() - decks.deck[0].beat.get() + 0.5).rem_euclid(1.0) - 0.5
@@ -173,6 +178,9 @@ impl App {
                     if deck.sync.load(Ordering::Relaxed) {
                         info += " · SYNC";
                     }
+                    if deck.keylock.load(Ordering::Relaxed) {
+                        info += " · KEY LOCK";
+                    }
                     let pads = (0..4).map(|i| match &s.hot[i] {
                         Some((_, name)) => format!("[{} {name}]", (b'A' + i as u8) as char),
                         None => format!("[{} —]", (b'A' + i as u8) as char),
@@ -182,7 +190,8 @@ impl App {
                     let size = if beats < 1.0 { format!("1/{:.0} beat", 1.0 / beats) } else { format!("{beats:.0} beats") };
                     let looping = if deck.loop_on.load(Ordering::Relaxed) { format!("Loop {size}, on") } else { format!("Loop {size}") };
                     let mix = format!(
-                        "Trim {:+.0} dB · EQ H {} M {} L {} · Filter {} · Fader {:.0}% · Level {} dB",
+                        "{}Trim {:+.0} dB · EQ H {} M {} L {} · Filter {} · Fader {:.0}% · Level {} dB",
+                        if deck.pfl.load(Ordering::Relaxed) { "CUE · " } else { "" },
                         (deck.trim.get() - 0.5) * 24.0,
                         eq_text(deck.eq_high.get()),
                         eq_text(deck.eq_mid.get()),
@@ -225,7 +234,12 @@ impl App {
         );
         ui.label(cx, ids!(live_fx)).set_text(cx, &fx);
         let port = if self.live_ports.0.is_empty() { "no OMNIS-DUO found: plug it in by USB (its PC port)" } else { "OMNIS-DUO connected" };
-        ui.label(cx, ids!(live_status)).set_text(cx, port);
+        let phones = match (load_phones(), self.sound_outputs().len() > 1) {
+            (Some(n), true) => format!("headphones: {n}"),
+            (Some(n), false) => format!("headphones: {n} is not there"),
+            (None, _) => "no headphones output (Settings, Sound)".to_string(),
+        };
+        ui.label(cx, ids!(live_status)).set_text(cx, &format!("{port} · {phones}"));
         ui.view(cx, ids!(live_view)).redraw(cx);
     }
 
@@ -256,6 +270,8 @@ impl App {
                 ("bpm", f(s.grid.bpm_at(t) * k.speed.get())),
                 ("tempo_fader", f(k.tempo.get() as f64)),
                 ("sync", Value::Bool(k.sync.load(Ordering::Relaxed))),
+                ("headphone_cue", Value::Bool(k.pfl.load(Ordering::Relaxed))),
+                ("key_lock", Value::Bool(k.keylock.load(Ordering::Relaxed))),
                 ("section", s.section_at(t).map_or(Value::Null, |(_, n)| json::s(n.to_string()))),
                 ("cue", f(k.cue.get())),
                 ("hot", Value::Arr(hot)),
@@ -272,6 +288,8 @@ impl App {
             ("controller", Value::Bool(!self.live_ports.0.is_empty())),
             ("bpm", f(decks.bpm.get())),
             ("xfader", f(decks.xfader.get() as f64)),
+            ("headphones_level_db", json::s(db(decks.cue_meter.get()))),
+            ("headphones_output", load_phones().filter(|_| self.sound_outputs().len() > 1).map_or(Value::Null, json::s)),
             (
                 "fx",
                 json::obj(vec![

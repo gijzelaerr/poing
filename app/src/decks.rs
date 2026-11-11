@@ -13,6 +13,15 @@
 //! and plays that at its speed (so instruments and effects bend with the
 //! tempo, like the stems). What it rendered last stays in a short history:
 //! the platter going back plays that, as a record would.
+//!
+//! Key lock: instead of reading the history faster or slower (tempo and pitch
+//! together, like vinyl), the deck lays short overlapping pieces of it at
+//! their own pitch, each chosen near where the playhead is so it carries on
+//! from the one before (WSOLA). The platter in the hand is always vinyl.
+//!
+//! Headphone cue: the decks whose cue button is on, after their EQ and trim
+//! but before their fader and the crossfader, summed into a [`CueRing`] that
+//! a second sound output (the headphones) plays.
 
 use crate::audio::{mix_into, MixParams, Stems};
 use crate::deckmap::{Act, Control, Decoder, Map, Msg};
@@ -49,6 +58,14 @@ const FADE_S: f64 = 0.02;
 const FADE_STEP: usize = 64;
 /// The playhead may be this many frames past what was rendered and still carry on from it.
 const GAP: u64 = 16;
+/// Key lock: a new piece every this long (seconds), each twice as long and
+/// looked for up to this far (seconds) either side of the playhead.
+const LOCK_HOP_S: f64 = 0.02;
+const LOCK_SEARCH_S: f64 = 0.01;
+/// Key lock holds between these speeds; outside them the deck plays like vinyl.
+const LOCK_SPEEDS: (f64, f64) = (0.5, 2.0);
+/// Frames skipped between the ones compared when choosing a piece.
+const LOCK_STRIDE: usize = 4;
 
 // ------------------------------------------------------------------ the grid
 
@@ -291,6 +308,10 @@ pub struct Deck {
     /// The tempo fader, 0..1 (0.5 is the middle).
     pub tempo: AF32,
     pub sync: AtomicBool,
+    /// Key lock ("master tempo"): the tempo fader leaves the pitch alone.
+    pub keylock: AtomicBool,
+    /// Heard in the headphones (the mixer's cue button).
+    pub pfl: AtomicBool,
     /// Bit per stem (deckmap::STEMS): muted.
     pub mutes: AtomicU8,
     pub trim: AF32,
@@ -327,6 +348,8 @@ impl Default for Deck {
             nudge: AtomicI32::new(0),
             tempo: AF32::new(0.5),
             sync: AtomicBool::new(false),
+            keylock: AtomicBool::new(false),
+            pfl: AtomicBool::new(false),
             mutes: AtomicU8::new(0),
             trim: AF32::new(0.5),
             eq_high: AF32::new(0.5),
@@ -378,6 +401,9 @@ pub struct Decks {
     pub fx: Mutex<Option<Box<DjFx>>>,
     /// The tempo the decks play at (the leading deck's), for the UI.
     pub bpm: AF64,
+    /// What the headphones play, and its level.
+    pub cue: CueRing,
+    pub cue_meter: AF32,
     pub ports_in: [AtomicU64; PORTS],
     pub ports_out: [AtomicU64; PORTS],
     /// Messages from the controller that the map does not know, for the log.
@@ -398,6 +424,8 @@ impl Default for Decks {
             fx_beats: AtomicU8::new(2),
             fx: Mutex::new(None),
             bpm: AF64::new(0.0),
+            cue: CueRing::default(),
+            cue_meter: AF32::new(0.0),
             ports_in: std::array::from_fn(|_| AtomicU64::new(0)),
             ports_out: std::array::from_fn(|_| AtomicU64::new(0)),
             unmapped: ArrayQueue::new(64),
@@ -492,6 +520,12 @@ impl Decks {
                 }
             }
             Act::Load if down => deck.load.store(true, Ordering::Relaxed),
+            Act::KeyLock if down => {
+                deck.keylock.fetch_xor(true, Ordering::Relaxed);
+            }
+            Act::HeadCue if down => {
+                deck.pfl.fetch_xor(true, Ordering::Relaxed);
+            }
             Act::HotCue(n) if down => deck.send(Cmd::HotCue(n - 1)),
             Act::Loop(b) if down => deck.send(Cmd::Loop(b)),
             Act::Mute(s) if down => {
@@ -564,6 +598,8 @@ impl Leds {
                     Act::Cue => lit(song.is_some() && !playing && (deck.pos.get() - deck.cue.get()).abs() < 0.005),
                     Act::Load => lit(song.is_some()),
                     Act::Sync => lit(deck.sync.load(Ordering::Relaxed)),
+                    Act::KeyLock => lit(deck.keylock.load(Ordering::Relaxed)),
+                    Act::HeadCue => lit(deck.pfl.load(Ordering::Relaxed)),
                     Act::HotCue(n) => lit(song.as_ref().is_some_and(|s| s.hot[n as usize - 1].is_some())),
                     Act::Mute(s) => lit(song.is_some() && !deck.muted(s as usize)),
                     Act::Loop(b) => lit(loop_on && (loop_beats - b).abs() < 1e-3),
@@ -589,6 +625,85 @@ impl Leds {
     /// Forget what was sent (everything is sent again).
     pub fn reset(&mut self) {
         self.sent.clear();
+    }
+}
+
+// ------------------------------------------------------- the headphone cue
+
+/// Frames the cue ring holds, and how far behind the writer the headphones
+/// start reading (their latency, and the room for the two outputs' blocks to
+/// fall differently).
+const CUE_RING: usize = 1 << 15;
+pub const CUE_BEHIND: u64 = 1024;
+
+/// The headphone mix on its way from the decks' callback to the headphones'
+/// output: a ring of stereo frames (f32 bits) by frame number, one writer and
+/// one reader, no locks.
+pub struct CueRing {
+    l: Box<[AtomicU32]>,
+    r: Box<[AtomicU32]>,
+    written: AtomicU64,
+}
+
+impl Default for CueRing {
+    fn default() -> Self {
+        CueRing { l: (0..CUE_RING).map(|_| AtomicU32::new(0)).collect(), r: (0..CUE_RING).map(|_| AtomicU32::new(0)).collect(), written: AtomicU64::new(0) }
+    }
+}
+
+impl CueRing {
+    /// The decks' callback: the next frames of the headphone mix.
+    pub fn push(&self, l: &[f32], r: &[f32]) {
+        let base = self.written.load(Ordering::Relaxed);
+        let n = l.len().min(r.len());
+        for i in 0..n {
+            let s = (base as usize + i) % CUE_RING;
+            self.l[s].store(l[i].to_bits(), Ordering::Relaxed);
+            self.r[s].store(r[i].to_bits(), Ordering::Relaxed);
+        }
+        self.written.store(base + n as u64, Ordering::Release);
+    }
+}
+
+/// The headphones' side of the [`CueRing`]: where it reads.
+#[derive(Default)]
+pub struct CueReader {
+    at: u64,
+    reading: bool,
+}
+
+impl CueReader {
+    /// The next frames for the headphones (overwrites l/r). It reads
+    /// [`CUE_BEHIND`] frames behind the writer. The two outputs run on their
+    /// own clocks: when the headphones catch up with the writer they play
+    /// silence for what is missing and step back; when they fall far behind
+    /// they skip ahead.
+    pub fn pull(&mut self, ring: &CueRing, l: &mut [f32], r: &mut [f32]) {
+        let n = l.len().min(r.len());
+        let written = ring.written.load(Ordering::Acquire);
+        let behind = written.saturating_sub(self.at);
+        if !self.reading || self.at > written || behind > 4 * CUE_BEHIND {
+            self.at = written.saturating_sub(CUE_BEHIND);
+            self.reading = true;
+        }
+        for i in 0..n {
+            if self.at >= written {
+                // caught up: the rest is silence, and the next block starts further back
+                l[i..n].fill(0.0);
+                r[i..n].fill(0.0);
+                self.reading = false;
+                return;
+            }
+            let s = self.at as usize % CUE_RING;
+            l[i] = f32::from_bits(ring.l[s].load(Ordering::Relaxed));
+            r[i] = f32::from_bits(ring.r[s].load(Ordering::Relaxed));
+            self.at += 1;
+        }
+    }
+
+    /// Nothing is being written (live mode is off): start afresh when it is.
+    pub fn stop(&mut self) {
+        self.reading = false;
     }
 }
 
@@ -763,6 +878,92 @@ impl DjFx {
 
 // --------------------------------------------------------------- the player
 
+/// Key lock's state: the piece being played and the fade out of it that the
+/// next one goes over.
+struct Lock {
+    /// Frames a piece plays alone before the next comes in, and how far either side of the playhead one is looked for.
+    hop: usize,
+    search: usize,
+    /// The fade in over a hop (the fade out is 1 minus it).
+    rise: Vec<f32>,
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
+    /// Frames of `buf` played (`hop`: all of it).
+    read: usize,
+    tail_l: Vec<f32>,
+    tail_r: Vec<f32>,
+    /// The song frame the last piece would carry on at.
+    next: Option<u64>,
+    /// The lock is laying pieces (else the deck plays like vinyl).
+    on: bool,
+    /// Leaving the lock: frames of `tail` already faded out under vinyl (`hop`: done).
+    fade: usize,
+    /// What would come next, and the history near the playhead (mono), to compare.
+    want: Vec<f32>,
+    near: Vec<f32>,
+}
+
+impl Lock {
+    fn new(sr: u32) -> Lock {
+        let hop = ((LOCK_HOP_S * sr as f64) as usize).max(64);
+        let search = ((LOCK_SEARCH_S * sr as f64) as usize).max(16);
+        let rise = (0..hop).map(|i| 0.5 - 0.5 * (std::f32::consts::PI * (i as f32 + 0.5) / hop as f32).cos()).collect();
+        Lock {
+            hop,
+            search,
+            rise,
+            buf_l: vec![0.0; hop],
+            buf_r: vec![0.0; hop],
+            read: hop,
+            tail_l: vec![0.0; hop],
+            tail_r: vec![0.0; hop],
+            next: None,
+            on: false,
+            fade: hop,
+            want: vec![0.0; hop],
+            near: vec![0.0; 2 * search + hop + 1],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.on = false;
+        self.read = self.hop;
+        self.fade = self.hop;
+        self.next = None;
+    }
+
+    /// The deck plays like vinyl again (l/r hold what it plays): what the
+    /// lock had still to play fades out under it over a hop, and it fades in.
+    fn leave(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let hop = self.hop;
+        if self.on {
+            self.on = false;
+            // the rest of the piece, then the fade out that would have followed it
+            let left = hop - self.read;
+            for i in 0..hop {
+                let fall = 1.0 - self.rise[i];
+                let (a, b) = if i < left { (self.buf_l[self.read + i], self.buf_r[self.read + i]) } else { (self.tail_l[i - left], self.tail_r[i - left]) };
+                self.want[i] = a * fall;
+                self.near[i] = b * fall;
+            }
+            self.tail_l[..hop].copy_from_slice(&self.want[..hop]);
+            self.tail_r[..hop].copy_from_slice(&self.near[..hop]);
+            self.read = hop;
+            self.next = None;
+            self.fade = 0;
+        }
+        for i in 0..l.len().min(r.len()) {
+            if self.fade >= hop {
+                break;
+            }
+            let rise = self.rise[self.fade];
+            l[i] = l[i] * rise + self.tail_l[self.fade];
+            r[i] = r[i] * rise + self.tail_r[self.fade];
+            self.fade += 1;
+        }
+    }
+}
+
 /// One deck on the audio thread: its song, transport and strip.
 struct DeckPlayer {
     song: Option<Arc<DeckSong>>,
@@ -797,6 +998,7 @@ struct DeckPlayer {
     h_hi: u64,
     /// The playhead was moved (a cue, a loop's end): forward play renders afresh.
     jumped: bool,
+    lock: Lock,
     win_l: Vec<f32>,
     win_r: Vec<f32>,
     out_l: Vec<f32>,
@@ -841,6 +1043,7 @@ impl DeckPlayer {
             h_lo: 0,
             h_hi: 0,
             jumped: false,
+            lock: Lock::new(sr),
             win_l: vec![0.0; win],
             win_r: vec![0.0; win],
             out_l: vec![0.0; BLOCK],
@@ -896,6 +1099,7 @@ impl DeckPlayer {
         self.h_lo = 0;
         self.h_hi = 0;
         self.jumped = true;
+        self.lock.clear();
         if let Some(s) = &self.song {
             let start = s.hot[0].as_ref().map_or(0.0, |h| h.0);
             self.pos = start * s.sr as f64;
@@ -1066,6 +1270,8 @@ impl DeckPlayer {
         // the stems as muted now: what is rendered from here on fades to it
         self.mutes = deck.mutes.load(Ordering::Relaxed);
         let held = deck.touch.load(Ordering::Relaxed);
+        // key lock: playing on at a speed it holds, the platter not in the hand
+        let locked = deck.keylock.load(Ordering::Relaxed) && self.playing && !held && (LOCK_SPEEDS.0..=LOCK_SPEEDS.1).contains(&rate);
         let g = &song.grid;
         // a stopped (or held) record is silent, not its last sample held
         let mut done = if rate == 0.0 { n } else { 0 };
@@ -1081,13 +1287,21 @@ impl DeckPlayer {
                 }
                 k = k.min(((lb - self.pos) / rate).ceil().max(1.0) as usize);
             }
-            self.segment(&song, rate, done, k, held);
+            if locked {
+                self.stretch(&song, rate, done, k);
+            } else {
+                self.segment(&song, rate, done, k, held);
+            }
             self.pos += rate * k as f64;
             if looping && self.pos >= lb {
                 self.pos -= lb - la;
                 self.jumped = true;
             }
             done += k;
+        }
+        if !locked {
+            // out of key lock: its last piece fades under what plays now
+            self.lock.leave(&mut self.out_l[..n], &mut self.out_r[..n]);
         }
         if self.pos < 0.0 {
             self.pos = 0.0;
@@ -1097,6 +1311,100 @@ impl DeckPlayer {
             self.playing = false;
         }
         self.speed = if self.playing { rate / to_song } else { 0.0 };
+    }
+
+    /// [`Self::segment`] with key lock: frames [at, at + k) from the pieces
+    /// the lock lays, a new one whenever the last is played out.
+    fn stretch(&mut self, song: &DeckSong, rate: f64, at: usize, k: usize) {
+        let mut p = self.pos;
+        for i in 0..k {
+            if self.lock.read >= self.lock.hop {
+                self.piece(song, p.max(0.0).round() as u64);
+            }
+            let j = self.lock.read;
+            self.out_l[at + i] = self.lock.buf_l[j];
+            self.out_r[at + i] = self.lock.buf_r[j];
+            self.lock.read += 1;
+            p += rate;
+        }
+    }
+
+    /// The next piece for the key lock, for a playhead at song frame `a`: the
+    /// stretch of the history within reach of `a` that best carries on from
+    /// the piece before, faded in over that one's fade out.
+    fn piece(&mut self, song: &DeckSong, a: u64) {
+        let (hop, search) = (self.lock.hop as u64, self.lock.search as u64);
+        let cap = self.hist_l.len() as u64;
+        // after a jump, or somewhere the history is not: afresh from here
+        let jumped = std::mem::take(&mut self.jumped);
+        if jumped || a < self.h_lo || a > self.h_hi + GAP {
+            self.h_lo = a;
+            self.h_hi = a;
+            self.lock.next = None;
+        }
+        self.extend(song, a + search + 2 * hop + 1);
+        let read = |hist: &[f32], f: u64| hist[(f % cap) as usize];
+        if !self.lock.on {
+            // coming from vinyl: as if the piece before was the song from here
+            self.lock.on = true;
+            self.lock.fade = self.lock.hop;
+            self.lock.next = Some(a);
+            for i in 0..hop as usize {
+                let fall = 1.0 - self.lock.rise[i];
+                self.lock.tail_l[i] = fall * read(&self.hist_l, a + i as u64);
+                self.lock.tail_r[i] = fall * read(&self.hist_r, a + i as u64);
+            }
+        }
+        // where to look: around the playhead, within the history
+        let lo = a.saturating_sub(search).max(self.h_lo);
+        let hi = a + search;
+        let mut start = a;
+        if let Some(next) = self.lock.next.filter(|n| *n >= self.h_lo && *n + hop <= self.h_hi) {
+            let stride = LOCK_STRIDE;
+            let m = hop as usize / stride;
+            for i in 0..m {
+                let f = next + (i * stride) as u64;
+                self.lock.want[i] = read(&self.hist_l, f) + read(&self.hist_r, f);
+            }
+            let span = (hi - lo) as usize + hop as usize;
+            for i in 0..span {
+                let f = lo + i as u64;
+                self.lock.near[i] = read(&self.hist_l, f) + read(&self.hist_r, f);
+            }
+            // how well the stretch from `s` carries on: its likeness to what would have come next
+            let score = |near: &[f32], want: &[f32], s: u64| -> f32 {
+                let at = (s - lo) as usize;
+                let (mut dot, mut energy) = (0.0f32, 1e-9f32);
+                for i in 0..m {
+                    let y = near[at + i * stride];
+                    dot += want[i] * y;
+                    energy += y * y;
+                }
+                dot / energy.sqrt()
+            };
+            // what would have come next, when it is within reach: then nothing is changed
+            let mut best = f32::MIN;
+            if (lo..=hi).contains(&next) {
+                start = next;
+                best = score(&self.lock.near, &self.lock.want, next) + 1e-6;
+            }
+            for s in lo..=hi {
+                let v = score(&self.lock.near, &self.lock.want, s);
+                if v > best {
+                    best = v;
+                    start = s;
+                }
+            }
+        }
+        for i in 0..hop as usize {
+            let (rise, f) = (self.lock.rise[i], start + i as u64);
+            self.lock.buf_l[i] = self.lock.tail_l[i] + rise * read(&self.hist_l, f);
+            self.lock.buf_r[i] = self.lock.tail_r[i] + rise * read(&self.hist_r, f);
+            self.lock.tail_l[i] = (1.0 - rise) * read(&self.hist_l, f + hop);
+            self.lock.tail_r[i] = (1.0 - rise) * read(&self.hist_r, f + hop);
+        }
+        self.lock.next = Some(start + hop);
+        self.lock.read = 0;
     }
 
     /// Frames [at, at + k) of the block: the song from `pos` on at `rate`,
@@ -1208,11 +1516,14 @@ pub struct Player {
     sr: u32,
     decks: [DeckPlayer; DECKS],
     fx: Option<Box<DjFx>>,
+    /// The headphone mix of the block being rendered.
+    cue_l: Vec<f32>,
+    cue_r: Vec<f32>,
 }
 
 impl Player {
     pub fn new(sr: u32) -> Player {
-        Player { sr, decks: [DeckPlayer::new(sr), DeckPlayer::new(sr)], fx: None }
+        Player { sr, decks: [DeckPlayer::new(sr), DeckPlayer::new(sr)], fx: None, cue_l: vec![0.0; BLOCK], cue_r: vec![0.0; BLOCK] }
     }
 
     /// Frames [0, n) of the live mix into l/r (overwrites).
@@ -1275,11 +1586,20 @@ impl Player {
         let cross = [x.cos(), x.sin()];
         l.fill(0.0);
         r.fill(0.0);
+        self.cue_l[..n].fill(0.0);
+        self.cue_r[..n].fill(0.0);
         for d in 0..DECKS {
             let deck = &shared.deck[d];
             let p = &mut self.decks[d];
             p.render(deck, speed[d], self.sr, n);
             let trim = 10f32.powf((deck.trim.get() - 0.5) * 24.0 / 20.0);
+            if deck.pfl.load(Ordering::Relaxed) {
+                // the headphones hear it whatever its fader and the crossfader say
+                for i in 0..n {
+                    self.cue_l[i] += p.out_l[i] * trim;
+                    self.cue_r[i] += p.out_r[i] * trim;
+                }
+            }
             let fader = deck.fader.get().clamp(0.0, 1.0).powi(2);
             let gain = trim * fader * cross[d];
             let mut peak = 0.0f32;
@@ -1296,6 +1616,9 @@ impl Player {
         if let Some(fx) = self.fx.as_mut() {
             fx.run(shared, bpm, l, r);
         }
+        shared.cue.push(&self.cue_l[..n], &self.cue_r[..n]);
+        let peak = self.cue_l[..n].iter().chain(&self.cue_r[..n]).fold(0.0f32, |p, x| p.max(x.abs()));
+        shared.cue_meter.set(peak.max(shared.cue_meter.get() * 0.9));
     }
 }
 
@@ -1622,6 +1945,97 @@ mod tests {
         assert!(peak(&l) > 1.0, "the lanes are heard: {}", peak(&l));
     }
 
+    /// A deck with a 440 Hz tone at half scale on it, playing.
+    fn tone_deck(sr: u32) -> (Decks, DeckPlayer) {
+        let frames = sr as usize * 6;
+        let tone: Vec<f32> = (0..frames).map(|i| 0.5 * (i as f32 * std::f32::consts::TAU * 440.0 / sr as f32).sin()).collect();
+        let stems: Stems = Arc::new(vec![Arc::new(Stem::new(tone.clone(), tone))]);
+        let mix = MixParams { version: 1, gains: vec![1.0], ..Default::default() };
+        let decks = Decks::default();
+        decks.load(0, deck_song(sr, stems, mix, frames, FxRack::new(vec![Vec::new()], Vec::new())));
+        let mut p = DeckPlayer::new(sr);
+        p.adopt(&decks.deck[0]);
+        p.command(Cmd::Play);
+        (decks, p)
+    }
+
+    fn play_for(p: &mut DeckPlayer, deck: &Deck, speed: f64, sr: u32, frames: usize) -> Vec<f32> {
+        let mut got = Vec::new();
+        while got.len() < frames {
+            let k = (frames - got.len()).min(441);
+            p.play(deck, speed, sr, k);
+            got.extend_from_slice(&p.out_l[..k]);
+        }
+        got
+    }
+
+    /// Upward zero crossings: a tone's frequency over a second.
+    fn crossings(x: &[f32]) -> usize {
+        x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count()
+    }
+
+    #[test]
+    fn key_lock_keeps_the_pitch_at_another_tempo() {
+        let sr = 48000;
+        // like vinyl: 8% faster is 8% higher
+        let (decks, mut p) = tone_deck(sr);
+        let got = play_for(&mut p, &decks.deck[0], 1.08, sr, 2 * sr as usize);
+        assert!((crossings(&got[sr as usize..]) as i32 - 475).abs() <= 2, "vinyl: {} Hz", crossings(&got[sr as usize..]));
+        // locked: the same tempo, the tone where it was
+        let (decks, mut p) = tone_deck(sr);
+        decks.deck[0].keylock.store(true, Ordering::Relaxed);
+        let got = play_for(&mut p, &decks.deck[0], 1.08, sr, 2 * sr as usize);
+        assert!((p.pos - 2.0 * 1.08 * sr as f64).abs() < 1.0, "the deck is 8% further: {}", p.pos);
+        assert!((crossings(&got[sr as usize..]) as i32 - 440).abs() <= 2, "locked: {} Hz", crossings(&got[sr as usize..]));
+        // and as loud all the way: the pieces join without holes or bumps
+        for w in got[480..].chunks(480) {
+            assert!((0.45..0.56).contains(&peak(w)), "level {}", peak(w));
+        }
+        // slower too
+        let got = play_for(&mut p, &decks.deck[0], 0.92, sr, 2 * sr as usize);
+        assert!((crossings(&got[sr as usize..]) as i32 - 440).abs() <= 2, "locked, slower: {} Hz", crossings(&got[sr as usize..]));
+    }
+
+    #[test]
+    fn key_lock_at_the_song_s_own_tempo_changes_nothing() {
+        let sr = 48000;
+        let frames = sr as usize * 2;
+        let (stems, mix, mut rack) = song_with_fx(sr, frames);
+        let (mut want, mut want_r) = (vec![0.0f32; sr as usize], vec![0.0f32; sr as usize]);
+        mix_into(&stems, &mix, sr, 0, &mut want, &mut want_r, Some(&mut rack));
+        let (stems, mix, rack) = song_with_fx(sr, frames);
+        let decks = Decks::default();
+        decks.load(0, deck_song(sr, stems, mix, frames, rack));
+        decks.deck[0].keylock.store(true, Ordering::Relaxed);
+        let mut p = DeckPlayer::new(sr);
+        p.adopt(&decks.deck[0]);
+        p.command(Cmd::Play);
+        let got = play_for(&mut p, &decks.deck[0], 1.0, sr, sr as usize);
+        let worst = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(worst < 1e-5, "off by {worst}");
+    }
+
+    #[test]
+    fn key_lock_goes_on_and_off_without_a_click() {
+        let sr = 48000;
+        let (decks, mut p) = tone_deck(sr);
+        let deck = &decks.deck[0];
+        let mut got = Vec::new();
+        for on in [false, true, false, true, false] {
+            deck.keylock.store(on, Ordering::Relaxed);
+            got.extend(play_for(&mut p, deck, 1.08, sr, 10007));
+        }
+        // the hand on the platter takes it out of the lock, and letting go puts it back
+        deck.keylock.store(true, Ordering::Relaxed);
+        got.extend(play_for(&mut p, deck, 1.08, sr, 10007));
+        // a 475 Hz tone at half scale moves at most 0.031 a frame
+        let step = got.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(step < 0.06, "a jump of {step} between two frames");
+        for w in got[480..].chunks(480) {
+            assert!((0.3..0.75).contains(&peak(w)), "level {}", peak(w));
+        }
+    }
+
     /// A latent plugin on one lane makes the whole rack late; the deck reads
     /// ahead by that much, so what it plays stays where its position says.
     #[cfg(windows)]
@@ -1720,6 +2134,74 @@ mod tests {
     }
 
     #[test]
+    fn the_headphones_hear_a_cued_deck_whatever_the_faders_say() {
+        let sr = 48000;
+        let decks = Decks::default();
+        let mut p = Player::new(sr);
+        decks.load(0, song(sr, 30.0));
+        decks.load(1, song(sr, 30.0));
+        // the crossfader on deck 1, deck 2's fader down, both playing
+        decks.xfader.set(0.0);
+        decks.deck[1].fader.set(0.0);
+        decks.deck[0].send(Cmd::Play);
+        decks.deck[1].send(Cmd::Play);
+        let mut ears = CueReader::default();
+        let mut heard = |p: &mut Player| {
+            let (l, _) = run(p, &decks, 0.2);
+            // the headphones' next block: from just behind what the decks wrote
+            let (mut cl, mut cr) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+            ears.pull(&decks.cue, &mut cl, &mut cr);
+            (l[l.len() - 1], cl[cl.len() - 1])
+        };
+        let (master, phones) = heard(&mut p);
+        assert!((master - 1.5).abs() < 1e-3 && phones == 0.0, "no cue button on: {master} {phones}");
+        // deck 2's cue button: the headphones get it, the master does not
+        let map = Map::parse(crate::deckmap::BUILT_IN).unwrap();
+        decks.midi(&map, &mut Decoder::default(), [0xb4, 0x47, 0x7f]);
+        assert!(decks.deck[1].pfl.load(Ordering::Relaxed));
+        let (master, phones) = heard(&mut p);
+        assert!((master - 1.5).abs() < 1e-3 && (phones - 1.5).abs() < 1e-3, "deck 2 in the headphones only: {master} {phones}");
+        assert!(decks.cue_meter.get() > 1.0);
+        // both cue buttons: both decks
+        decks.deck[0].pfl.store(true, Ordering::Relaxed);
+        let (_, phones) = heard(&mut p);
+        assert!((phones - 3.0).abs() < 1e-3, "{phones}");
+        assert!(Leds::default().update(&map, &decks).contains(&[0xb4, 0x47, 0x7f]), "the cue button is lit");
+    }
+
+    #[test]
+    fn the_headphones_read_behind_the_decks_and_survive_their_own_clock() {
+        let ring = CueRing::default();
+        let mut ears = CueReader::default();
+        let ramp = |from: usize, n: usize| -> Vec<f32> { (from..from + n).map(|i| i as f32).collect() };
+        let pull = |ears: &mut CueReader, n: usize| {
+            let (mut l, mut r) = (vec![9.0f32; n], vec![9.0f32; n]);
+            ears.pull(&ring, &mut l, &mut r);
+            l
+        };
+        ring.push(&ramp(0, 4000), &ramp(0, 4000));
+        // it starts CUE_BEHIND frames back, and goes on from where it was
+        let behind = CUE_BEHIND as usize;
+        assert_eq!(pull(&mut ears, 500), ramp(4000 - behind, 500));
+        ring.push(&ramp(4000, 500), &ramp(4000, 500));
+        assert_eq!(pull(&mut ears, 500), ramp(4500 - behind, 500));
+        // faster than the decks: silence for what is not there yet, then back behind them
+        let got = pull(&mut ears, 2000);
+        assert_eq!(got[..behind - 500], ramp(5000 - behind, behind - 500)[..]);
+        assert!(got[behind - 500..].iter().all(|x| *x == 0.0));
+        ring.push(&ramp(4500, 3000), &ramp(4500, 3000));
+        assert_eq!(pull(&mut ears, 10)[0], (7500 - behind) as f32);
+        // slower than the decks: far behind, it skips to its place again
+        ring.push(&ramp(7500, 20000), &ramp(7500, 20000));
+        assert_eq!(pull(&mut ears, 10)[0], (27500 - behind) as f32);
+        // and round the ring's end
+        for k in 0..40 {
+            ring.push(&ramp(27500 + k * 1000, 1000), &ramp(27500 + k * 1000, 1000));
+            assert_eq!(pull(&mut ears, 1000)[999], (27500 + (k + 1) * 1000 - behind + 9) as f32, "block {k}");
+        }
+    }
+
+    #[test]
     fn leds_follow_the_decks_and_send_only_changes() {
         let map = Map::parse(crate::deckmap::BUILT_IN).unwrap();
         let decks = Decks::default();
@@ -1749,6 +2231,9 @@ mod tests {
         assert_eq!(decks.xfader.get(), 0.0);
         decks.midi(&map, &mut dec, [0x96, 0x00, 0x7f]);
         assert_eq!(decks.deck[1].cmds.pop(), Some(Cmd::HotCue(0)));
+        decks.midi(&map, &mut dec, [0x91, 0x11, 0x7f]);
+        decks.midi(&map, &mut dec, [0x91, 0x11, 0x00]);
+        assert!(decks.deck[1].keylock.load(Ordering::Relaxed) && !decks.deck[0].keylock.load(Ordering::Relaxed), "master tempo on the touch panel is key lock");
         decks.midi(&map, &mut dec, [0x96, 0x0c, 0x7f]);
         assert_eq!(decks.unmapped.pop(), Some([0x96, 0x0c, 0x7f]), "unknown: logged");
         decks.midi(&map, &mut dec, [0x86, 0x00, 0x00]);

@@ -18,6 +18,10 @@ pub enum Act {
     Start,
     Sync,
     Load,
+    /// Key lock (the touch panel's Master Tempo).
+    KeyLock,
+    /// The mixer's headphone cue button.
+    HeadCue,
     HotCue(u8),
     Loop(f32),
     Mute(u8),
@@ -154,6 +158,8 @@ impl Map {
                 "start" => Act::Start,
                 "sync" => Act::Sync,
                 "load" => Act::Load,
+                "keylock" => Act::KeyLock,
+                "headcue" => Act::HeadCue,
                 "hotcue" => Act::HotCue(arg()?.parse().ok().filter(|c| (1..=4).contains(c)).ok_or_else(|| bad("hot cues are 1 to 4"))?),
                 "loop" => Act::Loop(arg()?.parse().ok().filter(|b: &f32| *b > 0.0 && *b <= 32.0).ok_or_else(|| bad("a loop is 1/32 to 32 beats"))?),
                 "mute" => {
