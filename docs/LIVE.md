@@ -93,7 +93,13 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
   - A VST3 effect or instrument gets an instance of its own for the deck, with the state it has when the song is loaded. Changes made to the plugin after that reach the deck with the next Load. A plugin that does not load for the deck is named in the status line, and the deck plays without it.
   - The deck renders the song through that rack and then plays it at its speed, so effects and instruments bend with the tempo as the stems do. With a plugin that adds latency, the deck renders that much ahead, so it stays on its beat grid.
   - A MIDI lane mutes with the stem its name says (a lane called "Bass synth" with the bass), else with "other". Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
-- **Tempo.** Speed and pitch move together, like vinyl. There is no key lock yet.
+- **Tempo.** Speed and pitch move together, like vinyl, unless the deck's key lock is on.
+- **Key lock.** The touch panel's **Master Tempo** button (`90 11` / `91 11`) turns it on or off for a deck. With it on, the tempo fader, sync and a nudge change the tempo and leave the pitch where it is.
+  - How: the deck lays pieces of the song 40 ms long, a new one every 20 ms, each faded over the one before. Each piece is taken from within 10 ms of where the playhead is, at the spot that best carries on from the last one (WSOLA). At the song's own tempo that gives back the song unchanged.
+  - The deck's position and beat are the playhead's, so sync and the beat grid work as without it. What you hear can be up to 10 ms either side of it.
+  - The platter in the hand (touched) always plays like vinyl. Going into and out of the lock crossfades over 20 ms.
+  - A jump (a hot cue, a loop's end) is heard up to 20 ms late with the lock on: the piece being played ends first.
+  - It holds from half to double speed. The effects and instruments are in what it stretches, so they keep their pitch too.
 - **Beat grid and hot cues.** These are the DJ export's own: `dj_grid` and `dj_cues` from `djexport.rs`. Hot cues A–D sit on the intro, the first chorus, the bridge or drop (else the last chorus), and the outro (else the last section). A song may have fewer than four. "It's Autumn" has no outro and its last section is chorus 3, so it gets A, B and C, and pad 4 stays dark.
 
 ### The pads, on four pads with no mode buttons
@@ -137,7 +143,12 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
   - **Reverb**: `allpass_reverb.splash`.
 
   Shift + FX on switches between them, the depth knob is their mix, and FX on/off is bypass.
-- **Where it plays.** The two decks go to the same output as the song (the device chosen in Settings). Cueing in headphones needs the DUO's own USB audio as a 4-channel device. That is a later step.
+- **Where it plays.** The two decks go to the same output as the song (the device chosen in Settings).
+- **Headphone cue.** The mixer's cue buttons (`B4 46` / `B4 47`, lit while on) put a deck in the headphones: after its EQ, filter and trim, before its channel fader and the crossfader, and without the beat FX. So a deck can be heard there with its fader down. With both buttons on you hear both decks; with none, nothing.
+  - The headphones are a second sound output: **Settings, Sound, "Headphones in live mode"**. Makepad opens a Windows output with two channels, so a four-channel device cannot carry master and headphones together; the DUO's driver shows a speaker and a line endpoint, which would be the two outputs (to check on the hardware). Any other pair of outputs works too, such as an audio interface for the room and the PC's headphone jack.
+  - The headphones only hear the cue buttons, not the master: there is no cue/master mix in Poing (the DUO has that knob itself).
+  - The headphones play about 21 ms (1024 frames) behind the decks, plus their own device's delay. The two outputs each run on their own clock. When they drift apart far enough the headphones skip ahead or repeat about 21 ms, which you hear as a tick. Two endpoints of one device share a clock and do not drift.
+  - The live view's status line names the headphones' output, and the `live` tool gives `headphones_level_db`.
 
 ### The map is a data file
 
@@ -185,7 +196,15 @@ Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a h
 - `live_test.sh` on a copy of "It's Autumn", three times on a fresh Poing: all 13 checks passed twice. The first run failed one, the timing of deck 2's hot cue B 3 s after it was pressed; its numbers were not kept and it did not happen again.
 - Not checked in the app: a VST3 effect on a lane (only instruments were on the test songs; the unit test covers the latency of an effect slot). Every run was muted and judged by level: nobody has listened to it yet.
 
-The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another.
+**Key lock and the headphone cue, 2026-11-11, on glacier** (a copy of "It's Autumn" on both decks; the PC has one sound output, so nothing played through a second one).
+
+- Key lock on both decks, deck 2 at +3%: both played at their levels. With sync on, the phase difference read 0.000 beat, and stayed there through a hot cue on deck 1 while playing and a 2-beat loop on deck 2. Touching deck 1's platter held it; letting go, it played on.
+- The crossfader on deck 1 and deck 2's cue button on: `headphones_level_db` read +3 dB while deck 2's own level read silent, and −inf again with the button off. Its LED was sent on and off (`B4 47 7F`, `B4 47 00`).
+- Settings shows the second choice under Sound ("No headphones in live mode").
+- `live_test.sh` again on a fresh Poing: 13 of 13.
+- Not checked: sound through a second output (the callback that plays the headphones never ran here), and how key lock sounds.
+
+The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another. For key lock: a 440 Hz tone at +8% reads 475 Hz like vinyl and 440 Hz locked (at −8% too) at a steady level, the song's own tempo gives the mixer's samples back, and turning the lock on and off leaves no step between two frames larger than a tone's own. For the headphones: a cued deck is in the cue ring and not in the master with its fader down, and the reader starts 1024 frames behind, plays silence when it catches up, skips when far behind and goes round the ring's end.
 
 ### To check on the real DUO
 
@@ -194,16 +213,17 @@ The unit tests (`cargo test`, `deckmap` and `decks`) check every documented mess
 3. **Jog resolution** (720 steps a revolution assumed) and its direction.
 4. **Tempo fader direction** (`invert`) and whether the mixer knobs really send only 7 bits.
 5. **Pad LEDs.** Does 7F light them? They may be RGB with a colour per velocity.
-6. **Sync on the touch panel.** Does it send `90 1F` in PC mode?
-7. **USB audio.** Does the DUO's ASIO device offer 4 outputs (master and headphones), for headphone cueing later?
-8. **A fast forward spin on a song with plugins.** The platter going forward past what the deck has played renders the song at up to 4 times its speed, through every effect and instrument, in the audio callback. Listen for dropouts on a song with many plugins.
+6. **Sync and Master Tempo on the touch panel.** Do they send `90 1F` and `90 11` in PC mode?
+7. **USB audio.** Do the DUO's master and headphone outputs show up as two sound outputs in Settings? If Windows shows one four-channel output only, the headphone cue needs four-channel output in Makepad first.
+8. **The headphone cue buttons.** Do `B4 46` / `B4 47` arrive as a press and a release (they are CCs), and do they light?
+9. **Key lock by ear.** It has only been measured (the pitch of a tone, its level). Listen to it at ±8% on drums and on a voice.
+10. **A fast forward spin on a song with plugins.** The platter going forward past what the deck has played renders the song at up to 4 times its speed, through every effect and instrument, in the audio callback. Listen for dropouts on a song with many plugins.
 
 ### Not in this first version
 
 - Changes to the song after it was loaded: press Load again.
 - Bringing back a deck's plugin after its process crashed. In the song's tab a plugin that runs in its own process is reloaded when its helper dies; a deck's instance is not, so that lane stays silent until the next Load.
-- Key lock (time-stretch).
-- Headphone cueing.
+- A cue/master mix and a level for the headphones in Poing, and master and headphones on one four-channel output.
 - Saving changed cue points to the song.
 - A waveform view (the live view shows the decks as text and bars).
 - Decks 3 and 4.
