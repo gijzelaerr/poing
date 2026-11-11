@@ -148,6 +148,8 @@ pub struct DeckSong {
     /// it while the song is on the deck and puts it back when it lets go, so
     /// it is dropped with the song, on the UI thread.
     pub rack: Mutex<Option<Box<FxRack>>>,
+    /// Plugins of the song that did not load for the deck (by name).
+    pub missing: Vec<String>,
 }
 
 /// The stem a lane is (by its id or name); anything else is "other".
@@ -166,8 +168,11 @@ pub fn role_of(id: &str, name: &str) -> u8 {
 }
 
 impl DeckSong {
-    /// A deck's copy of the song open in `st`: its stems are shared, not copied.
-    pub fn of(st: &crate::state::EditorState) -> DeckSong {
+    /// A deck's copy of the song open in `st`: its stems are shared, not
+    /// copied; its effects and instruments are the deck's own (plugins get an
+    /// instance for the deck, as they sound now).
+    pub fn of(st: &mut crate::state::EditorState) -> DeckSong {
+        let (rack, missing) = st.make_deck_rack();
         let p = &st.project;
         let mix = MixParams::from_project(p, 0, &st.active);
         let lanes = st.stems.iter().take(p.tracks.len()).map(|s| s.l.len()).max().unwrap_or(0);
@@ -211,7 +216,8 @@ impl DeckSong {
             bpm,
             hot,
             sections,
-            rack: Mutex::new(Some(Box::new(st.make_rack()))),
+            rack: Mutex::new(Some(Box::new(rack))),
+            missing,
         }
     }
 
@@ -1318,6 +1324,7 @@ mod tests {
             sections: vec![(0.0, "Intro".into()), (8.0, "Chorus 1".into()), (16.0, "Chorus 2".into())],
             role: vec![0, 1, 2, 3],
             rack: Mutex::new(None),
+            missing: Vec::new(),
         })
     }
 
@@ -1499,6 +1506,7 @@ mod tests {
             sections: vec![(0.0, "Intro".into())],
             role: vec![3; n],
             rack: Mutex::new(Some(Box::new(rack))),
+            missing: Vec::new(),
         })
     }
 
@@ -1612,6 +1620,41 @@ mod tests {
         let (l, _) = run(&mut p, &decks, 0.3);
         assert!((8.0 - d.pos.get() - 0.18).abs() < 0.01, "{}", d.pos.get());
         assert!(peak(&l) > 1.0, "the lanes are heard: {}", peak(&l));
+    }
+
+    /// A latent plugin on one lane makes the whole rack late; the deck reads
+    /// ahead by that much, so what it plays stays where its position says.
+    #[cfg(windows)]
+    #[test]
+    fn a_deck_stays_on_its_grid_with_a_latent_plugin() {
+        let sr = 48000;
+        let frames = sr as usize;
+        let click = {
+            let mut v = vec![0.0f32; frames];
+            v[1000] = 1.0;
+            Arc::new(Stem::new(v.clone(), v))
+        };
+        let quiet = Arc::new(Stem::new(vec![0.0; frames], vec![0.0; frames]));
+        let stems: Stems = Arc::new(vec![quiet, click]);
+        let mix = MixParams { version: 1, gains: vec![1.0, 1.0], ..Default::default() };
+        let mut plugin = fx("late");
+        plugin.plugin = Some("x".into());
+        let slot = FxUnit::plugin("late", FxControls::for_plugin(&plugin), sr);
+        let mut rack = FxRack::new(vec![vec![slot], Vec::new()], Vec::new());
+        rack.compensate(&|id| if id == "late" { 300 } else { 0 });
+        assert_eq!(rack.latency, 300);
+        let decks = Decks::default();
+        decks.load(0, deck_song(sr, stems, mix, frames, rack));
+        let deck = &decks.deck[0];
+        let mut p = DeckPlayer::new(sr);
+        p.adopt(deck);
+        p.command(Cmd::Play);
+        let mut got = Vec::new();
+        while got.len() < 4000 {
+            p.play(deck, 1.0, sr, 500);
+            got.extend_from_slice(&p.out_l[..500]);
+        }
+        assert_eq!(got.iter().position(|x| *x > 0.5), Some(1000), "the click on the lane without the plugin");
     }
 
     #[test]

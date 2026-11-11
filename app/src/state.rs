@@ -728,6 +728,20 @@ impl EditorState {
     /// A rack for an offline render: plugins get a second instance each
     /// (one that will not load is left out, and named).
     pub fn make_render_rack(&mut self) -> (FxRack, Vec<String>) {
+        self.second_rack(false)
+    }
+
+    /// A rack for a live deck: the song's effects and instruments apart from
+    /// the ones its tab plays, with an instance of each plugin as it sounds
+    /// now, playing in real time (one that will not load is left out, and named).
+    pub fn make_deck_rack(&mut self) -> (FxRack, Vec<String>) {
+        self.second_rack(true)
+    }
+
+    /// A rack of the song's own, with another instance of each plugin: to
+    /// play (`realtime`) or for an offline render.
+    #[allow(unused_variables)]
+    fn second_rack(&mut self, realtime: bool) -> (FxRack, Vec<String>) {
         #[allow(unused_mut)]
         let mut rack = self.make_rack();
         #[allow(unused_mut)]
@@ -740,12 +754,12 @@ impl EditorState {
             let path = PathBuf::from(fx.plugin.clone().unwrap_or_default());
             // the state as it sounds now (unsaved edits too), else as saved
             let state = self.plugins.get(&fx.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&fx.id));
-            let how = crate::plugins::LoadAs { instrument: false, isolated: fx.isolated(), realtime: false };
+            let how = crate::plugins::LoadAs { instrument: false, isolated: fx.isolated(), realtime };
             match crate::plugins::load(&path, self.sr(), Some(&fx), state.as_deref(), how) {
                 Ok((handle, shared)) => {
                     late.insert(fx.id.clone(), handle.latency());
                     let _ = rack.install(&fx.id, shared);
-                    // the render lets go of it on the worker; it is destroyed here after
+                    // whoever plays the rack lets go of it; it is destroyed here after
                     self.retiring.push(handle);
                 }
                 Err(_) => missing.push(fx.name.clone()),
@@ -755,7 +769,7 @@ impl EditorState {
         for t in self.project.tracks.iter().filter(|t| t.is_midi()) {
             let Some(inst) = t.instrument.as_ref().filter(|f| f.plugin.is_some()) else { continue };
             let state = self.plugins.get(&t.id).and_then(|h| h.save_state()).or_else(|| self.plugin_state(&t.id));
-            let how = crate::plugins::LoadAs { instrument: true, isolated: inst.isolated(), realtime: false };
+            let how = crate::plugins::LoadAs { instrument: true, isolated: inst.isolated(), realtime };
             match crate::plugins::load(std::path::Path::new(inst.plugin.as_deref().unwrap_or_default()), self.sr(), Some(inst), state.as_deref(), how) {
                 Ok((handle, shared)) => {
                     late.insert(t.id.clone(), handle.latency());

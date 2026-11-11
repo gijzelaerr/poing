@@ -66,11 +66,17 @@ impl App {
         map
     }
 
-    /// Put the song in front on deck `d`.
+    /// Put the song in front on deck `d`; returns its name, with the plugins
+    /// that did not load for the deck.
     fn load_deck(&mut self, d: usize) -> Option<String> {
-        let st = self.state.as_ref()?;
+        let st = self.state.as_mut()?;
+        let t0 = std::time::Instant::now();
         let song = Arc::new(DeckSong::of(st));
-        let name = song.name.clone();
+        log!("poing: live: deck {} loaded {} in {:.1} s", d + 1, song.name, t0.elapsed().as_secs_f64());
+        let name = match song.missing.as_slice() {
+            [] => song.name.clone(),
+            missing => format!("{} (without {}: it did not load)", song.name, missing.join(", ")),
+        };
         if let Some(old) = st.shared.decks.load(d, song) {
             self.live_retired.push(old);
         }
@@ -98,7 +104,9 @@ impl App {
             shared.decks.set_ports(&self.live_ports.0, &self.live_ports.1);
             for d in 0..DECKS {
                 if shared.decks.song(d).is_none() {
-                    self.load_deck(d);
+                    if let Some(name) = self.load_deck(d) {
+                        self.set_status(cx, &format!("Deck {}: {name}", d + 1));
+                    }
                 }
             }
             let _ = self.live_map();

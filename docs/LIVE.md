@@ -88,7 +88,11 @@ Decks 3 and 4 (`92`, `93`, pads `97`, `98`, mixer `B4 0C`…) are in the csv, bu
 ### Using it
 
 - **Starting it.** Open a song and press **Live** in the top bar. Both decks load the song in front. The hardware **Load** button loads the song in front onto that deck, so a version or remix opened in another tab can go on deck 2. **Live** again goes back to the song.
-- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). Splash effects on the lanes and the master are heard, and so are MIDI lanes played by Splash instruments: each deck has its own copy of the song's effects rack, and their knobs are the song's own (turn one in the song's tab and the deck follows). The deck renders the song through that rack and then plays it at its speed, so effects and instruments bend with the tempo as the stems do. Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
+- **What a deck plays.** The song as it plays in its tab when loaded: the lanes at their levels and mutes (the muted "Original" stays out), regions, and the takes that are on (a whole-song remix replaces the lanes). The effects on the lanes and the master are heard, and so are the MIDI lanes with their instruments:
+  - Each deck has its own copy of the song's effects rack. A Splash effect or instrument's knobs are the song's own: turn one in the song's tab and the deck follows.
+  - A VST3 effect or instrument gets an instance of its own for the deck, with the state it has when the song is loaded. Changes made to the plugin after that reach the deck with the next Load. A plugin that does not load for the deck is named in the status line, and the deck plays without it.
+  - The deck renders the song through that rack and then plays it at its speed, so effects and instruments bend with the tempo as the stems do. With a plugin that adds latency, the deck renders that much ahead, so it stays on its beat grid.
+  - A MIDI lane mutes with the stem its name says (a lane called "Bass synth" with the bass), else with "other". Each stem can be muted on its own (with a whole-song remix on, the stem mutes do nothing: the remix is one piece of audio). Two copies of one song share their audio, so nothing is loaded twice. A deck that gets a song stops on its hot cue A.
 - **Tempo.** Speed and pitch move together, like vinyl. There is no key lock yet.
 - **Beat grid and hot cues.** These are the DJ export's own: `dj_grid` and `dj_cues` from `djexport.rs`. Hot cues A–D sit on the intro, the first chorus, the bridge or drop (else the last chorus), and the outro (else the last section). A song may have fewer than four. "It's Autumn" has no outro and its last section is chorus 3, so it gets A, B and C, and pad 4 stays dark.
 
@@ -172,7 +176,13 @@ Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a h
 9. **An unknown message** (`96 0C 7F`) was logged as `poing: live: unmapped 96 0C 7F`.
 10. **Leaving live mode.** Live off ("Back to the song") brought the song's timeline back.
 
-The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change.
+**Effects and MIDI lanes on a deck, 2026-11-11, on glacier.**
+
+- A test song with two lanes: the drums through a Splash effect that turns them down 20 dB, and a MIDI lane on the built-in bass. With the drums muted by shift + pad 2 the deck played the MIDI lane alone at −9 dB. With the bass muted and deck 1 looping 4 beats, the drums read −27 and −29 dB with the effect and −13 and −9 dB with it bypassed from the `effect` tool.
+- A copy of "ded24d v2" (six BBC Symphony Orchestra lanes and three Serum 2 lanes), with every audio stem muted. A deck loaded its nine plugin instances in 3.7 s. Deck 1 at +5% played the MIDI lanes at −16 to −20 dB, deck 2 synced to it (0.02 beat apart 4 s after sync went on, and closing), and no plugin block was missed.
+- Not checked in the app: a VST3 effect on a lane (only instruments were on the test song; the unit test covers the latency of an effect slot), and a plugin running in its own process on a deck.
+
+The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another.
 
 ### To check on the real DUO
 
@@ -186,7 +196,6 @@ The unit tests (`cargo test`, `deckmap` and `decks`) check every documented mess
 
 ### Not in this first version
 
-- VST3 effects and VST3 instruments on a deck (a VST3 effect passes its lane through unchanged and a MIDI lane played by a VST3 instrument is silent).
 - Changes to the song after it was loaded: press Load again.
 - Key lock (time-stretch).
 - Headphone cueing.
