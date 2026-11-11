@@ -179,8 +179,11 @@ Injected MIDI goes through makepad-remote (`midi a= b= c= p=OMNIS-DUO`) into a h
 **Effects and MIDI lanes on a deck, 2026-11-11, on glacier.**
 
 - A test song with two lanes: the drums through a Splash effect that turns them down 20 dB, and a MIDI lane on the built-in bass. With the drums muted by shift + pad 2 the deck played the MIDI lane alone at −9 dB. With the bass muted and deck 1 looping 4 beats, the drums read −27 and −29 dB with the effect and −13 and −9 dB with it bypassed from the `effect` tool.
-- A copy of "ded24d v2" (six BBC Symphony Orchestra lanes and three Serum 2 lanes), with every audio stem muted. A deck loaded its nine plugin instances in 3.7 s. Deck 1 at +5% played the MIDI lanes at −16 to −20 dB, deck 2 synced to it (0.02 beat apart 4 s after sync went on, and closing), and no plugin block was missed.
-- Not checked in the app: a VST3 effect on a lane (only instruments were on the test song; the unit test covers the latency of an effect slot), and a plugin running in its own process on a deck.
+- A copy of "ded24d v2" (six BBC Symphony Orchestra lanes and three Serum 2 lanes), with every audio stem muted. A deck loaded its nine plugin instances in 3.7 s. Deck 1 at +5% played the MIDI lanes at −16 to −20 dB, and no plugin block was missed.
+- The same song with one Serum 2 lane set to run in its own process and the other MIDI lanes muted: the deck played that lane at −18 to −22 dB, with a `poing-plughost` for the song's tab and one for each deck. Deck 2 synced to deck 1: ten readings from 4 s after sync went on were all within 0.0011 beat.
+- Two tabs: with deck 1 playing "ded24d v2", the test song was opened in a second tab and loaded onto deck 2 with the hardware Load message (`91 51`). Deck 1 played on (−21 to −25 dB) and deck 2 played the test song (−10 dB). Closing the "ded24d v2" tab left deck 1 playing it, and deck 2's old plugin instances were gone (one `poing-plughost` left, deck 1's).
+- `live_test.sh` on a copy of "It's Autumn", three times on a fresh Poing: all 13 checks passed twice. The first run failed one, the timing of deck 2's hot cue B 3 s after it was pressed; its numbers were not kept and it did not happen again.
+- Not checked in the app: a VST3 effect on a lane (only instruments were on the test songs; the unit test covers the latency of an effect slot). Every run was muted and judged by level: nobody has listened to it yet.
 
 The unit tests (`cargo test`, `deckmap` and `decks`) check every documented message against its control. They also cover sync pulling a 0.3-beat, 3% offset into phase within 2 s, and the CDJ cue. Further tests: nudge (20 steps, 20 ms), scratch (a tenth of a turn, 0.18 s back), hot cue phase, a loop, mute fades, the crossfader at −3 dB, an EQ kill and the filter, the echo landing exactly one beat later, and LEDs sent only on change. For the rack: a deck at the song's speed gives the same samples as the song's mixer through a feedback delay (in blocks of 512 and 333), a MIDI note at +5% starts on time and holds, a loop's end lets go of the note it cuts, a deck with a 300-frame latent plugin slot still plays a click where its position says, and the rack goes back to its song when the deck gets another.
 
@@ -193,10 +196,12 @@ The unit tests (`cargo test`, `deckmap` and `decks`) check every documented mess
 5. **Pad LEDs.** Does 7F light them? They may be RGB with a colour per velocity.
 6. **Sync on the touch panel.** Does it send `90 1F` in PC mode?
 7. **USB audio.** Does the DUO's ASIO device offer 4 outputs (master and headphones), for headphone cueing later?
+8. **A fast forward spin on a song with plugins.** The platter going forward past what the deck has played renders the song at up to 4 times its speed, through every effect and instrument, in the audio callback. Listen for dropouts on a song with many plugins.
 
 ### Not in this first version
 
 - Changes to the song after it was loaded: press Load again.
+- Bringing back a deck's plugin after its process crashed. In the song's tab a plugin that runs in its own process is reloaded when its helper dies; a deck's instance is not, so that lane stays silent until the next Load.
 - Key lock (time-stretch).
 - Headphone cueing.
 - Saving changed cue points to the song.
